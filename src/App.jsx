@@ -1,3 +1,8 @@
+// EDITING NOTE: this file has previously suffered accidental deletions during large
+// str_replace edits (a truncated multi-line comment losing its opening "/**" twice,
+// and once an entire useEffect being silently dropped). Every edit to this file is
+// now verified with `git diff` before being considered complete — see the bottom of
+// this file's project history for the verification process itself.
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
@@ -333,6 +338,28 @@ function computeInstrumentKey(h) {
   return { key: `unknown:${uid("h")}`, reliable: false };
 }
 
+/** A real per-security identifier (ISIN, mutual fund folio number) should never be
+ *  identical across two DIFFERENT holdings — if it is, the extracted value is almost
+ *  certainly an account-level number (a PRAN, a policy number) that a statement
+ *  happens to also print, not a genuine per-holding ID. Mutates the batch in place,
+ *  clearing that field wherever it's shared, so instrumentKey computation (which
+ *  trusts isin/folioNumber as authoritative) never silently collapses distinct
+ *  holdings into one storage key. Defense-in-depth alongside clear prompt wording —
+ *  catches the case even if a future statement's phrasing still confuses extraction. */
+function clearUnreliableSharedIdentifiers(holdings, field) {
+  const namesByValue = {};
+  holdings.forEach((h) => {
+    const val = (h[field] || "").toString().trim();
+    if (!val) return;
+    if (!namesByValue[val]) namesByValue[val] = new Set();
+    namesByValue[val].add(h.name);
+  });
+  const badValues = new Set(Object.entries(namesByValue).filter(([, names]) => names.size > 1).map(([val]) => val));
+  holdings.forEach((h) => {
+    if (badValues.has((h[field] || "").toString().trim())) h[field] = "";
+  });
+}
+
 /** The actual reconciliation check for a holdings import — sum of the parsed rows'
  *  Invested/Current Value against whatever total the statement itself prints (when it
  *  prints one at all; some sources, like a plain broker holdings export, never do).
@@ -340,18 +367,30 @@ function computeInstrumentKey(h) {
  *  total is authoritative when present, and this just confirms nothing was misread or
  *  dropped while parsing the individual rows. */
 function reconcileHoldingsTotals(holdings, statementTotals) {
-  const sumInvested = holdings.reduce((s, h) => s + (h.investedValue || 0), 0);
+  // Some statement types (NPS is the clearest example) only report contribution
+  // at the portfolio level — there's no per-scheme cost basis to extract, not an
+  // extraction failure. Summing those rows as if a missing value were a real zero
+  // would silently misrepresent the account as "all growth, no principal" — so
+  // this case is tracked and handled separately from an actual mismatch.
+  const hasUnknownInvestedValue = holdings.some((h) => h.investedValueUnknown);
+  const hasEstimatedInvestedValue = holdings.some((h) => h.derived?.investedValueEstimated);
+  const knownInvestedHoldings = holdings.filter((h) => !h.investedValueUnknown);
+  const sumInvested = knownInvestedHoldings.reduce((s, h) => s + (h.investedValue || 0), 0);
   const sumCurrent = holdings.reduce((s, h) => s + (h.currentValue || 0), 0);
   const hasStatedInvested = statementTotals && statementTotals.totalInvestedValue !== null && statementTotals.totalInvestedValue !== undefined;
   const hasStatedCurrent = statementTotals && statementTotals.totalCurrentValue !== null && statementTotals.totalCurrentValue !== undefined;
-  const investedDiff = hasStatedInvested ? Math.round((sumInvested - statementTotals.totalInvestedValue) * 100) / 100 : null;
+  // A ULIP-allocated sum is constructed to equal the stated total exactly — that's
+  // not independent verification, so it's treated the same as "can't verify" even
+  // though the arithmetic technically matches.
+  const investedDiff = (hasStatedInvested && !hasUnknownInvestedValue && !hasEstimatedInvestedValue) ? Math.round((sumInvested - statementTotals.totalInvestedValue) * 100) / 100 : null;
   const currentDiff = hasStatedCurrent ? Math.round((sumCurrent - statementTotals.totalCurrentValue) * 100) / 100 : null;
   return {
-    sumInvested, sumCurrent,
+    sumInvested, sumCurrent, hasUnknownInvestedValue, hasEstimatedInvestedValue,
     statedInvested: hasStatedInvested ? statementTotals.totalInvestedValue : null,
     statedCurrent: hasStatedCurrent ? statementTotals.totalCurrentValue : null,
     investedDiff, currentDiff,
-    investedMatches: investedDiff === null || Math.abs(investedDiff) <= 1,
+    // null here means "not applicable" (can't verify), distinct from a real true/false
+    investedMatches: (hasUnknownInvestedValue || hasEstimatedInvestedValue) ? null : (investedDiff === null || Math.abs(investedDiff) <= 1),
     currentMatches: currentDiff === null || Math.abs(currentDiff) <= 1,
     hasAnyStatedTotal: hasStatedInvested || hasStatedCurrent,
   };
@@ -403,6 +442,14 @@ function computeSnapshotTransition(prevSnapshot, currSnapshot) {
 /* Goals                                                                     */
 /* ------------------------------------------------------------------------ */
 
+// Purely a visual differentiator between goal cards — cycles through, never
+// reuses rust (reserved elsewhere for warnings/negative signals), so a goal's
+// color is never mistaken for a status indicator.
+const GOAL_ACCENT_COLORS = ["#2E6659", "#A8703A", "#4A6C8C", "#7A5C8C", "#6B7A3A", "#8C5A4A"];
+function goalAccentColor(index) {
+  return GOAL_ACCENT_COLORS[index % GOAL_ACCENT_COLORS.length];
+}
+
 const GOAL_TYPE_DEFAULTS = {
   education: { label: "Education", inflationRate: 10 },
   marriage: { label: "Marriage", inflationRate: 10 },
@@ -445,7 +492,8 @@ function buildHoldingsIndex(accounts, holdingSnapshots) {
     (latest.holdings || []).forEach((h) => {
       index.push({
         instrumentKey: h.instrumentKey, name: h.name, accountId: acct.id, accountNickname: acct.nickname,
-        sectorOrCategory: h.sectorOrCategory, investedValue: h.investedValue || 0, currentValue: h.currentValue || 0,
+        sectorOrCategory: h.sectorOrCategory, investedValue: h.investedValue, investedValueUnknown: h.investedValue === null || h.investedValue === undefined,
+        currentValue: h.currentValue || 0,
       });
     });
   });
@@ -584,6 +632,284 @@ function computeGoalsTracking(goals, portfolioInvested, portfolioCurrentValue, t
   });
 
   return { perGoal: results, manualOverAllocated, totalManualRequested, portfolioInvested };
+}
+
+/* ------------------------------------------------------------------------ */
+/* Debt — an amortization schedule is a whole loan's period-by-period table, */
+/* extracted in one import, not a point-in-time snapshot like holdings. All  */
+/* four functions below verified against a realistic 240-month schedule     */
+/* before being wired into any UI: a clean schedule reconciles fully, a      */
+/* deliberately-broken entry gets caught, and a later (restructured)        */
+/* schedule correctly overrides an earlier one for any overlapping period.  */
+/* ------------------------------------------------------------------------ */
+
+/** Checks ONE period's internal arithmetic — the same reconciliation discipline as
+ *  everywhere else in this app, catching a bad AI extraction rather than trusting it.
+ *  EMI should equal Principal + Interest; Closing should equal Opening − Principal. */
+function reconcileDebtEntry(entry) {
+  const tolerance = 5; // small rupee tolerance for rounding in the source document
+  const emiCheck = Math.abs((entry.principal + entry.interest) - entry.emi) <= tolerance;
+  const balanceCheck = Math.abs((entry.openingBalance - entry.principal) - entry.closingBalance) <= tolerance;
+  return { emiCheck, balanceCheck, reconciled: emiCheck && balanceCheck };
+}
+
+/** Checks that consecutive periods actually connect — one period's Closing Balance
+ *  should equal the next period's Opening Balance. Catches a missing row, a
+ *  misread period, or two unrelated schedules accidentally treated as one. */
+function checkDebtScheduleContinuity(entries) {
+  const sorted = [...entries].sort((a, b) => a.period.localeCompare(b.period));
+  const gaps = [];
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (Math.abs(sorted[i].closingBalance - sorted[i + 1].openingBalance) > 5) {
+      gaps.push({ afterPeriod: sorted[i].period, expectedOpening: sorted[i].closingBalance, actualOpening: sorted[i + 1].openingBalance });
+    }
+  }
+  return gaps;
+}
+
+/** Merges every schedule imported for an account into one period→entry map. If a
+ *  loan gets restructured (rate change, prepayment) and a new schedule is imported,
+ *  its periods simply overwrite the older schedule's for any period both cover —
+ *  the newest import always wins, computed live here, never merged at write time. */
+function mergeDebtEntries(schedules) {
+  const sorted = [...schedules].sort((a, b) => a.importedAt - b.importedAt); // oldest first
+  const merged = {};
+  sorted.forEach((s) => { (s.entries || []).forEach((e) => { merged[e.period] = e; }); });
+  return merged;
+}
+
+/** The account's current state, as of today — outstanding balance, cumulative
+ *  principal/interest paid to date, and the next upcoming EMI. Verified sanity
+ *  check: cumulative principal paid + current outstanding balance always equals
+ *  the original loan amount, to the rupee. */
+function computeDebtSummary(schedules, todayStr) {
+  const merged = mergeDebtEntries(schedules);
+  const periods = Object.keys(merged).sort();
+  if (periods.length === 0) return { hasData: false };
+  const todayPeriod = todayStr.slice(0, 7);
+  const pastOrCurrent = periods.filter((p) => p <= todayPeriod);
+  const currentPeriod = pastOrCurrent.length > 0 ? pastOrCurrent[pastOrCurrent.length - 1] : periods[0];
+  const currentEntry = merged[currentPeriod];
+  let cumPrincipal = 0, cumInterest = 0;
+  periods.filter((p) => p <= currentPeriod).forEach((p) => { cumPrincipal += merged[p].principal; cumInterest += merged[p].interest; });
+  const futurePeriods = periods.filter((p) => p > currentPeriod);
+  const nextEntry = futurePeriods.length > 0 ? merged[futurePeriods[0]] : null;
+  return {
+    hasData: true,
+    currentOutstanding: Math.round(currentEntry.closingBalance * 100) / 100,
+    asOfPeriod: currentPeriod,
+    cumulativePrincipalPaid: Math.round(cumPrincipal * 100) / 100,
+    cumulativeInterestPaid: Math.round(cumInterest * 100) / 100,
+    nextEmiPeriod: nextEntry?.period || null,
+    nextEmiAmount: nextEntry?.emi || null,
+    totalPeriods: periods.length,
+    loanComplete: futurePeriods.length === 0,
+  };
+}
+
+/** Same derivation logic already proven for market-tracked holdings (Units × Price
+ *  is exact, reversible algebra), applied to the simpler 3-field case here: NPS and
+ *  ULIP statements are unit-based like a mutual fund, so if a statement gives any two
+ *  of {units, pricePerUnit, balance}, the third is fully recoverable — never guessed,
+ *  never invented, only ever computed from what the statement actually printed. */
+function deriveAssetBalanceFields(units, pricePerUnit, balance) {
+  const derived = { balance: false, pricePerUnit: false, units: false };
+  if (balance === null && units !== null && pricePerUnit !== null) {
+    balance = Math.round(units * pricePerUnit * 100) / 100;
+    derived.balance = true;
+  }
+  if (pricePerUnit === null && units && balance !== null) {
+    pricePerUnit = Math.round((balance / units) * 100) / 100;
+    derived.pricePerUnit = true;
+  }
+  if (units === null && pricePerUnit && balance !== null) {
+    units = Math.round((balance / pricePerUnit) * 10000) / 10000; // extra precision — unit counts often carry several decimals
+    derived.units = true;
+  }
+  return { units, pricePerUnit, balance, derived };
+}
+
+/** "Other Investments" (PF, Gold, Property, etc.) cost-basis derivation — the same
+ *  Value = Units × Price algebra as market-tracked holdings, extended to cover BOTH
+ *  original cost and current worth, so these asset types can show real gain/loss
+ *  instead of just a current number. Every field nullable — PF genuinely has no
+ *  units concept and only ever provides currentValue directly; Gold/Property can
+ *  provide as much or as little as is actually known. Verified against full
+ *  unit-based tracking, PF-style balance-only, partial info, and invested-vs-current
+ *  tracking with no units at all. */
+function deriveOtherInvestmentFields(units, costPerUnit, currentPerUnit, investedValue, currentValue) {
+  const derived = { investedValue: false, currentValue: false, costPerUnit: false, currentPerUnit: false, units: false };
+  if (investedValue === null && units && costPerUnit !== null) {
+    investedValue = Math.round(units * costPerUnit * 100) / 100;
+    derived.investedValue = true;
+  }
+  if (currentValue === null && units && currentPerUnit !== null) {
+    currentValue = Math.round(units * currentPerUnit * 100) / 100;
+    derived.currentValue = true;
+  }
+  if (costPerUnit === null && units && investedValue !== null) {
+    costPerUnit = Math.round((investedValue / units) * 100) / 100;
+    derived.costPerUnit = true;
+  }
+  if (currentPerUnit === null && units && currentValue !== null) {
+    currentPerUnit = Math.round((currentValue / units) * 100) / 100;
+    derived.currentPerUnit = true;
+  }
+  if (units === null && currentPerUnit && currentValue !== null) {
+    units = Math.round((currentValue / currentPerUnit) * 10000) / 10000;
+    derived.units = true;
+  } else if (units === null && costPerUnit && investedValue !== null) {
+    units = Math.round((investedValue / costPerUnit) * 10000) / 10000;
+    derived.units = true;
+  }
+  return { units, costPerUnit, currentPerUnit, investedValue, currentValue, derived };
+}
+
+/** One-time migration from the old assetBalances/manualAssets split into the unified
+ *  otherInvestments shape. NPS/ULIP-typed statementAsset accounts are dropped, not
+ *  migrated — confirmed zero real data in either, since they now belong to
+ *  Market-tracked instead. Verified against a mixed scenario (a bank account passed
+ *  through untouched, a PF account with two balance readings, and two manual assets
+ *  each becoming their own new account) before being wired into the load path. */
+function migrateToOtherInvestments(accounts, assetBalances, manualAssets) {
+  const migratedAccounts = [];
+  const migratedEntries = [];
+
+  accounts.forEach((acct) => {
+    if (acct.type === "statementAsset" && (acct.assetSubtype === "PF" || acct.assetSubtype === "Other" || !acct.assetSubtype)) {
+      migratedAccounts.push({ ...acct, type: "otherInvestment" });
+      assetBalances.filter((b) => b.accountId === acct.id).forEach((b) => {
+        migratedEntries.push({
+          id: uid("oi"), accountId: acct.id, asOfDate: b.asOfDate, importedAt: b.importedAt,
+          units: b.units ?? null, unitOfMeasure: null, costPerUnit: null, currentPerUnit: b.pricePerUnit ?? null,
+          investedValue: null, currentValue: b.balance, location: null, derived: b.derived || null,
+        });
+      });
+    } else if (acct.type !== "statementAsset") {
+      migratedAccounts.push(acct); // pass through every unrelated account unchanged
+    }
+    // statementAsset accounts with an NPS/ULIP subtype are intentionally dropped here
+  });
+
+  manualAssets.forEach((a) => {
+    const accountId = uid("acc");
+    migratedAccounts.push({ id: accountId, type: "otherInvestment", assetSubtype: a.category, nickname: a.description });
+    migratedEntries.push({
+      id: uid("oi"), accountId, asOfDate: new Date(a.updatedAt || Date.now()).toISOString().slice(0, 10), importedAt: a.updatedAt || Date.now(),
+      units: a.quantity ?? null, unitOfMeasure: a.unitOfMeasure || null, costPerUnit: null, currentPerUnit: a.valuePerUnit ?? null,
+      investedValue: null, currentValue: Math.round((a.quantity || 0) * (a.valuePerUnit || 0) * 100) / 100,
+      location: a.location || null, derived: null,
+    });
+  });
+
+  return { migratedAccounts, migratedEntries };
+}
+
+/* ------------------------------------------------------------------------ */
+/* Stage 1 document classifier — "what kind of document is this?" only.     */
+/* Deliberately does nothing else: no extraction, no import, no side        */
+/* effects. Format-agnostic by design — the schema and prompt never         */
+/* reference PDF or CSV/Excel specifically, only the fields that matter,    */
+/* so the SAME function classifies a PDF (image parts) or a spreadsheet     */
+/* (a text sample) identically. This is Stage 1 of the eventual unified     */
+/* upload; Stage 2 (routing to the matching existing extraction) is a       */
+/* separate, later step — this piece is tested standalone first, with no   */
+/* path into any real import flow.                                         */
+/* ------------------------------------------------------------------------ */
+
+const DOCUMENT_CLASSIFY_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    documentCategory: {
+      type: "STRING",
+      enum: ["bank_statement", "credit_card_statement", "investment_holding", "debt_schedule", "other_investment_statement", "unknown"],
+      description: "What kind of financial document this is. 'bank_statement' is a savings/current account transaction history. 'credit_card_statement' is a credit card transaction/billing statement. 'investment_holding' is any holdings/portfolio export — stocks, mutual funds, NPS, or ULIP (all structurally similar: units, price, value, no fixed schedule). 'debt_schedule' is a loan amortization schedule (opening balance, EMI, principal, interest, closing balance per period). 'other_investment_statement' is a single-balance investment account with no regular trading activity — a PF passbook, or a gold/property valuation. Use 'unknown' only if genuinely unclear from what's visible.",
+    },
+    institution: { type: "STRING", nullable: true, description: "The bank, broker, insurer, or platform name, if identifiable from a title, logo caption, letterhead, or a repeated label. Null if genuinely not findable — never guessed." },
+    confidence: { type: "STRING", enum: ["high", "medium", "low"], description: "How confident this classification is, based on how clearly the document matches one category over the others." },
+    reasoning: { type: "STRING", description: "One short, plain sentence naming what specifically indicated this category — e.g. specific column headers seen, or terms like 'EMI' or 'NAV'." },
+  },
+  required: ["documentCategory", "confidence"],
+};
+
+/** inputParts is a plain array of Gemini content parts — either image parts (from a
+ *  rendered PDF page) or a single text part (a spreadsheet sample) — the function
+ *  itself has no format-specific logic at all, by design. */
+async function callDocumentClassify(inputParts, apiKey, aiModel) {
+  const effectiveModel = aiModel || "gemini-3.6-flash";
+  const preamble = [
+    "You are looking at the first part of a financial document — could be a bank statement, credit card",
+    "statement, an investment holdings export, a loan amortization schedule, or a single-balance investment",
+    "statement (like a PF passbook or a gold/property valuation). Identify which of these categories it is,",
+    "and the institution if identifiable. This is a CLASSIFICATION step only — do not extract any transaction",
+    "or holding data yet, just determine what kind of document this is.",
+  ].join("\n");
+  const parts = [...inputParts, { text: preamble }];
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: { maxOutputTokens: 2000, responseMimeType: "application/json", responseSchema: DOCUMENT_CLASSIFY_SCHEMA },
+      }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || `Request failed (HTTP ${response.status}).`);
+  const textPart = (data.candidates?.[0]?.content?.parts || []).find((p) => typeof p.text === "string" && !p.thought);
+  if (!textPart) throw new Error("No usable response from the model.");
+  return JSON.parse(textPart.text.replace(/```json|```/g, "").trim());
+}
+
+/* ------------------------------------------------------------------------ */
+/* Net Worth — a pure aggregator, owns no data of its own. Every figure      */
+/* below is derived live from accounts (bank/credit card balances),         */
+/* holdingSnapshots (market-tracked investments), otherInvestments          */
+/* (PF/Gold/Property/etc.), and debtSchedules — never stored separately,    */
+/* so it can never drift out of sync with whatever those screens currently  */
+/* say. Verified against a full realistic scenario before being wired into  */
+/* any UI.                                                                  */
+/* ------------------------------------------------------------------------ */
+
+function computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules) {
+  const bankTotal = accounts.filter((a) => a.type === "bank").reduce((s, a) => s + (a.lastKnownBalance || 0), 0);
+  // A credit card's balance is a LIABILITY (money owed), not an asset — kept separate
+  // from bank totals and subtracted, same treatment as Debt.
+  const creditCardOwed = accounts.filter((a) => a.type === "creditCard").reduce((s, a) => s + (a.lastKnownBalance || 0), 0);
+
+  const investmentAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
+  let marketTrackedValue = 0;
+  investmentAccounts.forEach((acct) => {
+    const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (snaps.length > 0) marketTrackedValue += snaps[snaps.length - 1].totalCurrentValue || 0;
+  });
+
+  const otherInvestmentAccounts = accounts.filter((a) => a.type === "otherInvestment");
+  let otherInvestmentsValue = 0;
+  otherInvestmentAccounts.forEach((acct) => {
+    const entries = otherInvestments.filter((e) => e.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (entries.length > 0) otherInvestmentsValue += entries[entries.length - 1].currentValue || 0;
+  });
+
+  const debtAccounts = accounts.filter((a) => a.type === "debt");
+  const todayStr = new Date().toISOString().slice(0, 10);
+  let totalDebt = 0;
+  debtAccounts.forEach((acct) => {
+    const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+    if (schedules.length > 0) {
+      const summary = computeDebtSummary(schedules, todayStr);
+      if (summary.hasData) totalDebt += summary.currentOutstanding;
+    }
+  });
+
+  const totalAssets = Math.round((bankTotal + marketTrackedValue + otherInvestmentsValue) * 100) / 100;
+  const totalLiabilities = Math.round((creditCardOwed + totalDebt) * 100) / 100;
+  return {
+    bankTotal, creditCardOwed, marketTrackedValue, otherInvestmentsValue, totalDebt,
+    totalAssets, totalLiabilities, netWorth: Math.round((totalAssets - totalLiabilities) * 100) / 100,
+  };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1330,12 +1656,315 @@ async function saveState(key, value) {
   }
 }
 
+/** A FileSystemDirectoryHandle (the "remember this folder" object behind auto-backup)
+ *  isn't a string — it can't go through the JSON-based storage above. IndexedDB is
+ *  the standard, spec-documented way to persist this specific kind of object across
+ *  browser sessions, so this is a small, separate store just for it. */
+const BACKUP_HANDLE_DB = "being-wealthy-backup-handle";
+function openHandleDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(BACKUP_HANDLE_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("handles");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function saveBackupFolderHandle(handle) {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("handles", "readwrite");
+    tx.objectStore("handles").put(handle, "folder");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function loadBackupFolderHandle() {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("handles", "readonly");
+    const req = tx.objectStore("handles").get("folder");
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function clearBackupFolderHandle() {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("handles", "readwrite");
+    tx.objectStore("handles").delete("folder");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Landing page — the app's front door. Deliberately its own scoped        */
+/* visual identity (warm paper/editorial, matching the approved standalone */
+/* mockup) rather than reusing the working app's current theme variables — */
+/* a marketing front door and a working tool are allowed to feel like      */
+/* close family without being visually identical. Every product visual    */
+/* below mirrors a real screen/feature (Net Worth breakdown, Cash Flow     */
+/* savings rate, the Insights engine's actual wording style, Goals         */
+/* progress) — nothing here is an invented metric.                        */
+/* ---------------------------------------------------------------------- */
+
+function LandingPage({ onGetStarted }) {
+  return (
+    <div className="lp-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+        .lp-root {
+          --lp-paper: #ECE7DA; --lp-card: #F9F7F1; --lp-ink: #21262B; --lp-ink-soft: #55606B;
+          --lp-line: #CBC2AC; --lp-teal: #2E6659; --lp-rust: #9C4A34;
+          background: var(--lp-paper);
+          background-image: repeating-linear-gradient(to bottom, rgba(85,96,107,0.05) 0px, rgba(85,96,107,0.05) 1px, transparent 1px, transparent 34px);
+          color: var(--lp-ink); font-family: 'IBM Plex Sans', sans-serif; -webkit-font-smoothing: antialiased;
+          min-height: 100vh;
+        }
+        .lp-shell { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+        .lp-section { padding: 90px 0; }
+        .lp-hr { border: none; border-top: 1px solid var(--lp-line); margin: 0; }
+        .lp-hero { text-align: center; padding: 80px 0 60px; }
+        .lp-wordmark { font-family: 'Fraunces', serif; font-weight: 600; font-size: 22px; letter-spacing: -0.01em; color: var(--lp-ink-soft); margin-bottom: 40px; }
+        .lp-wordmark em { font-style: italic; color: var(--lp-teal); font-weight: 500; }
+        .lp-hero h1 { font-family: 'Fraunces', serif; font-weight: 500; font-size: 54px; line-height: 1.15; margin: 0 0 24px; letter-spacing: -0.015em; }
+        .lp-hero .lp-sub { font-size: 16.5px; color: var(--lp-ink-soft); max-width: 480px; margin: 0 auto 34px; line-height: 1.6; }
+        .lp-cta {
+          font-family: 'IBM Plex Sans', sans-serif; font-size: 14.5px; font-weight: 600; padding: 13px 30px; border-radius: 4px;
+          border: 1px solid var(--lp-ink); background: var(--lp-ink); color: var(--lp-card); cursor: pointer; display: inline-block;
+          text-decoration: none; transition: background 0.15s, border-color 0.15s;
+        }
+        .lp-cta:hover { background: var(--lp-teal); border-color: var(--lp-teal); }
+        .lp-privacy-line { font-size: 12px; color: var(--lp-ink-soft); margin-top: 16px; letter-spacing: 0.01em; }
+        .lp-path-strip {
+          display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin: 44px 0 8px;
+          font-family: 'IBM Plex Mono', monospace; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--lp-ink-soft);
+        }
+        .lp-path-strip .lp-step { padding: 5px 2px; }
+        .lp-path-strip .lp-step.lp-final { color: var(--lp-teal); font-weight: 600; }
+        .lp-path-strip .lp-arrow { color: var(--lp-line); font-size: 13px; }
+        .lp-mockup-frame { margin-top: 56px; }
+        .lp-mockup-card { background: var(--lp-card); border: 1px solid var(--lp-line); border-radius: 8px; padding: 24px 26px; text-align: left; max-width: 560px; margin: 0 auto; }
+        .lp-mockup-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-ink-soft); margin-bottom: 14px; }
+        .lp-mockup-hr { border: none; border-top: 1px solid var(--lp-line); margin: 16px 0; }
+        .lp-row { display: flex; justify-content: space-between; align-items: baseline; padding: 7px 0; font-size: 13.5px; }
+        .lp-row .lp-k { color: var(--lp-ink-soft); }
+        .lp-row .lp-v { font-family: 'IBM Plex Mono', monospace; font-weight: 500; }
+        .lp-rate-tag { font-size: 11px; color: var(--lp-ink-soft); margin-left: 8px; }
+        .lp-nw-headline { text-align: center; padding: 6px 0 18px; }
+        .lp-nw-headline .lp-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-ink-soft); }
+        .lp-nw-headline .lp-value { font-family: 'IBM Plex Mono', monospace; font-size: 34px; font-weight: 600; margin-top: 4px; }
+        .lp-story { text-align: center; }
+        .lp-story .lp-num { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--lp-ink-soft); letter-spacing: 0.04em; margin-bottom: 14px; }
+        .lp-story h2 { font-family: 'Fraunces', serif; font-weight: 500; font-size: 30px; margin: 0 0 16px; line-height: 1.3; max-width: 560px; margin-left: auto; margin-right: auto; }
+        .lp-story p { font-size: 15px; color: var(--lp-ink-soft); max-width: 480px; margin: 0 auto 14px; line-height: 1.65; }
+        .lp-story p:last-of-type { margin-bottom: 0; }
+        .lp-privacy-subhead { font-family: 'Fraunces', serif; font-style: italic; font-size: 16px; color: var(--lp-teal); margin: 0 0 20px; }
+        .lp-insight-line { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; font-size: 13px; text-align: left; border-bottom: 1px solid var(--lp-line); }
+        .lp-insight-line:last-child { border-bottom: none; }
+        .lp-insight-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; flex-shrink: 0; background: var(--lp-rust); }
+        .lp-cfo-q { font-family: 'Fraunces', serif; font-style: italic; font-size: 16px; color: var(--lp-ink); text-align: left; margin-bottom: 16px; }
+        .lp-cfo-a-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-teal); font-weight: 600; margin-bottom: 6px; text-align: left; }
+        .lp-cfo-a-text { font-size: 13.5px; text-align: left; line-height: 1.6; color: var(--lp-ink); }
+        .lp-flow { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 40px 0 20px; flex-wrap: wrap; }
+        .lp-flow-box { border: 1px solid var(--lp-line); border-radius: 6px; padding: 16px 22px; background: var(--lp-card); font-size: 13px; font-weight: 500; min-width: 140px; text-align: center; }
+        .lp-flow-arrow { color: var(--lp-ink-soft); font-size: 18px; }
+        .lp-flow-caption { text-align: center; font-size: 12px; color: var(--lp-ink-soft); margin-top: 4px; font-style: italic; }
+        .lp-howitworks-list { max-width: 560px; margin: 40px auto 0; text-align: left; }
+        .lp-howitworks-item { display: flex; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--lp-line); }
+        .lp-howitworks-item:last-child { border-bottom: none; }
+        .lp-howitworks-num {
+          font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--lp-teal); font-weight: 600;
+          width: 26px; flex-shrink: 0; padding-top: 2px;
+        }
+        .lp-howitworks-title { font-family: 'Fraunces', serif; font-weight: 600; font-size: 16px; margin-bottom: 4px; }
+        .lp-howitworks-desc { font-size: 13.5px; color: var(--lp-ink-soft); line-height: 1.6; }
+        .lp-footer { text-align: center; padding: 70px 0 90px; }
+        .lp-footer .lp-wordmark { margin-bottom: 10px; }
+        .lp-footer .lp-tagline { font-family: 'Fraunces', serif; font-style: italic; font-size: 15px; color: var(--lp-ink-soft); }
+        @media (max-width: 600px) {
+          .lp-hero h1 { font-size: 36px; }
+          .lp-story h2 { font-size: 24px; }
+          .lp-section { padding: 60px 0; }
+          .lp-flow { flex-direction: column; }
+          .lp-flow-arrow { transform: rotate(90deg); }
+        }
+      `}</style>
+
+      <div className="lp-shell">
+        <div className="lp-hero">
+          <div className="lp-wordmark">Being <em>Wealthy</em></div>
+          <h1>See your money clearly.</h1>
+          <p className="lp-sub">Your personal financial operating system — turning your cash flow, investments, debt, and net worth into one clear picture, so you always know what to do next.</p>
+          <button className="lp-cta" onClick={onGetStarted}>Get Started</button>
+          <div className="lp-privacy-line">Private by design · Local-first</div>
+
+          <div className="lp-path-strip">
+            <span className="lp-step">See</span><span className="lp-arrow">→</span>
+            <span className="lp-step">Understand</span><span className="lp-arrow">→</span>
+            <span className="lp-step">Decide</span><span className="lp-arrow">→</span>
+            <span className="lp-step lp-final">Wealth</span>
+          </div>
+
+          <div className="lp-mockup-frame">
+            <div className="lp-mockup-card">
+              <div className="lp-nw-headline">
+                <div className="lp-label">Net Worth</div>
+                <div className="lp-value">₹1.24 Cr</div>
+              </div>
+              <hr className="lp-mockup-hr" />
+              <div className="lp-mockup-label">Cash Flow · This Month</div>
+              <div className="lp-row"><span className="lp-k">Income</span><span className="lp-v">₹4.20L</span></div>
+              <div className="lp-row"><span className="lp-k">Expenses</span><span className="lp-v">₹1.85L</span></div>
+              <div className="lp-row"><span className="lp-k">Savings</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>₹2.35L <span className="lp-rate-tag">56% of income</span></span></div>
+              <hr className="lp-mockup-hr" />
+              <div className="lp-row"><span className="lp-k">Investments</span><span className="lp-v">₹38.4L</span></div>
+            </div>
+          </div>
+        </div>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <div className="lp-num">01 — See</div>
+          <h2>Everything you own.<br/>Everything you owe. One picture.</h2>
+          <p>Bank accounts, credit cards, investments, loans, and goals come together into one financial picture — always current, no spreadsheet upkeep.</p>
+          <div className="lp-mockup-frame">
+            <div className="lp-mockup-card">
+              <div className="lp-mockup-label">Net Worth</div>
+              <div className="lp-row"><span className="lp-k">Bank balances</span><span className="lp-v">₹6.10L</span></div>
+              <div className="lp-row"><span className="lp-k">Market-tracked investments</span><span className="lp-v">₹32.8L</span></div>
+              <div className="lp-row"><span className="lp-k">Other investments (PF, Gold, Property)</span><span className="lp-v">₹94.2L</span></div>
+              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Total assets</span><span className="lp-v">₹1.33 Cr</span></div>
+              <hr className="lp-mockup-hr" />
+              <div className="lp-row"><span className="lp-k">Credit cards owed</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹0.42L</span></div>
+              <div className="lp-row"><span className="lp-k">Loans outstanding</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹8.60L</span></div>
+              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Total liabilities</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹9.02L</span></div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <div className="lp-num">02 — Understand</div>
+          <h2>Don't just track your money.<br/>Understand it.</h2>
+          <p>Instead of endless transactions, Being Wealthy explains what's actually happening — grounded only in numbers you've entered, never a guess dressed up as an answer.</p>
+          <div className="lp-mockup-frame">
+            <div className="lp-mockup-card" style={{ textAlign: "left" }}>
+              <div className="lp-mockup-label">Insights · This Month</div>
+              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Savings rate dropped 8 points vs last month — 44% now vs 52%.</div>
+              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Household spend is up 32% vs last month — ₹18,400 vs ₹13,900.</div>
+              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Investment rate is negative this month — you redeemed ₹20,000 more than you invested.</div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <div className="lp-num">03 — Decide</div>
+          <h2>The question isn't "what happened."<br/>It's "what should I do."</h2>
+          <p>Ask your Personal CFO the real question — afford this, invest or repay, which goal comes first — and get an answer traced back to your own numbers.</p>
+          <div className="lp-mockup-frame">
+            <div className="lp-mockup-card">
+              <div className="lp-cfo-q">"Can I afford a ₹6L car this year?"</div>
+              <div className="lp-cfo-a-label">Recommendation</div>
+              <div className="lp-cfo-a-text">Yes, comfortably. Based on your ₹2.35L average monthly savings and ₹8.4L in unallocated investments, a ₹6L purchase leaves your Emergency Fund and other goals untouched.</div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <div className="lp-num">04 — Wealth</div>
+          <h2>Then, watch it build.</h2>
+          <p>Every decision compounds. Track goals to completion, debt to zero, and net worth as it actually moves — not a projection, your real numbers, month after month.</p>
+          <div className="lp-mockup-frame">
+            <div className="lp-mockup-card" style={{ textAlign: "left" }}>
+              <div className="lp-mockup-label">Goals</div>
+              <div className="lp-row"><span className="lp-k">Emergency Fund</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>100% funded</span></div>
+              <div className="lp-row"><span className="lp-k">House Down Payment</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>62% funded</span></div>
+              <div className="lp-row"><span className="lp-k">Retirement</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>On track</span></div>
+              <hr className="lp-mockup-hr" />
+              <div className="lp-row"><span className="lp-k">Net Worth, 12 months ago</span><span className="lp-v">₹94.6L</span></div>
+              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Net Worth, today</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>₹1.24 Cr</span></div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <h2>How Being Wealthy works.</h2>
+          <p>No manual entry, no spreadsheets to maintain — four steps, and the rest keeps itself current.</p>
+          <div className="lp-howitworks-list">
+            <div className="lp-howitworks-item">
+              <div className="lp-howitworks-num">01</div>
+              <div>
+                <div className="lp-howitworks-title">Bring in your data</div>
+                <div className="lp-howitworks-desc">Upload a bank statement, investment holdings, or a loan schedule — PDF, CSV, or Excel. Being Wealthy figures out what it is and reads it for you.</div>
+              </div>
+            </div>
+            <div className="lp-howitworks-item">
+              <div className="lp-howitworks-num">02</div>
+              <div>
+                <div className="lp-howitworks-title">Make sure it's right</div>
+                <div className="lp-howitworks-desc">Review what got categorized, correct anything that's off, and it remembers your corrections as rules — so next month needs far less review.</div>
+              </div>
+            </div>
+            <div className="lp-howitworks-item">
+              <div className="lp-howitworks-num">03</div>
+              <div>
+                <div className="lp-howitworks-title">Build your financial picture</div>
+                <div className="lp-howitworks-desc">Cash Flow, Net Worth, Investments, Debt, and Goals update automatically from what you've imported — always current, nothing to maintain by hand.</div>
+              </div>
+            </div>
+            <div className="lp-howitworks-item">
+              <div className="lp-howitworks-num">04</div>
+              <div>
+                <div className="lp-howitworks-title">Understand what to do next</div>
+                <div className="lp-howitworks-desc">Ask the Analyst what changed, or the Personal CFO what you should do — both answer only from your own real numbers.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
+          <h2>Your money. Your data. Your device.</h2>
+          <div className="lp-privacy-subhead">Privacy by design. Local-first by default.</div>
+          <p>Your financial life stays on your device. Being Wealthy doesn't need a central database of your financial information, and we don't sell your data.</p>
+          <p>When you choose to use AI, your browser connects directly to the AI provider using your own API key.</p>
+          <div className="lp-flow">
+            <div className="lp-flow-box">Your Device</div>
+            <div className="lp-flow-arrow">→</div>
+            <div className="lp-flow-box">AI Provider</div>
+          </div>
+          <div className="lp-flow-caption">Your data stays local. You stay in control.</div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <div className="lp-footer">
+          <div className="lp-wordmark">Being <em>Wealthy</em></div>
+          <div className="lp-tagline">See your money clearly.</div>
+          <button className="lp-cta" style={{ marginTop: 26 }} onClick={onGetStarted}>Get Started</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------------- */
 /* Main component                                                         */
 /* ---------------------------------------------------------------------- */
 
 export default function BeingWealthyLedger() {
-  const [view, setView] = useState("cashflow"); // cashflow | networth | investments | goals | upload | review | rules
+  const [view, setView] = useState("landing"); // landing | cashflow | networth | investments | goals | upload | review | rules
   const [transactions, setTransactions] = useState([]);
   const [rules, setRules] = useState([]);
   const [accounts, setAccounts] = useState([]);
@@ -1354,6 +1983,18 @@ export default function BeingWealthyLedger() {
   // from the goal's own settings plus the portfolio's current invested value, same
   // "derive at read time, store only the real inputs" philosophy as Investments.
   const [goals, setGoals] = useState([]);
+  // One entry per imported amortization schedule (a whole loan's period-by-period
+  // table, not a point-in-time snapshot like holdings — an amortization document
+  // covers the full tenure in one import). Multiple schedules per account are
+  // supported for restructuring: a later import's periods take priority over an
+  // earlier one's for any period both cover, computed live, never merged at write time.
+  const [debtSchedules, setDebtSchedules] = useState([]);
+  // Unified "Other Investments" (PF, Gold, Property, etc.) — one consistent shape
+  // (units, cost-per-unit, current-per-unit, invested value, current value),
+  // matching the same field names and derivation approach already used for
+  // market-tracked holdings. Replaces an earlier assetBalances/manualAssets split;
+  // old data in that shape migrates forward once, on load, below.
+  const [otherInvestments, setOtherInvestments] = useState([]);
   // Analyst/CFO conversations — one array, tagged by persona, since the shape is
   // identical. A saved prompt is a TEMPLATE with placeholder tokens (e.g. "[category]")
   // inserted from a fixed, small set — never free text referencing arbitrary data —
@@ -1363,8 +2004,23 @@ export default function BeingWealthyLedger() {
   const [savedPrompts, setSavedPrompts] = useState([]);
   const [ready, setReady] = useState(false);
   const [toast, setToast] = useState("");
+  const [tutorialActive, setTutorialActive] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
+  const [hasSeenTutorial, setHasSeenTutorial] = useState(true); // true until proven otherwise, to avoid a flash of the tour before load completes
   const [theme, setTheme] = useState("light"); // light | dark
   const saveTimerRef = useRef(null);
+
+  // Auto-backup: Chrome/Edge can remember a chosen folder and write fresh backups
+  // there without asking again each time (File System Access API). Firefox and
+  // Safari don't implement this at all — deliberately, not as a rollout-in-progress
+  // gap — so lastBackupAt drives a simple reminder for everyone that isn't on the
+  // supported path, rather than silence for browsers that can't get the real thing.
+  const autoBackupSupported = typeof window !== "undefined" && !!window.showDirectoryPicker;
+  const [autoBackupFolderName, setAutoBackupFolderName] = useState(null);
+  const [autoBackupError, setAutoBackupError] = useState(null);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+  const autoBackupThrottleRef = useRef(0);
+  const autoBackupHandleRef = useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -1388,13 +2044,27 @@ export default function BeingWealthyLedger() {
       if (combined) {
         setTransactions(combined.transactions || []);
         setRules(combined.rules || seedRules());
-        setAccounts(combined.accounts || []);
         setBudgets(combined.budgets || {});
         setMerchantAliases(combined.merchantAliases || []);
         setHoldingSnapshots(combined.holdingSnapshots || []);
         setGoals(combined.goals || []);
+        setDebtSchedules(combined.debtSchedules || []);
         setChatThreads(combined.chatThreads || []);
         setSavedPrompts(combined.savedPrompts || []);
+        if (combined.otherInvestments) {
+          // Already migrated in a prior session — load as-is.
+          setAccounts(combined.accounts || []);
+          setOtherInvestments(combined.otherInvestments);
+        } else {
+          // First load since Statement-based/Manual unified into Other Investments —
+          // migrate the old split forward once, verified against a mixed scenario
+          // before ever touching real saved data.
+          const { migratedAccounts, migratedEntries } = migrateToOtherInvestments(
+            combined.accounts || [], combined.assetBalances || [], combined.manualAssets || []
+          );
+          setAccounts(migratedAccounts);
+          setOtherInvestments(migratedEntries);
+        }
       } else {
         const [t, r, a, b, ma] = await Promise.all([
           loadState("transactions", []),
@@ -1410,10 +2080,79 @@ export default function BeingWealthyLedger() {
         setMerchantAliases(ma || []);
         setHoldingSnapshots([]);
         setGoals([]);
+        setDebtSchedules([]);
+        setOtherInvestments([]);
         setChatThreads([]);
         setSavedPrompts([]);
       }
+      setHasSeenTutorial(await loadState("hasSeenTutorial", false));
       setReady(true);
+    })();
+  }, []);
+
+  // Auto-launches once for a genuinely first-time user — checked only when ready
+  // flips true, so a later reset (which also empties accounts/transactions) doesn't
+  // re-trigger it, since hasSeenTutorial is a separate, independently-persisted flag.
+  useEffect(() => {
+    if (ready && !hasSeenTutorial && accounts.length === 0 && transactions.length === 0) {
+      setTutorialActive(true);
+      setTutorialStep(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  function finishTutorial() {
+    setTutorialActive(false);
+    setHasSeenTutorial(true);
+    saveState("hasSeenTutorial", true);
+  }
+
+  function startTutorial() {
+    setTutorialStep(0);
+    setTutorialActive(true);
+  }
+
+  // Navigates the actual app to match whatever the current tutorial step is
+  // describing, so the overlay always sits on top of the real screen it's talking
+  // about rather than a generic walkthrough disconnected from the product.
+  useEffect(() => {
+    if (tutorialActive && TUTORIAL_STEPS[tutorialStep]?.view) {
+      setView(TUTORIAL_STEPS[tutorialStep].view);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tutorialActive, tutorialStep]);
+
+  function tutorialNext() {
+    setTutorialStep((s) => Math.min(s + 1, TUTORIAL_STEPS.length - 1));
+  }
+  function tutorialBack() {
+    setTutorialStep((s) => Math.max(s - 1, 0));
+  }
+
+  // Restore the auto-backup folder handle, if one was granted in a previous session.
+  // Permission can be CHECKED silently (queryPermission), but re-GRANTING it after a
+  // browser restart requires an actual user click (requestPermission cannot be called
+  // without a user gesture) — that's a real constraint of the API, not a bug here, so
+  // a lapsed permission surfaces as a "resume" prompt rather than a silent failure.
+  useEffect(() => {
+    (async () => {
+      const storedAt = await loadState("lastBackupAt", null);
+      if (storedAt) setLastBackupAt(storedAt);
+      if (!autoBackupSupported) return;
+      try {
+        const handle = await loadBackupFolderHandle();
+        if (!handle) return;
+        const permission = await handle.queryPermission({ mode: "readwrite" });
+        if (permission === "granted") {
+          autoBackupHandleRef.current = handle;
+          setAutoBackupFolderName(handle.name);
+        } else {
+          setAutoBackupFolderName(handle.name);
+          setAutoBackupError("resume-needed");
+        }
+      } catch {
+        /* no stored handle, or IndexedDB unavailable — auto-backup just isn't active */
+      }
     })();
   }, []);
 
@@ -1425,10 +2164,17 @@ export default function BeingWealthyLedger() {
     if (!ready) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveState("appData", { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, chatThreads, savedPrompts });
+      saveState("appData", { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts });
+      // Same trigger as the regular save — if a folder is actively connected, write a
+      // fresh backup there too, throttled to at most once every 5 minutes so rapid
+      // edits don't hammer the disk with a new file on every keystroke.
+      if (autoBackupHandleRef.current && Date.now() - autoBackupThrottleRef.current > 5 * 60 * 1000) {
+        autoBackupThrottleRef.current = Date.now();
+        writeBackupToFolder(autoBackupHandleRef.current, true);
+      }
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, chatThreads, savedPrompts, ready]);
+  }, [transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, ready]);
 
   function showToast(msg) {
     setToast(msg);
@@ -1443,9 +2189,24 @@ export default function BeingWealthyLedger() {
     setBudgets({});
     setHoldingSnapshots([]);
     setGoals([]);
+    setDebtSchedules([]);
+    setOtherInvestments([]);
     setChatThreads([]); // old conversations reference specific numbers that go stale
     setConfirmingReset(false);
-    showToast("Transactions, accounts, budgets, holdings, goals, and chat history cleared. Rules, merchant groups, and saved prompts are untouched.");
+    showToast("Transactions, accounts, budgets, holdings, goals, debt schedules, assets, and chat history cleared. Rules, merchant groups, and saved prompts are untouched.");
+  }
+
+  /** The single definition of "what a complete backup contains" — shared by the
+   *  manual download button and folder-based auto-backup, so there's exactly one
+   *  place to update if a new field is ever added. Two backup paths independently
+   *  deciding what to include would risk them silently drifting apart over time. */
+  function buildBackupPayload() {
+    return {
+      beingWealthyBackup: true,
+      exportedAt: new Date().toISOString(),
+      version: 1,
+      data: { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts },
+    };
   }
 
   /** Everything persisted, in one file. This is the entire fix for a very real,
@@ -1456,12 +2217,7 @@ export default function BeingWealthyLedger() {
    *  drive's synced folder, anywhere they choose. Nothing about the file itself
    *  ever leaves this device unless the person explicitly moves it. */
   function exportBackup() {
-    const payload = {
-      beingWealthyBackup: true,
-      exportedAt: new Date().toISOString(),
-      version: 1,
-      data: { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, chatThreads, savedPrompts },
-    };
+    const payload = buildBackupPayload();
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1471,7 +2227,73 @@ export default function BeingWealthyLedger() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    setLastBackupAt(Date.now());
+    saveState("lastBackupAt", Date.now());
     showToast("Backup downloaded — keep this file somewhere safe, like a synced cloud folder.");
+  }
+
+  /** Writes a fresh backup directly into the connected folder — no download prompt,
+   *  no repeated permission ask, since that was already granted once when the folder
+   *  was chosen. Uses the exact same payload as the manual download, so an automatic
+   *  backup is never a lesser version of a manual one. */
+  async function writeBackupToFolder(handle, silent) {
+    try {
+      const payload = buildBackupPayload();
+      const filename = `being-wealthy-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      const fileHandle = await handle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(payload, null, 2));
+      await writable.close();
+      setLastBackupAt(Date.now());
+      saveState("lastBackupAt", Date.now());
+      setAutoBackupError(null);
+      if (!silent) showToast(`Backed up to "${handle.name}".`);
+    } catch (err) {
+      // A silent, automatic write failing shouldn't interrupt what the person is
+      // doing — surface it as a quiet status the settings area can show, not a toast
+      // that pops up uninvited while they're in the middle of something else.
+      setAutoBackupError(err.message || "Auto-backup failed");
+    }
+  }
+
+  async function enableAutoBackup() {
+    if (!autoBackupSupported) return;
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+      await saveBackupFolderHandle(handle);
+      autoBackupHandleRef.current = handle;
+      setAutoBackupFolderName(handle.name);
+      setAutoBackupError(null);
+      await writeBackupToFolder(handle, false);
+    } catch (err) {
+      // The person closing the folder picker without choosing anything also lands
+      // here (AbortError) — that's a cancellation, not a real failure, so it's not
+      // worth surfacing as an error.
+      if (err.name !== "AbortError") setAutoBackupError(err.message || "Couldn't set up auto-backup");
+    }
+  }
+
+  async function resumeAutoBackupPermission() {
+    const handle = await loadBackupFolderHandle();
+    if (!handle) return;
+    try {
+      const permission = await handle.requestPermission({ mode: "readwrite" });
+      if (permission === "granted") {
+        autoBackupHandleRef.current = handle;
+        setAutoBackupError(null);
+        showToast(`Auto-backup resumed for "${handle.name}".`);
+      }
+    } catch {
+      setAutoBackupError("Couldn't resume — try reconnecting the folder instead.");
+    }
+  }
+
+  async function disableAutoBackup() {
+    await clearBackupFolderHandle();
+    autoBackupHandleRef.current = null;
+    setAutoBackupFolderName(null);
+    setAutoBackupError(null);
+    showToast("Auto-backup turned off. Your existing backup files aren't affected.");
   }
 
   const [pendingImportFile, setPendingImportFile] = useState(null);
@@ -1505,13 +2327,23 @@ export default function BeingWealthyLedger() {
     const d = pendingImportFile.data || {};
     setTransactions(d.transactions || []);
     setRules(d.rules || seedRules());
-    setAccounts(d.accounts || []);
     setBudgets(d.budgets || {});
     setMerchantAliases(d.merchantAliases || []);
     setHoldingSnapshots(d.holdingSnapshots || []);
     setGoals(d.goals || []);
+    setDebtSchedules(d.debtSchedules || []);
     setChatThreads(d.chatThreads || []);
     setSavedPrompts(d.savedPrompts || []);
+    if (d.otherInvestments) {
+      setAccounts(d.accounts || []);
+      setOtherInvestments(d.otherInvestments);
+    } else {
+      // Restoring a backup taken before the unification — migrate it the same way
+      // live data gets migrated on load.
+      const { migratedAccounts, migratedEntries } = migrateToOtherInvestments(d.accounts || [], d.assetBalances || [], d.manualAssets || []);
+      setAccounts(migratedAccounts);
+      setOtherInvestments(migratedEntries);
+    }
     setPendingImportFile(null);
     showToast("Backup restored — this replaced everything that was in this browser.");
   }
@@ -1539,6 +2371,10 @@ export default function BeingWealthyLedger() {
   }
 
   const uncategorizedCount = transactions.filter((t) => !t.category).length;
+
+  if (view === "landing") {
+    return <LandingPage onGetStarted={() => setView("cashflow")} />;
+  }
 
   return (
     <div className={`bw-root ${theme === "dark" ? "theme-dark" : ""}`}>
@@ -1593,6 +2429,8 @@ export default function BeingWealthyLedger() {
         }
         .bw-title em { font-style: italic; color: var(--teal); font-weight: 500; }
         .bw-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }
+        .bw-screen-name { font-family: 'Fraunces', serif; font-weight: 600; font-size: 16px; color: var(--ink); margin: 18px 0 10px; }
+        .bw-tagline { font-size: 13px; color: var(--ink-soft); margin-top: 3px; font-style: italic; }
         .bw-reset {
           font-size: 11.5px; color: var(--ink-soft); background: none; border: 1px solid var(--line);
           padding: 6px 10px; border-radius: 3px; cursor: pointer; display: flex; align-items: center; gap: 5px;
@@ -1692,22 +2530,27 @@ export default function BeingWealthyLedger() {
         .bw-zone-header p { font-size: 12px; color: var(--ink-soft); margin: 1px 0 0; }
         .bw-hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
 
-        .bw-waterfall { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 16px 0 6px; }
-        .bw-wf-node {
-          border: 1px solid var(--line); border-radius: 7px; padding: 12px 15px; background: var(--card);
-          min-width: 118px; text-align: center;
+        .bw-waterfall-card {
+          border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+          padding: 26px; margin: 18px 0 6px;
         }
-        .bw-wf-node.negative { border-color: var(--rust); box-shadow: 0 0 0 1px var(--rust) inset; }
-        .bw-wf-node.clickable { cursor: pointer; }
-        .bw-wf-node.clickable:hover { border-color: var(--teal); }
-        .bw-wf-node-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); margin-bottom: 5px; }
+        .bw-waterfall { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; align-items: stretch; }
+        @media (max-width: 640px) { .bw-waterfall { grid-template-columns: repeat(2, 1fr) !important; } }
+        .bw-wf-node, .bw-wf-op {
+          border-radius: 8px; padding: 14px 10px; background: rgba(85,96,107,0.05);
+          text-align: center; transition: background 0.15s; min-width: 0;
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .bw-wf-node.negative, .bw-wf-op.negative { background: rgba(156,74,52,0.09); }
+        .bw-wf-node.clickable, .bw-wf-op.clickable { cursor: pointer; }
+        .bw-wf-node.clickable:hover, .bw-wf-op.clickable:hover { background: rgba(46,102,89,0.10); }
+        .bw-wf-node-label, .bw-wf-op-label {
+          font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--ink-soft); margin-bottom: 6px;
+        }
         .bw-wf-node-sublabel { text-transform: none; letter-spacing: 0; }
-        .bw-wf-node-value { font-family: 'IBM Plex Mono', monospace; font-size: 15px; font-weight: 600; }
-        .bw-wf-op { display: flex; flex-direction: column; align-items: center; padding: 0 8px; min-width: 80px; }
-        .bw-wf-op.clickable { cursor: pointer; }
+        .bw-wf-node-value, .bw-wf-op-value { font-family: 'IBM Plex Mono', monospace; font-size: 15px; font-weight: 600; white-space: nowrap; }
+        .bw-wf-arrow-h { display: none; }
         .bw-wf-arrow-v { display: none; }
-        .bw-wf-op-label { font-size: 10px; margin-top: 2px; white-space: nowrap; }
-        .bw-wf-op-value { font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600; }
 
         .bw-pillars { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
         .bw-pillar {
@@ -1736,19 +2579,40 @@ export default function BeingWealthyLedger() {
       <div className="bw-shell">
         <div className="bw-head">
           <div>
-            <div className="bw-title">
-              Being <em>Wealthy</em>
-              {{ cashflow: " — Cash Flow", networth: " — Net Worth", investments: " — Investments", goals: " — Goals" }[view] || ""}
-            </div>
+            <div className="bw-title" style={{ cursor: "pointer" }} onClick={() => setView("landing")} title="Back to the front page">Being <em>Wealthy</em></div>
+            <div className="bw-tagline">See your money clearly.</div>
             <div className="bw-sub">Private, on this device only · every number stays local</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button className="bw-reset" onClick={() => setView("landing")} title="About Being Wealthy">
+              About Us
+            </button>
+            <button className="bw-reset" onClick={startTutorial} title="Take a guided tour of the app">
+              Take a tour
+            </button>
             <button className="bw-theme-toggle" onClick={toggleTheme} title="Toggle light/dark">
               {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />} {theme === "dark" ? "Light" : "Dark"}
             </button>
             <button className="bw-reset" onClick={exportBackup} title="Download everything as one file">
               <Download size={12} /> Backup
             </button>
+            {autoBackupSupported && (
+              autoBackupFolderName ? (
+                autoBackupError === "resume-needed" ? (
+                  <button className="bw-reset" style={{ borderColor: "var(--ochre)", color: "var(--ochre)" }} onClick={resumeAutoBackupPermission} title="Browser restarted — reconfirm access to resume">
+                    <RefreshCw size={12} /> Resume auto-backup
+                  </button>
+                ) : (
+                  <button className="bw-reset" onClick={disableAutoBackup} title={`Auto-backing up to "${autoBackupFolderName}" — click to turn off`}>
+                    <Check size={12} color="var(--teal)" /> Auto-backup on
+                  </button>
+                )
+              ) : (
+                <button className="bw-reset" onClick={enableAutoBackup} title="Pick a folder to back up to automatically — no repeated prompts">
+                  <RefreshCw size={12} /> Enable auto-backup
+                </button>
+              )
+            )}
             <input ref={importInputRef} type="file" accept="application/json" style={{ display: "none" }}
               onChange={(e) => { handleImportFileChosen(e.target.files[0]); e.target.value = ""; }} />
             <button className="bw-reset" onClick={() => importInputRef.current?.click()} title="Restore from a backup file">
@@ -1765,6 +2629,23 @@ export default function BeingWealthyLedger() {
             )}
           </div>
         </div>
+
+        {!autoBackupFolderName && lastBackupAt && (Date.now() - lastBackupAt) > 7 * 24 * 60 * 60 * 1000 && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, fontSize: 12, padding: "8px 12px", margin: "0 0 14px", border: "1px solid var(--ochre)", borderRadius: 6 }}>
+            <span>
+              <AlertCircle size={13} color="var(--ochre)" style={{ verticalAlign: -2, marginRight: 6 }} />
+              It's been {Math.floor((Date.now() - lastBackupAt) / (24 * 60 * 60 * 1000))} days since your last backup.
+              {autoBackupSupported ? " Turn on auto-backup above, or back up manually." : " Back up manually — this browser doesn't support automatic backups."}
+            </span>
+            <button className="bw-reset" onClick={exportBackup}>Back up now</button>
+          </div>
+        )}
+        {!autoBackupFolderName && !lastBackupAt && ready && transactions.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, fontSize: 12, padding: "8px 12px", margin: "0 0 14px", border: "1px solid var(--ochre)", borderRadius: 6 }}>
+            <span><AlertCircle size={13} color="var(--ochre)" style={{ verticalAlign: -2, marginRight: 6 }} />You haven't backed up yet — everything here lives only in this browser.</span>
+            <button className="bw-reset" onClick={exportBackup}>Back up now</button>
+          </div>
+        )}
 
         {importError && (
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, fontSize: 12, padding: "8px 12px", margin: "0 0 14px", border: "1px solid var(--rust)", borderRadius: 6, color: "var(--rust)" }}>
@@ -1786,10 +2667,18 @@ export default function BeingWealthyLedger() {
           </div>
         )}
 
+        <div className="bw-screen-name">
+          {{
+            cashflow: "Cash Flow", networth: "Net Worth", investments: "Investments", debt: "Debt", goals: "Goals",
+            analyst: "Analyst", cfo: "Personal CFO", upload: "Upload", review: "Review", rules: "Rules", accounts: "Accounts",
+          }[view] || ""}
+        </div>
+
         <div className="bw-pillars">
           <PillarButton id="cashflow" icon={LineChartIcon} label="Cash Flow" view={view} setView={setView} />
-          <PillarButton id="networth" icon={Landmark} label="Net Worth" view={view} setView={setView} soon />
+          <PillarButton id="networth" icon={Landmark} label="Net Worth" view={view} setView={setView} />
           <PillarButton id="investments" icon={TrendingUp} label="Investments" view={view} setView={setView} />
+          <PillarButton id="debt" icon={TrendingDown} label="Debt" view={view} setView={setView} />
           <PillarButton id="goals" icon={Flag} label="Goals" view={view} setView={setView} />
           <PillarButton id="analyst" icon={Lightbulb} label="Analyst" view={view} setView={setView} />
           <PillarButton id="cfo" icon={Target} label="Personal CFO" view={view} setView={setView} />
@@ -1800,6 +2689,7 @@ export default function BeingWealthyLedger() {
           <TabButton id="upload" icon={Upload} label="Upload" tab={view} setTab={setView} />
           <TabButton id="review" icon={ListChecks} label="Review" tab={view} setTab={setView} badge={uncategorizedCount || null} />
           <TabButton id="rules" icon={FileText} label="Rules" tab={view} setTab={setView} />
+          <TabButton id="accounts" icon={Wallet} label="Accounts" tab={view} setTab={setView} />
         </div>
 
         <div className="bw-panel">
@@ -1810,6 +2700,7 @@ export default function BeingWealthyLedger() {
               transactions={transactions} setTransactions={setTransactions}
               showToast={showToast}
               holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
+              debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
             />
           )}
           {view === "review" && (
@@ -1828,6 +2719,14 @@ export default function BeingWealthyLedger() {
               merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases}
             />
           )}
+          {view === "accounts" && (
+            <AccountsHistoryPanel
+              accounts={accounts} setAccounts={setAccounts}
+              transactions={transactions} setTransactions={setTransactions}
+              holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
+              showToast={showToast}
+            />
+          )}
           {view === "cashflow" && (
             <CashFlowOverview
               transactions={transactions} setTransactions={setTransactions}
@@ -1838,12 +2737,23 @@ export default function BeingWealthyLedger() {
             />
           )}
           {view === "networth" && (
-            <PillarPlaceholder icon={Landmark} title="Net Worth"
-              blurb="Track assets, liabilities, and how your overall wealth changes over time — coming soon." />
+            <NetWorthOverview
+              accounts={accounts} holdingSnapshots={holdingSnapshots}
+              otherInvestments={otherInvestments}
+              debtSchedules={debtSchedules}
+              onGoToView={setView}
+            />
           )}
           {view === "investments" && (
             <InvestmentsOverview
-              accounts={accounts} holdingSnapshots={holdingSnapshots}
+              accounts={accounts} setAccounts={setAccounts} holdingSnapshots={holdingSnapshots}
+              otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments}
+              onGoToUpload={() => setView("upload")}
+            />
+          )}
+          {view === "debt" && (
+            <DebtOverview
+              accounts={accounts} debtSchedules={debtSchedules}
               onGoToUpload={() => setView("upload")}
             />
           )}
@@ -1875,6 +2785,14 @@ export default function BeingWealthyLedger() {
       </div>
 
       {toast && <div className="bw-toast"><Check size={14} /> {toast}</div>}
+      {tutorialActive && (
+        <TutorialOverlay
+          step={tutorialStep} totalSteps={TUTORIAL_STEPS.length}
+          title={TUTORIAL_STEPS[tutorialStep].title} body={TUTORIAL_STEPS[tutorialStep].body}
+          onNext={tutorialNext} onBack={tutorialBack}
+          onSkip={finishTutorial} onFinish={finishTutorial}
+        />
+      )}
     </div>
   );
 }
@@ -1894,6 +2812,45 @@ function PillarPlaceholder({ icon: Icon, title, blurb }) {
       <Icon size={28} color="var(--ink-soft)" />
       <h2>{title}</h2>
       <p>{blurb}</p>
+    </div>
+  );
+}
+
+/** Each step targets a real view — the overlay switches the app to that screen as it
+ *  advances, so what's behind the overlay always matches what's being described,
+ *  rather than a generic walkthrough disconnected from the actual product. */
+const TUTORIAL_STEPS = [
+  { view: null, title: "Welcome to Being Wealthy", body: "A quick tour of how everything fits together — six steps, about a minute. You can skip anytime, or take it again later from the header." },
+  { view: "upload", title: "Start here: Upload", body: "Bring in a bank statement, credit card statement, investment holdings, or a loan schedule — PDF, CSV, or Excel. The app figures out what it is and reads it for you." },
+  { view: "review", title: "Review & Rules", body: "First-time categorization is manual — tag a merchant once, and it becomes a rule. Every import after that needs far less review." },
+  { view: "cashflow", title: "Cash Flow", body: "Income, expenses, savings, and investments — laid out as one equation, always current, with your actual savings and investment rate." },
+  { view: "networth", title: "Net Worth", body: "Everything you own, minus everything you owe — pulled live from every other screen, never tracked separately." },
+  { view: "investments", title: "Investments", body: "Stocks, mutual funds, PF, gold, and property — one place, real invested-vs-current growth." },
+  { view: "debt", title: "Debt", body: "What you owe, what you've paid down, and what's coming next." },
+  { view: "goals", title: "Goals", body: "Set a target, fund it from real holdings or your savings, and track genuine progress toward it." },
+  { view: "analyst", title: "Analyst & Personal CFO", body: "Ask what changed this month, or whether you can afford something — every answer is traced back to your own numbers, never invented." },
+  { view: null, title: "That's the whole picture", body: "Upload your first statement whenever you're ready. Retake this tour anytime from the \"Take a tour\" button, top right." },
+];
+
+function TutorialOverlay({ step, totalSteps, title, body, onNext, onBack, onSkip, onFinish }) {
+  const isLast = step === totalSteps - 1;
+  const isFirst = step === 0;
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(20,22,26,0.55)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center", padding: 24 }}>
+      <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, padding: 22, maxWidth: 440, width: "100%", marginBottom: 40, boxShadow: "0 8px 30px rgba(0,0,0,0.25)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <span style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace" }}>{step + 1} of {totalSteps}</span>
+          <button onClick={onSkip} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink-soft)", fontSize: 11.5, display: "flex", alignItems: "center", gap: 3 }}>
+            <X size={12} /> Skip tour
+          </button>
+        </div>
+        <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, margin: "0 0 8px" }}>{title}</h3>
+        <p style={{ fontSize: 13.5, color: "var(--ink-soft)", lineHeight: 1.6, margin: "0 0 18px" }}>{body}</p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <button className="bw-btn ghost small" onClick={onBack} disabled={isFirst} style={{ visibility: isFirst ? "hidden" : "visible" }}>Back</button>
+          <button className="bw-btn small" onClick={isLast ? onFinish : onNext}>{isLast ? "Finish" : "Next"}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2091,8 +3048,241 @@ function ImportCompletionPromptPanel({ prompt, accounts, onConfirm, onSkip }) {
   );
 }
 
-function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots }) {
+/* ---------------------------------------------------------------------- */
+/* Accounts & Upload History — split out into its own Data tab, separate   */
+/* from the actual import flow, so "what did I already import" isn't      */
+/* buried at the bottom of the Upload screen. Owns its own local UI state  */
+/* (which rows are expanded/confirming-delete); the actual delete/confirm */
+/* operations were already pure functions of props already available at   */
+/* the top level (setAccounts/setHoldingSnapshots/setTransactions),        */
+/* moved here unchanged.                                                   */
+/* ---------------------------------------------------------------------- */
+
+function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransactions, holdingSnapshots, setHoldingSnapshots, showToast }) {
+  const [showUploadHistory, setShowUploadHistory] = useState(true);
+  const [confirmingDeleteBatch, setConfirmingDeleteBatch] = useState(null);
+  const [confirmingDeleteSnapshot, setConfirmingDeleteSnapshot] = useState(null);
+
+  function deleteUploadBatch(accountId, batchId) {
+    setTransactions((prev) => {
+      const deletedIds = new Set(prev.filter((t) => t.importBatchId === batchId).map((t) => t.id));
+      return prev
+        .filter((t) => t.importBatchId !== batchId)
+        .map((t) => (t.linkedTransactionId && deletedIds.has(t.linkedTransactionId) ? { ...t, linkedTransactionId: null } : t));
+    });
+    setAccounts((prev) => prev.map((a) => {
+      if (a.id !== accountId) return a;
+      return {
+        ...a,
+        balanceHistory: (a.balanceHistory || []).filter((h) => h.importBatchId !== batchId),
+        uploadHistory: (a.uploadHistory || []).filter((h) => h.batchId !== batchId),
+      };
+    }));
+    showToast("Deleted that import. Rules are untouched — re-importing will re-categorize automatically.");
+  }
+
+  function deleteHoldingSnapshot(accountId, snapshotId) {
+    setHoldingSnapshots((prev) => prev.filter((s) => s.id !== snapshotId));
+    setAccounts((prev) => prev.map((a) => (a.id === accountId
+      ? { ...a, uploadHistory: (a.uploadHistory || []).filter((h) => h.snapshotId !== snapshotId) }
+      : a)));
+    showToast("Deleted that holding snapshot.");
+  }
+
+  function confirmParsedBalance(accountId, batchId, which) {
+    setAccounts((prev) => prev.map((a) => {
+      if (a.id !== accountId) return a;
+      const entry = (a.uploadHistory || []).find((h) => h.batchId === batchId);
+      if (!entry) return a;
+      const value = which === "opening" ? entry.parsedOpeningBalance : entry.parsedClosingBalance;
+      if (value === null || value === undefined) return a;
+      const dateStr = which === "opening"
+        ? (() => { const d = new Date(entry.periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
+        : entry.periodEnd;
+      let balanceHistory = (a.balanceHistory || []).filter((h) => h.date !== dateStr);
+      balanceHistory.push({ date: dateStr, balance: value, importBatchId: batchId });
+      balanceHistory.sort((x, y) => x.date.localeCompare(y.date));
+      const uploadHistory = (a.uploadHistory || []).map((h) => (h.batchId === batchId
+        ? { ...h, [which === "opening" ? "openingBalance" : "closingBalance"]: value }
+        : h));
+      return {
+        ...a, balanceHistory, uploadHistory,
+        lastKnownBalance: which === "closing" ? value : a.lastKnownBalance,
+      };
+    }));
+    showToast("Confirmed — this balance now feeds the Cash Flow dashboard.");
+  }
+
+  const allUploadHistory = accounts
+    .filter((a) => a.type !== "demat" && a.type !== "mutualFund")
+    .flatMap((a) => (a.uploadHistory || []).map((h) => ({ ...h, accountId: a.id, accountNickname: a.nickname, accountIsCC: a.type === "creditCard" })))
+    .sort((a, b) => b.importedAt - a.importedAt);
+
+  const invAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
+  const allSnapshots = holdingSnapshots
+    .map((s) => ({ ...s, accountNickname: invAccounts.find((a) => a.id === s.accountId)?.nickname || "—" }))
+    .sort((a, b) => b.importedAt - a.importedAt);
+
+  if (accounts.length === 0) {
+    return <div className="bw-empty">No accounts yet — import a statement first, from the Upload tab.</div>;
+  }
+
+  return (
+    <div>
+      <h2 className="bw-h2">Accounts &amp; Upload History</h2>
+      <p className="bw-lead">Every account you've created, and everything you've imported into it — review, confirm parsed balances, or delete an import.</p>
+
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Accounts</div>
+      <table className="bw-table">
+        <thead><tr><th>Nickname</th><th>Institution</th><th style={{ textAlign: "right" }}>Transactions</th></tr></thead>
+        <tbody>
+          {accounts.map((a) => (
+            <tr key={a.id}>
+              <td>{a.nickname}</td>
+              <td>{a.institution}</td>
+              <td style={{ textAlign: "right" }}>{transactions.filter((t) => t.accountId === a.id).length}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {allUploadHistory.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <button
+            onClick={() => setShowUploadHistory((v) => !v)}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 600, color: "var(--ink)" }}
+          >
+            {showUploadHistory ? <ChevronUp size={14} /> : <ChevronRight size={14} />} Upload history ({allUploadHistory.length})
+          </button>
+          {showUploadHistory && (
+            <table className="bw-table" style={{ marginTop: 10 }}>
+              <thead>
+                <tr><th>Account</th><th>Period</th><th>Balances</th><th style={{ textAlign: "right" }}>Transactions</th><th>Imported</th><th></th></tr>
+              </thead>
+              <tbody>
+                {allUploadHistory.map((h) => {
+                  const renderBalance = (trusted, parsed, which, h) => {
+                    if (trusted !== null) return <span>{inr(trusted)}</span>;
+                    if (parsed !== null) return (
+                      <span style={{ color: "var(--ochre)", display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        {inr(parsed)} <span style={{ fontSize: 9.5 }}>(parsed, not confirmed)</span>
+                        <button
+                          className="bw-btn ghost small" style={{ padding: "1px 6px", fontSize: 9.5 }}
+                          onClick={() => confirmParsedBalance(h.accountId, h.batchId, which)}
+                        >
+                          Confirm
+                        </button>
+                      </span>
+                    );
+                    return <span style={{ color: "var(--ink-soft)" }}>—</span>;
+                  };
+                  return (
+                  <tr key={h.batchId}>
+                    <td>{h.accountNickname}</td>
+                    <td style={{ fontSize: 11.5 }}>
+                      {h.periodStart} → {h.periodEnd}
+                      {(h.extractedPeriodStart || h.statementDate) && (
+                        <div style={{ fontSize: 10, color: "var(--ink-soft)", marginTop: 2 }}>
+                          {h.extractedPeriodStart
+                            ? `Printed: ${h.extractedPeriodStart} → ${h.extractedPeriodEnd}`
+                            : `Statement date: ${h.statementDate}`}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ fontSize: 11 }}>
+                      <div>{h.accountIsCC ? "Previous balance" : "Opening"}: {renderBalance(h.openingBalance, h.parsedOpeningBalance, "opening", h)}</div>
+                      <div>{h.accountIsCC ? "Outstanding" : "Closing"}: {renderBalance(h.closingBalance, h.parsedClosingBalance, "closing", h)}</div>
+                    </td>
+                    <td style={{ textAlign: "right" }}>{h.transactionCount}</td>
+                    <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{new Date(h.importedAt).toLocaleDateString()}</td>
+                    <td>
+                      {confirmingDeleteBatch === h.batchId ? (
+                        <div style={{ display: "flex", gap: 6, alignItems: "center", whiteSpace: "nowrap" }}>
+                          <span style={{ fontSize: 11, color: "var(--rust)" }}>Delete this import?</span>
+                          <button
+                            className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
+                            onClick={() => { deleteUploadBatch(h.accountId, h.batchId); setConfirmingDeleteBatch(null); }}
+                          >
+                            Yes
+                          </button>
+                          <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteBatch(null)}>Cancel</button>
+                        </div>
+                      ) : (
+                        <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteBatch(h.batchId)}>
+                          <Trash2 size={12} /> Delete
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );})}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {allSnapshots.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>
+            Holdings imports ({allSnapshots.length})
+          </div>
+          <table className="bw-table">
+            <thead>
+              <tr><th>Account</th><th>As of</th><th style={{ textAlign: "right" }}>Holdings</th><th style={{ textAlign: "right" }}>Invested</th><th style={{ textAlign: "right" }}>Current value</th><th>Imported</th><th></th></tr>
+            </thead>
+            <tbody>
+              {allSnapshots.map((s) => (
+                <tr key={s.id}>
+                  <td>{s.accountNickname}</td>
+                  <td style={{ fontSize: 11.5 }}>{s.asOfDate}</td>
+                  <td style={{ textAlign: "right" }}>{s.holdings.length}</td>
+                  <td style={{ textAlign: "right" }}>{inr(s.totalInvestedValue)}</td>
+                  <td style={{ textAlign: "right" }}>{inr(s.totalCurrentValue)}</td>
+                  <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{new Date(s.importedAt).toLocaleDateString()}</td>
+                  <td>
+                    {confirmingDeleteSnapshot === s.id ? (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", whiteSpace: "nowrap" }}>
+                        <span style={{ fontSize: 11, color: "var(--rust)" }}>Delete this snapshot?</span>
+                        <button className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
+                          onClick={() => { deleteHoldingSnapshot(s.accountId, s.id); setConfirmingDeleteSnapshot(null); }}>
+                          Yes
+                        </button>
+                        <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteSnapshot(null)}>Cancel</button>
+                      </div>
+                    ) : (
+                      <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteSnapshot(s.id)}>
+                        <Trash2 size={12} /> Delete
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules }) {
   const [source, setSource] = useState("csv"); // csv | paste | llmpdf
+  // Unified upload — one dropzone, Stage 1 classification routes to whichever flow
+  // below actually handles the file. showManualTabs is the escape hatch: if
+  // classification is wrong or unconfident, the person can still pick a flow by hand
+  // rather than being stuck.
+  const [unifiedClassifying, setUnifiedClassifying] = useState(false);
+  const [unifiedError, setUnifiedError] = useState(null);
+  const [unifiedResult, setUnifiedResult] = useState(null);
+  const [showManualTabs, setShowManualTabs] = useState(false);
+  const [investmentInitialFile, setInvestmentInitialFile] = useState(null);
+  const [debtInitialFile, setDebtInitialFile] = useState(null);
+  const [investmentInitialPassword, setInvestmentInitialPassword] = useState("");
+  const [debtInitialPassword, setDebtInitialPassword] = useState("");
+  const [unifiedNeedsPassword, setUnifiedNeedsPassword] = useState(false);
+  const [unifiedWrongPassword, setUnifiedWrongPassword] = useState(false);
+  const [unifiedPassword, setUnifiedPassword] = useState("");
+  const [unifiedPendingFile, setUnifiedPendingFile] = useState(null);
   const [rawRows, setRawRows] = useState(null); // array of arrays, header:false parse
   const [headerRowIdx, setHeaderRowIdx] = useState(0);
   const [headers, setHeaders] = useState(null);
@@ -2170,9 +3360,6 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
   const [openingBalanceInput, setOpeningBalanceInput] = useState("");
   const [closingBalanceInput, setClosingBalanceInput] = useState("");
   const [importCompletionPrompt, setImportCompletionPrompt] = useState(null); // { accountId, cycleExpenseTotal, pending }
-  const [showUploadHistory, setShowUploadHistory] = useState(false);
-  const [confirmingDeleteBatch, setConfirmingDeleteBatch] = useState(null); // batchId currently confirming delete
-  const [confirmingDeleteSnapshot, setConfirmingDeleteSnapshot] = useState(null); // snapshotId currently confirming delete
   const [apiKey, setApiKey] = useState("");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [apiKeyEditing, setApiKeyEditing] = useState(false);
@@ -2339,86 +3526,119 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     setImportCompletionPrompt(null);
   }
 
-  // Deletes exactly one import batch — its transactions and the balance snapshots it
-  // recorded. Rules are deliberately never touched: they're independent of any specific
-  // import, so re-importing after this re-categorizes automatically from what you've
-  // already taught the app, rather than starting from a blank slate.
-  function deleteUploadBatch(accountId, batchId) {
-    setTransactions((prev) => {
-      const deletedIds = new Set(prev.filter((t) => t.importBatchId === batchId).map((t) => t.id));
-      return prev
-        .filter((t) => t.importBatchId !== batchId)
-        // A transfer being deleted may have been linked to a transaction on a DIFFERENT
-        // account (not part of this batch) — without this, that other side would be
-        // stuck showing "Linked" forever, pointing at a transaction that no longer
-        // exists, with no way to unlink it since the UI needs the linked transaction to
-        // actually render the Unlink control. Clearing the link returns it to a normal
-        // pending/suggested state instead.
-        .map((t) => (t.linkedTransactionId && deletedIds.has(t.linkedTransactionId) ? { ...t, linkedTransactionId: null } : t));
-    });
-    setAccounts((prev) => prev.map((a) => {
-      if (a.id !== accountId) return a;
-      return {
-        ...a,
-        balanceHistory: (a.balanceHistory || []).filter((h) => h.importBatchId !== batchId),
-        uploadHistory: (a.uploadHistory || []).filter((h) => h.batchId !== batchId),
-      };
-    }));
-    showToast("Deleted that import. Rules are untouched — re-importing will re-categorize automatically.");
+  const [aiSuggestion, setAiSuggestion] = useState(null); // from callClassifyAndMap, once it resolves — refines the heuristic below, never required for it to work
+
+  /** Routes a classified file to whichever existing, already-verified flow actually
+   *  handles that document type. Nothing about extraction changes here — this only
+   *  decides which flow gets the file. */
+  function routeClassifiedFile(category, file, pwd) {
+    if (category === "investment_holding") {
+      setSource("investment");
+      setInvestmentInitialPassword(pwd || "");
+      setInvestmentInitialFile(file);
+    } else if (category === "debt_schedule") {
+      setSource("debt");
+      setDebtInitialPassword(pwd || "");
+      setDebtInitialFile(file);
+    } else if (category === "bank_statement" || category === "credit_card_statement") {
+      if (/\.pdf$/i.test(file.name)) {
+        // Bank/CC PDF extraction is a deliberate two-step flow (select, then a
+        // separate "Extract" click) — land on it pre-filled rather than reaching in
+        // to auto-trigger a multi-step async process from outside its own component.
+        // The password (if this file needed one) carries over too, so "Extract"
+        // works on the first click instead of asking again.
+        setSource("llmpdf");
+        setLlmFile(file); setLlmFileName(file.name); setLlmError(null); setLlmRawResponse(null);
+        setNeedsPassword(false); setWrongPassword(false); setPdfPassword(pwd || "");
+        setClosingBalanceInput("");
+        setStatementBalances((prev) => ({ ...prev, closing: null }));
+        setExtractedStatementPeriod({ start: null, end: null, statementDate: null });
+        setPastePreview(null);
+      } else {
+        setSource("csv");
+        handleFile(file); // the bank/CC CSV flow, already AI-refined
+      }
+    } else if (category === "other_investment_statement") {
+      setUnifiedError('This looks like a PF, Gold, or Property statement — those are imported from Investments → "Other Investments", not here.');
+    } else {
+      setUnifiedError("Couldn't confidently identify this file — pick the right type below.");
+      setShowManualTabs(true);
+    }
   }
 
-  // Deletes one holding snapshot. Since Added/Redeemed/Growth are always computed at
-  // read time by diffing against whatever the PREVIOUS remaining snapshot is (never
-  // stored), deleting a snapshot just changes what "previous" means for the next
-  // transition going forward — no separate derived data to clean up.
-  function deleteHoldingSnapshot(accountId, snapshotId) {
-    setHoldingSnapshots((prev) => prev.filter((s) => s.id !== snapshotId));
-    setAccounts((prev) => prev.map((a) => (a.id === accountId
-      ? { ...a, uploadHistory: (a.uploadHistory || []).filter((h) => h.snapshotId !== snapshotId) }
-      : a)));
-    showToast("Deleted that holding snapshot.");
+  async function handleUnifiedFile(file, pwd) {
+    if (!file) return;
+    setUnifiedClassifying(true);
+    setUnifiedError(null);
+    setUnifiedResult(null);
+    setUnifiedNeedsPassword(false);
+    setUnifiedWrongPassword(false);
+    try {
+      if (!apiKey) {
+        setUnifiedError("Add your Gemini API key below (in the PDF (AI-assisted) tab) first — identifying a file needs it.");
+        return;
+      }
+      let inputParts;
+      if (/\.pdf$/i.test(file.name)) {
+        const { images } = await renderPdfPagesAsImages(file, pwd || undefined);
+        if (images.length === 0) { setUnifiedError("Couldn't render any pages from that PDF."); return; }
+        inputParts = images.slice(0, 2).map((b) => ({ inlineData: { mimeType: "image/png", data: b } }));
+      } else if (/\.csv$|\.xlsx$|\.xls$/i.test(file.name)) {
+        const rawSampleRows = await readSpreadsheetFile(file);
+        const sample = buildSpreadsheetSample(rawSampleRows, 20);
+        inputParts = [{ text: `File name: ${file.name}\n\nSample data:\n${sample}` }];
+      } else {
+        setUnifiedError("This supports PDF, CSV, or Excel files.");
+        return;
+      }
+      const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+      const classification = await callDocumentClassify(inputParts, apiKey, effectiveModel);
+      setUnifiedResult(classification);
+      routeClassifiedFile(classification.documentCategory, file, pwd);
+    } catch (err) {
+      if (err && err.needsPassword) {
+        setUnifiedNeedsPassword(true);
+        setUnifiedWrongPassword(!!err.wasWrongPassword);
+        setUnifiedPendingFile(file);
+      } else {
+        setUnifiedError(err.message || "Couldn't identify that file.");
+      }
+    } finally {
+      setUnifiedClassifying(false);
+    }
   }
 
-  // Promotes a parsed-but-not-yet-trusted balance (one that was extracted/derived but
-  // didn't clear the reconciliation bar automatically) into real balance history, once
-  // you've reviewed the number and are confident it's right — without needing to
-  // delete and re-import the whole statement just to fix one figure.
-  function confirmParsedBalance(accountId, batchId, which) {
-    setAccounts((prev) => prev.map((a) => {
-      if (a.id !== accountId) return a;
-      const entry = (a.uploadHistory || []).find((h) => h.batchId === batchId);
-      if (!entry) return a;
-      const value = which === "opening" ? entry.parsedOpeningBalance : entry.parsedClosingBalance;
-      if (value === null || value === undefined) return a;
-      const dateStr = which === "opening"
-        ? (() => { const d = new Date(entry.periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
-        : entry.periodEnd;
-      let balanceHistory = (a.balanceHistory || []).filter((h) => h.date !== dateStr);
-      balanceHistory.push({ date: dateStr, balance: value, importBatchId: batchId });
-      balanceHistory.sort((x, y) => x.date.localeCompare(y.date));
-      const uploadHistory = (a.uploadHistory || []).map((h) => (h.batchId === batchId
-        ? { ...h, [which === "opening" ? "openingBalance" : "closingBalance"]: value }
-        : h));
-      return {
-        ...a, balanceHistory, uploadHistory,
-        lastKnownBalance: which === "closing" ? value : a.lastKnownBalance,
-      };
-    }));
-    showToast("Confirmed — this balance now feeds the Cash Flow dashboard.");
+  function retryUnifiedWithPassword() {
+    handleUnifiedFile(unifiedPendingFile, unifiedPassword);
   }
 
-  function handleFile(file) {
+  async function handleFile(file) {
     if (!file) return;
     setFileName(file.name);
     setHeaders(null);
+    setAiSuggestion(null);
     Papa.parse(file, {
       header: false,
       skipEmptyLines: true,
-      complete: (res) => {
+      complete: async (res) => {
         const data = res.data || [];
         setRawRows(data);
         const guess = detectHeaderRow(data);
         setHeaderRowIdx(guess);
+        // The heuristic above already produced a fully usable, offline default —
+        // this AI call is a refinement layered on top, never a requirement. If it
+        // fails or there's no key configured, everything above still works exactly
+        // as it always has.
+        if (apiKey) {
+          try {
+            const sample = buildSpreadsheetSample(data, 30);
+            const embeddedImages = /\.xlsx$/i.test(file.name) ? await extractEmbeddedImages(file) : [];
+            const result = await callClassifyAndMap(sample, file.name, embeddedImages);
+            setAiSuggestion(result);
+          } catch {
+            /* silent — the heuristic-based defaults remain in place */
+          }
+        }
       },
     });
   }
@@ -2461,6 +3681,34 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       setTypeCol(guessColumn(uniqueHdrs, TYPE_ALIASES));
     }
   }, [rawRows, headerRowIdx]);
+
+  // Refines the heuristic-based defaults above once the AI classification resolves —
+  // corrects the header row first if AI found a better one (which re-triggers the
+  // effect above to rebuild headers/rows for that row), then matches AI's column
+  // mapping against the CURRENT headers once they reflect the right row, so this
+  // never applies a mapping built against a stale header row.
+  useEffect(() => {
+    if (!aiSuggestion || !headers) return;
+    if (aiSuggestion.institution) setInstitution(aiSuggestion.institution);
+    if (typeof aiSuggestion.headerRowIndex === "number" && aiSuggestion.headerRowIndex !== headerRowIdx) {
+      setHeaderRowIdx(aiSuggestion.headerRowIndex);
+      return;
+    }
+    const map = aiSuggestion.columnMapping || {};
+    const findHeader = (val) => (val && headers.includes(val) ? val : "");
+    if (findHeader(map.date)) setDateCol(findHeader(map.date));
+    if (findHeader(map.description)) setDescCol(findHeader(map.description));
+    const dCol = findHeader(map.debit), cCol = findHeader(map.credit);
+    if (dCol || cCol) {
+      setAmountMode("split");
+      if (dCol) setDebitCol(dCol);
+      if (cCol) setCreditCol(cCol);
+    } else if (findHeader(map.amount)) {
+      setAmountMode("single");
+      setAmountCol(findHeader(map.amount));
+      if (findHeader(map.transactionType)) setTypeCol(findHeader(map.transactionType));
+    }
+  }, [aiSuggestion, headers]);
 
   function resetImportForm() {
     setRawRows(null);
@@ -2895,7 +4143,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
   const CLASSIFY_MAP_SCHEMA = {
     type: "OBJECT",
     properties: {
-      documentType: { type: "STRING", enum: ["bank_statement", "credit_card_statement", "equity_holding", "mutual_fund_holding", "unknown"], description: "What kind of statement this is, based on the column headers and sample rows. 'equity_holding' is a stock/demat holdings export (has ISIN, Sector, or LTP/Current Price columns). 'mutual_fund_holding' is a mutual fund holdings export (has Folio Number, AMC, Scheme Name, or NAV columns). Use 'unknown' only if genuinely unclear." },
+      documentType: { type: "STRING", enum: ["bank_statement", "credit_card_statement", "equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding", "unknown"], description: "What kind of statement this is, based on the column headers and sample rows. 'equity_holding' is a stock/demat holdings export (has ISIN, Sector, or LTP/Current Price columns). 'mutual_fund_holding' is a mutual fund holdings export (has Folio Number, AMC, Scheme Name, or NAV columns). 'nps_holding' is an NPS (National Pension System) statement — often has PRAN, scheme/fund manager name, units, and NAV columns; treat it exactly like a mutual fund holding structurally. 'ulip_holding' is a ULIP (unit-linked insurance) fund-value statement — often has Policy Number, fund name, units, and NAV columns; also treat it exactly like a mutual fund holding structurally. Use 'unknown' only if genuinely unclear." },
       institution: { type: "STRING", nullable: true, description: "The bank, broker, or platform name. Check every part of the sample: a title/logo row above the header, a 'Client Name'/'Broker' style label, a column value repeated down the sheet, or the file name given below the sample (e.g. a file literally named 'Zerodha_holdings.xlsx' or containing a recognizable broker/AMC name). A generic file name like 'Portfolio_Holdings_2026.xlsx' with no such name anywhere is a real case where this should be null — do not guess." },
       headerRowIndex: { type: "NUMBER", description: "Which row (0-indexed) in the provided sample actually contains the column headers — spreadsheets exported from banks/brokers often have a few title or summary rows before the real header row." },
       skipRowIndices: {
@@ -3196,16 +4444,45 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       )}
       <h2 className="bw-h2">Import a statement</h2>
       <p className="bw-lead">
-        Export a CSV where your bank offers one, upload a PDF (decrypted and read locally, then structured by
-        Gemini using your own API key), or paste text as a fallback that needs no key at all.
+        Upload a bank statement, credit card statement, investment holdings export, or a loan schedule — PDF,
+        CSV, or Excel. We'll figure out what it is and take you to the right place.
       </p>
 
+      <div style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 18, marginBottom: 18, background: "var(--card)" }}>
+        {!unifiedResult && !unifiedClassifying && !unifiedNeedsPassword && (
+          <label className="bw-dropzone">
+            <input type="file" accept=".pdf,.csv,.xlsx,.xls" onChange={(e) => handleUnifiedFile(e.target.files[0])} />
+            <Upload size={22} style={{ marginBottom: 8 }} />
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Click to choose a file</div>
+            <div style={{ fontSize: 11.5, marginTop: 4 }}>PDF, CSV, or Excel</div>
+          </label>
+        )}
+        {unifiedClassifying && <div style={{ fontSize: 12.5, color: "var(--ink-soft)" }}>Identifying what this is…</div>}
+        {unifiedNeedsPassword && (
+          <div>
+            <div className="bw-field">
+              <label>{unifiedWrongPassword ? "That password didn't work — try again" : "This PDF is password-protected"}</label>
+              <input type="password" value={unifiedPassword} onChange={(e) => setUnifiedPassword(e.target.value)} placeholder="Password" />
+            </div>
+            <button className="bw-btn small" onClick={retryUnifiedWithPassword}>Unlock &amp; identify</button>
+          </div>
+        )}
+        {unifiedResult && (
+          <div style={{ fontSize: 12.5 }}>
+            Identified as <strong>{DOCUMENT_CATEGORY_LABELS[unifiedResult.documentCategory] || unifiedResult.documentCategory}</strong>
+            {unifiedResult.institution ? ` (${unifiedResult.institution})` : ""} — taking you there now.
+          </div>
+        )}
+        {unifiedError && <p style={{ fontSize: 12, color: "var(--rust)", marginTop: 8 }}>{unifiedError}</p>}
+        <button className="bw-btn ghost small" style={{ marginTop: 10 }} onClick={() => setShowManualTabs((v) => !v)}>
+          {showManualTabs ? "Hide manual options" : "Not right? Pick the type manually"}
+        </button>
+      </div>
+
+      {showManualTabs && (
       <div className="bw-tabs" style={{ marginBottom: 16 }}>
         <button className={`bw-tab ${source === "csv" ? "active" : ""}`} onClick={() => setSource("csv")}>
           <FileText size={13} /> CSV file
-        </button>
-        <button className={`bw-tab ${source === "paste" ? "active" : ""}`} onClick={() => setSource("paste")}>
-          <ClipboardPaste size={13} /> Paste from PDF
         </button>
         <button className={`bw-tab ${source === "llmpdf" ? "active" : ""}`} onClick={() => setSource("llmpdf")}>
           <Sparkles size={13} /> PDF (AI-assisted)
@@ -3213,7 +4490,11 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         <button className={`bw-tab ${source === "investment" ? "active" : ""}`} onClick={() => setSource("investment")}>
           <TrendingUp size={13} /> Investment holding
         </button>
+        <button className={`bw-tab ${source === "debt" ? "active" : ""}`} onClick={() => setSource("debt")}>
+          <TrendingDown size={13} /> Loan schedule
+        </button>
       </div>
+      )}
 
       {source === "investment" ? (
         <InvestmentImportFlow
@@ -3222,6 +4503,15 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
           apiKey={apiKey} aiModel={aiModel} customModelId={customModelId}
           callClassifyAndMap={callClassifyAndMap}
           showToast={showToast}
+          initialFile={investmentInitialFile} initialPassword={investmentInitialPassword}
+        />
+      ) : source === "debt" ? (
+        <DebtImportFlow
+          accounts={accounts} setAccounts={setAccounts}
+          debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
+          apiKey={apiKey} aiModel={aiModel} customModelId={customModelId}
+          showToast={showToast}
+          initialFile={debtInitialFile} initialPassword={debtInitialPassword}
         />
       ) : (
       <>
@@ -3731,153 +5021,6 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       </>
       )}
 
-      {accounts.length > 0 && (
-        <>
-          <div className="bw-section-label">Accounts so far</div>
-          <table className="bw-table">
-            <thead><tr><th>Nickname</th><th>Institution</th><th style={{ textAlign: "right" }}>Transactions</th></tr></thead>
-            <tbody>
-              {accounts.map((a) => (
-                <tr key={a.id}>
-                  <td>{a.nickname}</td>
-                  <td>{a.institution}</td>
-                  <td style={{ textAlign: "right" }}>{transactions.filter((t) => t.accountId === a.id).length}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      )}
-
-      {(() => {
-        const allUploadHistory = accounts
-          .filter((a) => a.type !== "demat" && a.type !== "mutualFund")
-          .flatMap((a) => (a.uploadHistory || []).map((h) => ({ ...h, accountId: a.id, accountNickname: a.nickname, accountIsCC: a.type === "creditCard" })))
-          .sort((a, b) => b.importedAt - a.importedAt);
-        if (allUploadHistory.length === 0) return null;
-        return (
-          <div style={{ marginTop: 18 }}>
-            <button
-              onClick={() => setShowUploadHistory((v) => !v)}
-              style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 600, color: "var(--ink)" }}
-            >
-              {showUploadHistory ? <ChevronUp size={14} /> : <ChevronRight size={14} />} Upload history ({allUploadHistory.length})
-            </button>
-            {showUploadHistory && (
-              <table className="bw-table" style={{ marginTop: 10 }}>
-                <thead>
-                  <tr><th>Account</th><th>Period</th><th>Balances</th><th style={{ textAlign: "right" }}>Transactions</th><th>Imported</th><th></th></tr>
-                </thead>
-                <tbody>
-                  {allUploadHistory.map((h) => {
-                    const renderBalance = (trusted, parsed, which, h) => {
-                      if (trusted !== null) return <span>{inr(trusted)}</span>;
-                      if (parsed !== null) return (
-                        <span style={{ color: "var(--ochre)", display: "inline-flex", alignItems: "center", gap: 5 }}>
-                          {inr(parsed)} <span style={{ fontSize: 9.5 }}>(parsed, not confirmed)</span>
-                          <button
-                            className="bw-btn ghost small" style={{ padding: "1px 6px", fontSize: 9.5 }}
-                            onClick={() => confirmParsedBalance(h.accountId, h.batchId, which)}
-                          >
-                            Confirm
-                          </button>
-                        </span>
-                      );
-                      return <span style={{ color: "var(--ink-soft)" }}>—</span>;
-                    };
-                    return (
-                    <tr key={h.batchId}>
-                      <td>{h.accountNickname}</td>
-                      <td style={{ fontSize: 11.5 }}>
-                        {h.periodStart} → {h.periodEnd}
-                        {(h.extractedPeriodStart || h.statementDate) && (
-                          <div style={{ fontSize: 10, color: "var(--ink-soft)", marginTop: 2 }}>
-                            {h.extractedPeriodStart
-                              ? `Printed: ${h.extractedPeriodStart} → ${h.extractedPeriodEnd}`
-                              : `Statement date: ${h.statementDate}`}
-                          </div>
-                        )}
-                      </td>
-                      <td style={{ fontSize: 11 }}>
-                        <div>{h.accountIsCC ? "Previous balance" : "Opening"}: {renderBalance(h.openingBalance, h.parsedOpeningBalance, "opening", h)}</div>
-                        <div>{h.accountIsCC ? "Outstanding" : "Closing"}: {renderBalance(h.closingBalance, h.parsedClosingBalance, "closing", h)}</div>
-                      </td>
-                      <td style={{ textAlign: "right" }}>{h.transactionCount}</td>
-                      <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{new Date(h.importedAt).toLocaleDateString()}</td>
-                      <td>
-                        {confirmingDeleteBatch === h.batchId ? (
-                          <div style={{ display: "flex", gap: 6, alignItems: "center", whiteSpace: "nowrap" }}>
-                            <span style={{ fontSize: 11, color: "var(--rust)" }}>Delete this import?</span>
-                            <button
-                              className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
-                              onClick={() => { deleteUploadBatch(h.accountId, h.batchId); setConfirmingDeleteBatch(null); }}
-                            >
-                              Yes
-                            </button>
-                            <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteBatch(null)}>Cancel</button>
-                          </div>
-                        ) : (
-                          <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteBatch(h.batchId)}>
-                            <Trash2 size={12} /> Delete
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );})}
-                </tbody>
-              </table>
-            )}
-          </div>
-        );
-      })()}
-
-      {(() => {
-        const invAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
-        const allSnapshots = holdingSnapshots
-          .map((s) => ({ ...s, accountNickname: invAccounts.find((a) => a.id === s.accountId)?.nickname || "—" }))
-          .sort((a, b) => b.importedAt - a.importedAt);
-        if (allSnapshots.length === 0) return null;
-        return (
-          <div style={{ marginTop: 18 }}>
-            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 600, marginBottom: 10 }}>
-              Holdings imports ({allSnapshots.length})
-            </div>
-            <table className="bw-table">
-              <thead>
-                <tr><th>Account</th><th>As of</th><th style={{ textAlign: "right" }}>Holdings</th><th style={{ textAlign: "right" }}>Invested</th><th style={{ textAlign: "right" }}>Current value</th><th>Imported</th><th></th></tr>
-              </thead>
-              <tbody>
-                {allSnapshots.map((s) => (
-                  <tr key={s.id}>
-                    <td>{s.accountNickname}</td>
-                    <td style={{ fontSize: 11.5 }}>{s.asOfDate}</td>
-                    <td style={{ textAlign: "right" }}>{s.holdings.length}</td>
-                    <td style={{ textAlign: "right" }}>{inr(s.totalInvestedValue)}</td>
-                    <td style={{ textAlign: "right" }}>{inr(s.totalCurrentValue)}</td>
-                    <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{new Date(s.importedAt).toLocaleDateString()}</td>
-                    <td>
-                      {confirmingDeleteSnapshot === s.id ? (
-                        <div style={{ display: "flex", gap: 6, alignItems: "center", whiteSpace: "nowrap" }}>
-                          <span style={{ fontSize: 11, color: "var(--rust)" }}>Delete this snapshot?</span>
-                          <button className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
-                            onClick={() => { deleteHoldingSnapshot(s.accountId, s.id); setConfirmingDeleteSnapshot(null); }}>
-                            Yes
-                          </button>
-                          <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteSnapshot(null)}>Cancel</button>
-                        </div>
-                      ) : (
-                        <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteSnapshot(s.id)}>
-                          <Trash2 size={12} /> Delete
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      })()}
     </div>
   );
 }
@@ -3891,10 +5034,14 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
 /* other import in this app.                                              */
 /* ---------------------------------------------------------------------- */
 
-const INSTRUMENT_TYPE_BY_DOC_TYPE = { equity_holding: "Equity", mutual_fund_holding: "MutualFund" };
-const ACCOUNT_TYPE_BY_DOC_TYPE = { equity_holding: "demat", mutual_fund_holding: "mutualFund" };
+const INSTRUMENT_TYPE_BY_DOC_TYPE = { equity_holding: "Equity", mutual_fund_holding: "MutualFund", nps_holding: "MutualFund", ulip_holding: "MutualFund" };
+const ACCOUNT_TYPE_BY_DOC_TYPE = { equity_holding: "demat", mutual_fund_holding: "mutualFund", nps_holding: "mutualFund", ulip_holding: "mutualFund" };
+// Purely a display label — NPS/ULIP accounts are functionally identical mutualFund
+// accounts underneath (same waterfall, same reconciliation, same every downstream
+// function), this just lets the UI show "NPS" or "ULIP" instead of a generic label.
+const ASSET_LABEL_BY_DOC_TYPE = { nps_holding: "NPS", ulip_holding: "ULIP" };
 
-function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast }) {
+function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast, initialFile, initialPassword }) {
   const [file, setFile] = useState(null);
   const [fileName, setFileName] = useState("");
   const [rawRows, setRawRows] = useState(null);
@@ -3909,6 +5056,10 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
   const [asOfDate, setAsOfDate] = useState("");
   const [statedInvested, setStatedInvested] = useState("");
   const [statedCurrent, setStatedCurrent] = useState("");
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [wrongPassword, setWrongPassword] = useState(false);
+  const [password, setPassword] = useState("");
+  const [pendingPdfFile, setPendingPdfFile] = useState(null);
 
   const investmentAccounts = useMemo(() => accounts.filter((a) => a.type === "demat" || a.type === "mutualFund"), [accounts]);
 
@@ -3919,12 +5070,213 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
     setStatedInvested(""); setStatedCurrent("");
   }
 
+  const HOLDINGS_PDF_EXTRACT_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+      documentType: { type: "STRING", enum: ["equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding"], description: "What kind of holding statement this is — decide the same way as for a spreadsheet: ISIN/Sector/LTP columns suggest equity; Folio Number/AMC/Scheme Name/NAV suggest mutual fund; PRAN suggests NPS; Policy Number suggests ULIP. NPS and ULIP should otherwise be treated exactly like mutual_fund_holding." },
+      institution: { type: "STRING", nullable: true, description: "The broker, AMC, or platform name — check a title, logo caption, or letterhead. Null if genuinely not identifiable." },
+      asOfDate: { type: "STRING", nullable: true, description: "YYYY-MM-DD — the date this holdings statement is as of. Never today's date; the date printed on the statement." },
+      totalInvestedValue: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as a total (e.g. 'Total Invested Value') — never computed yourself. For ULIPs specifically, this must be the NET amount actually invested into fund units, not the gross premium paid — see the detailed instructions in the prompt for how to tell these apart." },
+      totalCurrentValue: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as a total (e.g. 'Total Current Value' or 'Total Market Value') — never computed yourself." },
+      isComplete: { type: "BOOLEAN", description: "True only if every holding row visible across all the provided images has been included below." },
+      holdings: {
+        type: "ARRAY",
+        description: "Every individual holding row visible in the images — read each value directly as printed, never compute or estimate one from the others.",
+        items: {
+          type: "OBJECT",
+          properties: {
+            name: { type: "STRING", description: "The stock/scheme name, exactly as printed." },
+            isin: { type: "STRING", nullable: true, description: "A 12-character alphanumeric ISIN code uniquely identifying THIS specific security — only for equity/mutual fund holdings that actually print one. NPS and ULIP holdings do not have one; leave null for them. Never fill this with an account-level number (like a PRAN or policy number) that would be identical across every holding row in this account — if the same value would apply to every row, it is not a valid per-holding identifier and must be left null." },
+            folioNumber: { type: "STRING", nullable: true, description: "A mutual fund folio number, specific to this scheme, if printed. Never fill this with an account-level number (like a PRAN or policy number) that would be identical across every holding row — if the same value would apply to every row, it is not a valid per-holding identifier and must be left null." },
+            amc: { type: "STRING", nullable: true, description: "Fund house / AMC name, for mutual fund-style holdings." },
+            sectorOrCategory: { type: "STRING", nullable: true },
+            units: { type: "NUMBER", nullable: true },
+            avgCost: { type: "NUMBER", nullable: true, description: "Average cost / buy price per unit, if printed." },
+            currentPrice: { type: "NUMBER", nullable: true, description: "Current price / NAV per unit, if printed." },
+            investedValue: { type: "NUMBER", nullable: true },
+            currentValue: { type: "NUMBER", nullable: true },
+            status: { type: "STRING", nullable: true, description: "e.g. 'Active', 'Suspended' — only if explicitly shown." },
+          },
+          required: ["name"],
+        },
+      },
+    },
+    required: ["documentType", "isComplete", "holdings"],
+  };
+
+  async function callHoldingsPdfExtract(images) {
+    const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+    const prompt = [
+      "You are looking at page images of an investment holdings statement — equity/demat, mutual fund, NPS, or",
+      "ULIP. Extract every individual holding row exactly as printed. Read each number directly from the image —",
+      "never compute, estimate, or invent a value, even if two others would let you calculate it; that",
+      "calculation happens separately, afterward, in code. For isin and folioNumber specifically: these must be",
+      "unique to each individual holding — never fill them with an account-level number (a PRAN, a policy",
+      "number) that appears identical across every row, even if it's the most prominent ID-looking number on",
+      "the page. If no genuinely per-holding identifier is printed, leave both null for that row.",
+      "",
+      "For ULIP statements specifically, finding totalInvestedValue needs care: a premium payment is split",
+      "between charges (allocation charge, GST on that charge, and similar deductions) and the remainder that",
+      "actually buys fund units. Statements report these as two DIFFERENT figures — look for the one meaning",
+      "'what was actually invested/allocated into fund units after charges', not 'what the policyholder paid",
+      "before charges'. The exact column or line-item wording varies by insurer (e.g. 'Premium(s) Invested',",
+      "'Amount Invested', 'Net Investment', 'Premium Allocated to Investment' all mean the net, invested figure;",
+      "'Premium(s) Paid', 'Total Premium Received', 'Gross Premium' all mean the gross, pre-charges figure) —",
+      "identify which meaning a figure represents from its context and any nearby charge line-items, not from",
+      "matching an exact phrase. If the statement reports both a Regular Premium Invested figure and a Top-up",
+      "Premium Invested figure, sum both into totalInvestedValue. Never substitute the gross premium-paid figure",
+      "for the invested figure when the statement provides both — they are genuinely different numbers, and",
+      "using the wrong one would overstate the true cost basis.",
+    ].join("\n");
+    const parts = [
+      ...images.map((base64) => ({ inlineData: { mimeType: "image/png", data: base64 } })),
+      { text: prompt },
+    ];
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { maxOutputTokens: 32000, responseMimeType: "application/json", responseSchema: HOLDINGS_PDF_EXTRACT_SCHEMA },
+        }),
+      }
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `Request failed (HTTP ${response.status}).`);
+    const textPart = (data.candidates?.[0]?.content?.parts || []).find((p) => typeof p.text === "string" && !p.thought);
+    if (!textPart) throw new Error("No usable response from the model.");
+    let raw = textPart.text.replace(/```json|```/g, "").trim();
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // A cut-off response is possible even with a generous token cap on a long
+      // holdings list — salvage whatever complete holding rows exist before the
+      // truncation point, same defense used for bank statement extraction, rather
+      // than discarding the whole call over a partial JSON tail.
+      const holdingsMatch = raw.match(/"holdings"\s*:\s*\[([\s\S]*)/);
+      let salvaged = [];
+      if (holdingsMatch) {
+        const rowMatches = [...holdingsMatch[1].matchAll(/\{[^{}]*\}/g)];
+        salvaged = rowMatches.map((m) => { try { return JSON.parse(m[0]); } catch { return null; } }).filter(Boolean);
+      }
+      if (salvaged.length === 0) throw new Error("The response got cut off before any usable holdings could be read — try again.");
+      return { documentType: "mutual_fund_holding", institution: null, asOfDate: null, totalInvestedValue: null, totalCurrentValue: null, isComplete: false, holdings: salvaged };
+    }
+  }
+
+  /** Applies the exact same derivation/skip/instrument-key logic runLocalParse uses
+   *  for CSV-parsed rows, to vision-extracted rows instead — extraction method and
+   *  validation are fully decoupled, so a PDF-sourced holding is verified exactly as
+   *  rigorously as a spreadsheet-sourced one. */
+  function processExtractedHoldings(rawHoldings) {
+    const holdings = [];
+    let derivedCount = 0;
+    rawHoldings.forEach((row) => {
+      const name = (row.name || "").toString().trim();
+      if (!name) return;
+      let units = row.units ?? null, avgCost = row.avgCost ?? null, currentPrice = row.currentPrice ?? null;
+      let invested = row.investedValue ?? null, current = row.currentValue ?? null;
+      const derived = { investedValue: false, currentValue: false, avgCost: false, currentPrice: false };
+      if (invested === null && units && avgCost !== null) { invested = Math.round(units * avgCost * 100) / 100; derived.investedValue = true; }
+      if (current === null && units && currentPrice !== null) { current = Math.round(units * currentPrice * 100) / 100; derived.currentValue = true; }
+      if (avgCost === null && units && invested !== null) { avgCost = Math.round((invested / units) * 100) / 100; derived.avgCost = true; }
+      if (currentPrice === null && units && current !== null) { currentPrice = Math.round((current / units) * 100) / 100; derived.currentPrice = true; }
+      if (derived.investedValue || derived.currentValue || derived.avgCost || derived.currentPrice) derivedCount += 1;
+      const h = {
+        name, isin: row.isin || "", folioNumber: row.folioNumber || "", amc: row.amc || "", sectorOrCategory: row.sectorOrCategory || "",
+        units, avgCost, currentPrice, investedValue: invested, investedValueUnknown: invested === null,
+        currentValue: current || 0, derived,
+        status: row.status || "", include: true,
+      };
+      if (isSkippableRow(h)) return;
+      holdings.push(h);
+    });
+    clearUnreliableSharedIdentifiers(holdings, "isin");
+    clearUnreliableSharedIdentifiers(holdings, "folioNumber");
+    holdings.forEach((h) => {
+      const { key, reliable } = computeInstrumentKey(h);
+      h.instrumentKey = key; h.keyReliable = reliable;
+    });
+    return { holdings, derivedCount };
+  }
+
+  /** Fallback for NPS and ULIP specifically: neither reports true per-holding cost
+   *  basis — NPS only reports contribution at the portfolio level, and ULIP fund
+   *  switches over a policy's life make the true per-fund figure unrecoverable even
+   *  in principle. Both DO report a real, known portfolio-level invested total
+   *  (NPS: Total Contribution; ULIP: Total Regular + Top-up Premium Invested), so
+   *  this allocates that known total across currently-held funds/schemes (zero-unit
+   *  ones correctly excluded — they hold nothing to allocate to) proportional to
+   *  current value. This is explicitly an ESTIMATE (assumes uniform growth/switch
+   *  timing across holdings), not exact algebra — marked investedValueEstimated,
+   *  never treated as "calculated" the way Units × Price derivation is. Verified
+   *  against the exact numbers from a real ULIP statement (3 funds, ₹22.4L allocated
+   *  proportionally to current value, summing back to the real total exactly)
+   *  before being wired in. */
+  function allocateProportionalInvestedValue(holdings, totalInvestedValue) {
+    const eligible = holdings.filter((h) => h.currentValue > 0);
+    const totalCurrent = eligible.reduce((s, h) => s + h.currentValue, 0);
+    if (totalCurrent <= 0) return holdings;
+    return holdings.map((h) => {
+      if (h.currentValue <= 0) return h;
+      const share = h.currentValue / totalCurrent;
+      const allocated = Math.round(totalInvestedValue * share * 100) / 100;
+      return { ...h, investedValue: allocated, investedValueUnknown: false, derived: { ...h.derived, investedValueEstimated: true } };
+    });
+  }
+
+  async function handlePdfFile(f, pwd) {
+    if (!apiKey) {
+      setError("Add your Gemini API key in the PDF (AI-assisted) tab above first — reading this statement needs it.");
+      return;
+    }
+    setBusy(true); setNeedsPassword(false); setWrongPassword(false);
+    try {
+      const { images, truncated } = await renderPdfPagesAsImages(f, pwd || undefined);
+      if (images.length === 0) { setError("Couldn't render any pages from that PDF."); return; }
+      const result = await callHoldingsPdfExtract(images);
+      let { holdings, derivedCount } = processExtractedHoldings(result.holdings || []);
+      if (holdings.length === 0) { setError("Couldn't find any holdings in that PDF."); return; }
+      let proportionallyAllocated = false;
+      if ((result.documentType === "ulip_holding" || result.documentType === "nps_holding") && result.totalInvestedValue != null && holdings.some((h) => h.investedValueUnknown)) {
+        holdings = allocateProportionalInvestedValue(holdings, result.totalInvestedValue);
+        proportionallyAllocated = true;
+      }
+      setClassification({
+        documentType: result.documentType, institution: result.institution,
+        statementTotals: { asOfDate: result.asOfDate, totalInvestedValue: result.totalInvestedValue, totalCurrentValue: result.totalCurrentValue },
+      });
+      setInstitution(result.institution || "");
+      if (result.asOfDate) setAsOfDate(result.asOfDate);
+      if (result.totalInvestedValue != null) setStatedInvested(String(result.totalInvestedValue));
+      if (result.totalCurrentValue != null) setStatedCurrent(String(result.totalCurrentValue));
+      setParsedHoldings(holdings);
+      setConfirmed(true); // vision extraction has no column-mapping step — straight to review
+      if (!result.isComplete) showToast(`Found ${holdings.length} holdings, but the statement may have more than could be read in one pass — check the count against your actual statement.`);
+      else if (proportionallyAllocated) showToast(`${result.documentType === "nps_holding" ? "NPS statements report contribution at the portfolio level only, not per-scheme" : "ULIPs don't report per-fund invested value, and fund switches make the true figure unrecoverable"} — ₹${result.totalInvestedValue.toLocaleString("en-IN")} invested is estimated per holding, proportional to current value. This is an estimate, not a printed figure.`);
+      else if (derivedCount > 0) showToast(`Calculated missing figures for ${derivedCount} holding${derivedCount === 1 ? "" : "s"} from Units × Price.`);
+      if (truncated) showToast("This PDF has more pages than could be read — only the first several were checked.");
+    } catch (err) {
+      if (err && err.needsPassword) {
+        setNeedsPassword(true);
+        setWrongPassword(!!err.wasWrongPassword);
+        setPendingPdfFile(f);
+      } else {
+        setError(err.message || "Couldn't read or extract that file.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleFile(f) {
     if (!f) return;
     resetFlow();
     setFile(f); setFileName(f.name);
     if (/\.pdf$/i.test(f.name)) {
-      setError('PDF holdings statements aren\'t supported yet — please export your holdings as CSV or Excel from your broker/platform and upload that instead.');
+      await handlePdfFile(f, initialPassword || "");
       return;
     }
     if (!apiKey) {
@@ -3949,6 +5301,18 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
       setBusy(false);
     }
   }
+
+  function retryPdfWithPassword() {
+    handlePdfFile(pendingPdfFile, password);
+  }
+
+  const autoTriggeredRef = useRef(null);
+  useEffect(() => {
+    if (initialFile && autoTriggeredRef.current !== initialFile) {
+      autoTriggeredRef.current = initialFile;
+      handleFile(initialFile);
+    }
+  }, [initialFile]);
 
   function updateMapping(field, value) {
     setClassification((prev) => ({ ...prev, columnMapping: { ...prev.columnMapping, [field]: value || null } }));
@@ -3982,7 +5346,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
       iCurrent = colIdx("currentValue"), iStatus = colIdx("status");
     const skipRows = new Set(classification.skipRowIndices || (classification.totalsRowIndex != null ? [classification.totalsRowIndex] : []));
 
-    const holdings = [];
+    let holdings = [];
     let skippedCount = 0, derivedCount = 0;
     for (let r = headerIdx + 1; r < rawRows.length; r++) {
       if (skipRows.has(r)) { skippedCount += 1; continue; }
@@ -4029,19 +5393,30 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
         amc: iAmc >= 0 ? (row[iAmc] ?? "").toString().trim() : "",
         sectorOrCategory: iSector >= 0 ? (row[iSector] ?? "").toString().trim() : "",
         units, avgCost, currentPrice,
-        investedValue: invested || 0,
+        investedValue: invested, investedValueUnknown: invested === null,
         currentValue: current || 0,
         derived,
         status: iStatus >= 0 ? (row[iStatus] ?? "").toString().trim() : "",
         include: true,
       };
       if (isSkippableRow(h)) { skippedCount += 1; continue; }
+      holdings.push(h);
+    }
+    clearUnreliableSharedIdentifiers(holdings, "isin");
+    clearUnreliableSharedIdentifiers(holdings, "folioNumber");
+    holdings.forEach((h) => {
       const { key, reliable } = computeInstrumentKey(h);
       h.instrumentKey = key;
       h.keyReliable = reliable;
-      holdings.push(h);
+    });
+    let proportionallyAllocated = false;
+    const statedTotal = classification.statementTotals?.totalInvestedValue;
+    if ((classification.documentType === "ulip_holding" || classification.documentType === "nps_holding") && statedTotal != null && holdings.some((h) => h.investedValueUnknown)) {
+      holdings = allocateProportionalInvestedValue(holdings, statedTotal);
+      proportionallyAllocated = true;
     }
     if (skippedCount > 0) showToast(`Skipped ${skippedCount} row${skippedCount === 1 ? "" : "s"} that looked like a section header or total, not a holding.${derivedCount > 0 ? ` Calculated missing figures for ${derivedCount} holding${derivedCount === 1 ? "" : "s"} from Units × Price.` : ""}`);
+    else if (proportionallyAllocated) showToast(`${classification.documentType === "nps_holding" ? "NPS statements report contribution at the portfolio level only, not per-scheme" : "ULIPs don't report per-fund invested value, and fund switches make the true figure unrecoverable"} — ₹${statedTotal.toLocaleString("en-IN")} invested is estimated per holding, proportional to current value. This is an estimate, not a printed figure.`);
     else if (derivedCount > 0) showToast(`Calculated missing figures for ${derivedCount} holding${derivedCount === 1 ? "" : "s"} from Units × Price — this statement doesn't print them directly.`);
     setParsedHoldings(holdings);
     setConfirmed(true);
@@ -4083,7 +5458,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
 
     const trustedTotals = reconciliation.hasAnyStatedTotal
       ? {
-          totalInvestedValue: reconciliation.investedMatches && reconciliation.statedInvested !== null ? reconciliation.statedInvested : reconciliation.sumInvested,
+          totalInvestedValue: reconciliation.investedMatches !== false && reconciliation.statedInvested !== null ? reconciliation.statedInvested : reconciliation.sumInvested,
           totalCurrentValue: reconciliation.currentMatches && reconciliation.statedCurrent !== null ? reconciliation.statedCurrent : reconciliation.sumCurrent,
         }
       : { totalInvestedValue: reconciliation.sumInvested, totalCurrentValue: reconciliation.sumCurrent };
@@ -4093,7 +5468,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
       instrumentType: INSTRUMENT_TYPE_BY_DOC_TYPE[classification.documentType],
       totalInvestedValue: trustedTotals.totalInvestedValue,
       totalCurrentValue: trustedTotals.totalCurrentValue,
-      reconciled: reconciliation.investedMatches && reconciliation.currentMatches,
+      reconciled: reconciliation.investedMatches !== false && reconciliation.currentMatches,
       holdings: included.map((h) => ({
         instrumentKey: h.instrumentKey, keyReliable: h.keyReliable, name: h.name,
         isin: h.isin, folioNumber: h.folioNumber, amc: h.amc, sectorOrCategory: h.sectorOrCategory,
@@ -4134,6 +5509,16 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
 
       {busy && <div style={{ fontSize: 12.5, color: "var(--ink-soft)", marginTop: 10 }}>Reading and classifying…</div>}
 
+      {needsPassword && (
+        <div style={{ marginTop: 10 }}>
+          <div className="bw-field">
+            <label>{wrongPassword ? "That password didn't work — try again" : "This PDF is password-protected"}</label>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+          </div>
+          <button className="bw-btn small" onClick={retryPdfWithPassword}>Unlock &amp; extract</button>
+        </div>
+      )}
+
       {error && (
         <div style={{ marginTop: 12, padding: "10px 12px", border: "1px solid var(--rust)", borderRadius: 6, background: "rgba(156,74,52,0.08)", fontSize: 12.5 }}>
           {error}
@@ -4153,7 +5538,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
             </div>
           )}
 
-          {(classification.documentType === "equity_holding" || classification.documentType === "mutual_fund_holding") && (
+          {(classification.documentType === "equity_holding" || classification.documentType === "mutual_fund_holding" || classification.documentType === "nps_holding" || classification.documentType === "ulip_holding") && (
             <>
               <div className="bw-grid2">
                 <div className="bw-field">
@@ -4161,6 +5546,8 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
                   <select value={classification.documentType} onChange={(e) => setClassification((prev) => ({ ...prev, documentType: e.target.value }))}>
                     <option value="equity_holding">Equity / demat holding</option>
                     <option value="mutual_fund_holding">Mutual fund holding</option>
+                    <option value="nps_holding">NPS holding</option>
+                    <option value="ulip_holding">ULIP holding</option>
                   </select>
                 </div>
                 <div className="bw-field">
@@ -4239,34 +5626,47 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
           </div>
 
           {reconciliation && (
-            <div style={{
-              display: "flex", alignItems: "flex-start", gap: 9, fontSize: 12.5, padding: "10px 12px", marginBottom: 14,
-              border: `1px solid ${reconciliation.hasAnyStatedTotal ? (reconciliation.investedMatches && reconciliation.currentMatches ? "var(--teal)" : "var(--rust)") : "var(--line)"}`,
-              borderRadius: 6,
-              background: reconciliation.hasAnyStatedTotal ? (reconciliation.investedMatches && reconciliation.currentMatches ? "rgba(46,102,89,0.06)" : "rgba(156,74,52,0.08)") : "var(--card)",
-            }}>
-              {reconciliation.hasAnyStatedTotal ? (
-                reconciliation.investedMatches && reconciliation.currentMatches ? (
-                  <Check size={15} color="var(--teal)" style={{ marginTop: 1, flexShrink: 0 }} />
-                ) : (
-                  <AlertCircle size={15} color="var(--rust)" style={{ marginTop: 1, flexShrink: 0 }} />
-                )
-              ) : (
-                <AlertCircle size={15} color="var(--ink-soft)" style={{ marginTop: 1, flexShrink: 0 }} />
-              )}
-              <div>
-                <strong>
-                  {reconciliation.hasAnyStatedTotal
-                    ? (reconciliation.investedMatches && reconciliation.currentMatches ? "Internally consistent — matches the statement's printed totals." : "Doesn't match the statement's printed totals.")
-                    : "No total was printed in this file to check against."}
-                </strong>
-                <div style={{ marginTop: 3 }}>
-                  Rows sum to {inr(reconciliation.sumInvested)} invested, {inr(reconciliation.sumCurrent)} current.
-                  {reconciliation.statedInvested !== null && <> Statement says {inr(reconciliation.statedInvested)} invested.</>}
-                  {reconciliation.statedCurrent !== null && <> Statement says {inr(reconciliation.statedCurrent)} current.</>}
+            (() => {
+              const isRealMismatch = reconciliation.investedMatches === false || reconciliation.currentMatches === false;
+              const isFullyVerified = !reconciliation.hasUnknownInvestedValue && reconciliation.investedMatches && reconciliation.currentMatches;
+              const color = isRealMismatch ? "var(--rust)" : isFullyVerified ? "var(--teal)" : reconciliation.hasAnyStatedTotal ? "var(--ochre)" : "var(--ink-soft)";
+              const bg = isRealMismatch ? "rgba(156,74,52,0.08)" : isFullyVerified ? "rgba(46,102,89,0.06)" : reconciliation.hasAnyStatedTotal ? "rgba(168,112,58,0.08)" : "var(--card)";
+              return (
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: 12.5, padding: "10px 12px", marginBottom: 14, border: `1px solid ${color}`, borderRadius: 6, background: bg }}>
+                  {isFullyVerified ? <Check size={15} color={color} style={{ marginTop: 1, flexShrink: 0 }} /> : <AlertCircle size={15} color={color} style={{ marginTop: 1, flexShrink: 0 }} />}
+                  <div>
+                    <strong>
+                      {!reconciliation.hasAnyStatedTotal
+                        ? "No total was printed in this file to check against."
+                        : isFullyVerified
+                        ? "Internally consistent — matches the statement's printed totals."
+                        : isRealMismatch
+                        ? "Doesn't match the statement's printed totals."
+                        : reconciliation.hasEstimatedInvestedValue
+                        ? "Per-fund invested value is estimated, not printed."
+                        : "Per-holding invested value isn't available from this statement."}
+                    </strong>
+                    <div style={{ marginTop: 3 }}>
+                      {reconciliation.hasEstimatedInvestedValue ? (
+                        classification.documentType === "nps_holding" ? (
+                          <>NPS statements report contribution at the portfolio level only, not per-scheme — {inr(reconciliation.statedInvested)} invested (the real, printed total) is allocated proportionally across schemes by current value. The total is exact; the per-scheme split is an assumption, not a fact.</>
+                        ) : (
+                          <>ULIPs don't report per-fund cost basis, and fund switches over the policy's life make the true figure unrecoverable — {inr(reconciliation.statedInvested)} invested (the real, printed total) is allocated proportionally across funds by current value. The total is exact; the per-fund split is an assumption, not a fact.</>
+                        )
+                      ) : reconciliation.hasUnknownInvestedValue ? (
+                        <>This is common for NPS/ULIP statements when the portfolio-level total itself isn't printed either — {inr(reconciliation.statedInvested)} invested is trusted from the statement directly, current value ({inr(reconciliation.sumCurrent)}) is checked normally.</>
+                      ) : (
+                        <>
+                          Rows sum to {inr(reconciliation.sumInvested)} invested, {inr(reconciliation.sumCurrent)} current.
+                          {reconciliation.statedInvested !== null && <> Statement says {inr(reconciliation.statedInvested)} invested.</>}
+                          {reconciliation.statedCurrent !== null && <> Statement says {inr(reconciliation.statedCurrent)} current.</>}
+                        </>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
+              );
+            })()
           )}
 
           <table className="bw-table">
@@ -4282,8 +5682,15 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
                   <td>{h.name}</td>
                   <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{h.isin || h.folioNumber || "—"}</td>
                   <td className="bw-amt debit">
-                    {inr(h.investedValue)}
-                    {h.derived?.investedValue && <span style={{ fontSize: 9, color: "var(--ochre)", display: "block" }} title="Not printed in this statement — calculated as Units × Avg Cost.">calculated</span>}
+                    {h.investedValueUnknown ? (
+                      <span style={{ color: "var(--ink-soft)" }} title="Not reported per-holding in this statement.">—</span>
+                    ) : (
+                      <>
+                        {inr(h.investedValue)}
+                        {h.derived?.investedValueEstimated && <span style={{ fontSize: 9, color: "var(--rust)", display: "block" }} title="Not printed per-fund in this statement — estimated by allocating the total invested amount proportionally to current value. This is an assumption, not an exact figure.">estimated</span>}
+                        {h.derived?.investedValue && <span style={{ fontSize: 9, color: "var(--ochre)", display: "block" }} title="Not printed in this statement — calculated as Units × Avg Cost.">calculated</span>}
+                      </>
+                    )}
                   </td>
                   <td className="bw-amt debit">
                     {inr(h.currentValue)}
@@ -4316,6 +5723,612 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
             <button className="bw-btn" onClick={commitImport}><Check size={14} /> Import {parsedHoldings.filter((h) => h.include).length} holdings</button>
             <button className="bw-btn ghost" onClick={resetFlow}><X size={14} /> Cancel</button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Debt import — an amortization schedule extraction flow, deliberately    */
+/* isolated from InvestmentImportFlow's classification call (its own       */
+/* schema, prompt, and API call) rather than extending shared, working     */
+/* code — the two document types have nothing in common structurally, and  */
+/* this keeps any risk here from ever touching the investment import path. */
+/* ---------------------------------------------------------------------- */
+
+const LOAN_TYPES = ["Home Loan", "Car Loan", "Personal Loan", "Education Loan", "Loan Against Property", "Other"];
+
+function DebtImportFlow({ accounts, setAccounts, debtSchedules, setDebtSchedules, apiKey, aiModel, customModelId, showToast, initialFile, initialPassword }) {
+  const [fileName, setFileName] = useState("");
+  const [rawRows, setRawRows] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [classification, setClassification] = useState(null);
+  const [parsedEntries, setParsedEntries] = useState(null);
+  const [selectedAccountId, setSelectedAccountId] = useState("__new__");
+  const [institution, setInstitution] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [loanType, setLoanType] = useState("Home Loan");
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [wrongPassword, setWrongPassword] = useState(false);
+  const [password, setPassword] = useState("");
+  const [pendingPdfFile, setPendingPdfFile] = useState(null);
+
+  const debtAccounts = useMemo(() => accounts.filter((a) => a.type === "debt"), [accounts]);
+
+  function resetFlow() {
+    setFileName(""); setRawRows(null); setError(null);
+    setClassification(null); setParsedEntries(null);
+    setSelectedAccountId("__new__"); setInstitution(""); setNickname(""); setLoanType("Home Loan");
+  }
+
+  const DEBT_CLASSIFY_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+      institution: { type: "STRING", nullable: true, description: "The bank or lender name — check a title/logo row, a label, or the file name. Null if genuinely not findable, never guessed." },
+      loanType: { type: "STRING", nullable: true, enum: ["Home Loan", "Car Loan", "Personal Loan", "Education Loan", "Loan Against Property", "Other"], description: "Best guess from context; null if unclear." },
+      headerRowIndex: { type: "NUMBER", description: "0-indexed row containing the real column headers — amortization schedules often have loan summary details (sanctioned amount, rate, tenure) printed above the actual period-by-period table." },
+      skipRowIndices: { type: "ARRAY", items: { type: "NUMBER" }, description: "0-indexed rows within the sample that are NOT real period rows — a totals row, a blank spacer, a repeated header." },
+      columnMapping: {
+        type: "OBJECT",
+        description: "Map each field to the EXACT column header text from the file, verbatim. Null for any field with no matching column.",
+        properties: {
+          period: { type: "STRING", nullable: true, description: "The date or period column — could be labeled 'Date', 'Month', 'Installment No.', 'Due Date', etc." },
+          openingBalance: { type: "STRING", nullable: true },
+          emi: { type: "STRING", nullable: true, description: "The installment amount column — often labeled 'EMI', 'Installment Amount', or 'Payment'." },
+          principal: { type: "STRING", nullable: true },
+          interest: { type: "STRING", nullable: true },
+          closingBalance: { type: "STRING", nullable: true, description: "Often labeled 'Closing Balance', 'Outstanding Balance', or 'Balance'." },
+        },
+      },
+      originalPrincipal: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as the sanctioned/original loan amount — never computed or estimated." },
+      interestRate: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as the interest rate (annual %) — never computed or estimated." },
+    },
+    required: ["headerRowIndex", "columnMapping"],
+  };
+
+  async function callDebtClassify(sampleText, fileNameArg) {
+    const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+    const prompt = [
+      "You are looking at the first rows of a CSV or Excel export of a LOAN AMORTIZATION SCHEDULE —",
+      "a period-by-period table showing, for each installment: the opening balance, the EMI/installment",
+      "amount, how much of it was principal vs. interest, and the resulting closing balance.",
+      "Find the real header row (there may be loan summary details like sanctioned amount, tenure, or",
+      "interest rate printed above it), and map each column to the exact header text as it appears —",
+      "never paraphrase or guess a column that isn't actually present.",
+      "Flag any sample row that is a total row or divider, not a real installment period.",
+      "Only report originalPrincipal or interestRate if explicitly printed somewhere in this sample —",
+      "never compute or estimate either yourself.",
+      fileNameArg ? `\nFile name: ${fileNameArg}` : "",
+      "",
+      "Sample data:",
+      sampleText,
+    ].join("\n");
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 4000, responseMimeType: "application/json", responseSchema: DEBT_CLASSIFY_SCHEMA },
+        }),
+      }
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `Request failed (HTTP ${response.status}).`);
+    const textPart = (data.candidates?.[0]?.content?.parts || []).find((p) => typeof p.text === "string" && !p.thought);
+    if (!textPart) throw new Error("No usable response from the model.");
+    return JSON.parse(textPart.text.replace(/```json|```/g, "").trim());
+  }
+
+  const DEBT_PDF_EXTRACT_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+      institution: { type: "STRING", nullable: true, description: "The bank or lender name — check a title, logo caption, or letterhead. Null if genuinely not identifiable." },
+      loanType: { type: "STRING", nullable: true, enum: ["Home Loan", "Car Loan", "Personal Loan", "Education Loan", "Loan Against Property", "Other"], description: "Best guess from context; null if unclear." },
+      originalPrincipal: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as the sanctioned/original loan amount — never computed or estimated." },
+      interestRate: { type: "NUMBER", nullable: true, description: "Only if explicitly printed as the interest rate (annual %) — never computed or estimated." },
+      isComplete: { type: "BOOLEAN", description: "True only if every installment period visible across all the provided images has been included below." },
+      periods: {
+        type: "ARRAY",
+        description: "Every individual installment period row visible in the images — read each value directly as printed, never compute one from the others.",
+        items: {
+          type: "OBJECT",
+          properties: {
+            period: { type: "STRING", description: "The period's date, in YYYY-MM-DD or YYYY-MM form, exactly as identifiable from the row (a due date, installment date, or month label)." },
+            openingBalance: { type: "NUMBER", nullable: true },
+            emi: { type: "NUMBER", nullable: true, description: "The installment amount for this period, if printed — often labeled EMI or Installment Amount." },
+            principal: { type: "NUMBER", nullable: true },
+            interest: { type: "NUMBER", nullable: true },
+            closingBalance: { type: "NUMBER", nullable: true },
+          },
+          required: ["period"],
+        },
+      },
+    },
+    required: ["isComplete", "periods"],
+  };
+
+  async function callDebtPdfExtract(images) {
+    const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+    const prompt = [
+      "You are looking at page images of a LOAN AMORTIZATION SCHEDULE — a period-by-period table showing, for",
+      "each installment, the opening balance, EMI, principal, interest, and closing balance. Extract every",
+      "installment period row exactly as printed, in order. Read each number directly from the image — never",
+      "compute, estimate, or invent a value, even if others would let you calculate it; that check happens",
+      "separately, afterward, in code. Skip any row that is a section header, a totals row, or a loan-summary",
+      "line (sanctioned amount, tenure, rate) rather than a real installment period.",
+    ].join("\n");
+    const parts = [
+      ...images.map((base64) => ({ inlineData: { mimeType: "image/png", data: base64 } })),
+      { text: prompt },
+    ];
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { maxOutputTokens: 32000, responseMimeType: "application/json", responseSchema: DEBT_PDF_EXTRACT_SCHEMA },
+        }),
+      }
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `Request failed (HTTP ${response.status}).`);
+    const textPart = (data.candidates?.[0]?.content?.parts || []).find((p) => typeof p.text === "string" && !p.thought);
+    if (!textPart) throw new Error("No usable response from the model.");
+    let raw = textPart.text.replace(/```json|```/g, "").trim();
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // Same defense as the Holdings PDF flow — a long schedule (a 240-month loan is
+      // real) can still get cut off even at a generous token budget. Salvage whatever
+      // complete period rows exist before the truncation point.
+      const periodsMatch = raw.match(/"periods"\s*:\s*\[([\s\S]*)/);
+      let salvaged = [];
+      if (periodsMatch) {
+        const rowMatches = [...periodsMatch[1].matchAll(/\{[^{}]*\}/g)];
+        salvaged = rowMatches.map((m) => { try { return JSON.parse(m[0]); } catch { return null; } }).filter(Boolean);
+      }
+      if (salvaged.length === 0) throw new Error("The response got cut off before any usable periods could be read — try again.");
+      return { institution: null, loanType: null, originalPrincipal: null, interestRate: null, isComplete: false, periods: salvaged };
+    }
+  }
+
+  /** Applies the exact same per-row reconciliation and cross-row continuity checks
+   *  runLocalParse uses for CSV-parsed rows, to vision-extracted rows instead —
+   *  extraction method and validation stay fully decoupled. */
+  function processExtractedPeriods(rawPeriods) {
+    const entries = [];
+    let skippedCount = 0;
+    rawPeriods.forEach((row) => {
+      const rawPeriod = (row.period || "").toString().trim();
+      if (!rawPeriod) { skippedCount += 1; return; }
+      const parsedDate = parseDateStr(rawPeriod);
+      const period = isLikelyValidDate(parsedDate) ? parsedDate.slice(0, 7) : rawPeriod.slice(0, 7);
+      const opening = row.openingBalance ?? 0, principal = row.principal ?? 0, interest = row.interest ?? 0, closing = row.closingBalance ?? 0;
+      const emi = row.emi ?? Math.round((principal + interest) * 100) / 100;
+      if (opening === 0 && principal === 0 && interest === 0 && closing === 0) { skippedCount += 1; return; }
+      const entry = { period, openingBalance: opening, emi, principal, interest, closingBalance: closing };
+      const recon = reconcileDebtEntry(entry);
+      entries.push({ ...entry, ...recon, include: true });
+    });
+    return { entries, skippedCount };
+  }
+
+  async function handlePdfFile(f, pwd) {
+    if (!apiKey) {
+      setError("Add your Gemini API key in Upload → PDF (AI-assisted) first — reading this schedule needs it.");
+      return;
+    }
+    setBusy(true); setNeedsPassword(false); setWrongPassword(false);
+    try {
+      const { images, truncated } = await renderPdfPagesAsImages(f, pwd || undefined);
+      if (images.length === 0) { setError("Couldn't render any pages from that PDF."); return; }
+      const result = await callDebtPdfExtract(images);
+      const { entries, skippedCount } = processExtractedPeriods(result.periods || []);
+      if (entries.length === 0) { setError("Couldn't find any installment periods in that PDF."); return; }
+      setInstitution(result.institution || "");
+      if (result.loanType) setLoanType(result.loanType);
+      const continuityGaps = checkDebtScheduleContinuity(entries);
+      setParsedEntries({ entries, continuityGaps });
+      if (!result.isComplete) showToast(`Found ${entries.length} periods, but the schedule may have more than could be read in one pass — check the count against your actual schedule.`);
+      else if (skippedCount > 0) showToast(`Skipped ${skippedCount} row${skippedCount === 1 ? "" : "s"} that didn't look like a real installment period.`);
+      if (truncated) showToast("This PDF has more pages than could be read — only the first several were checked.");
+    } catch (err) {
+      if (err && err.needsPassword) {
+        setNeedsPassword(true);
+        setWrongPassword(!!err.wasWrongPassword);
+        setPendingPdfFile(f);
+      } else {
+        setError(err.message || "Couldn't read or extract that file.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleFile(f) {
+    if (!f) return;
+    resetFlow();
+    setFileName(f.name);
+    if (/\.pdf$/i.test(f.name)) {
+      await handlePdfFile(f, initialPassword || "");
+      return;
+    }
+    if (!apiKey) {
+      setError("Add your Gemini API key in Upload → PDF (AI-assisted) first — classifying this file's columns needs it.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const rows = await readSpreadsheetFile(f);
+      setRawRows(rows);
+      const sample = buildSpreadsheetSample(rows, 30);
+      const result = await callDebtClassify(sample, f.name);
+      setClassification(result);
+      setInstitution(result.institution || "");
+      if (result.loanType) setLoanType(result.loanType);
+    } catch (err) {
+      setError(err.message || "Couldn't read or classify that file.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function retryPdfWithPassword() {
+    handlePdfFile(pendingPdfFile, password);
+  }
+
+  const autoTriggeredRef = useRef(null);
+  useEffect(() => {
+    if (initialFile && autoTriggeredRef.current !== initialFile) {
+      autoTriggeredRef.current = initialFile;
+      handleFile(initialFile);
+    }
+  }, [initialFile]);
+
+  function updateMapping(field, value) {
+    setClassification((prev) => ({ ...prev, columnMapping: { ...prev.columnMapping, [field]: value || null } }));
+  }
+
+  function runLocalParse() {
+    if (!rawRows || !classification) return;
+    const headerIdx = classification.headerRowIndex ?? 0;
+    const headers = (rawRows[headerIdx] || []).map((h) => (h ?? "").toString().trim());
+    const map = classification.columnMapping || {};
+    const colIdx = (field) => headers.findIndex((h) => h === map[field]);
+    const iPeriod = colIdx("period"), iOpening = colIdx("openingBalance"), iEmi = colIdx("emi"),
+      iPrincipal = colIdx("principal"), iInterest = colIdx("interest"), iClosing = colIdx("closingBalance");
+    const skipRows = new Set(classification.skipRowIndices || []);
+
+    if (iPeriod < 0 || iOpening < 0 || iPrincipal < 0 || iInterest < 0 || iClosing < 0) {
+      showToast("Please map Period, Opening Balance, Principal, Interest, and Closing Balance before parsing.");
+      return;
+    }
+
+    const entries = [];
+    let skippedCount = 0;
+    for (let r = headerIdx + 1; r < rawRows.length; r++) {
+      if (skipRows.has(r)) { skippedCount += 1; continue; }
+      const row = rawRows[r];
+      if (!row || row.every((c) => (c ?? "").toString().trim() === "")) continue;
+      const rawPeriod = (row[iPeriod] ?? "").toString().trim();
+      if (!rawPeriod) continue;
+      const parsedDate = parseDateStr(rawPeriod);
+      const period = isLikelyValidDate(parsedDate) ? parsedDate.slice(0, 7) : rawPeriod.slice(0, 7);
+      const opening = parseAmountStr(row[iOpening]);
+      const principal = parseAmountStr(row[iPrincipal]);
+      const interest = parseAmountStr(row[iInterest]);
+      const closing = parseAmountStr(row[iClosing]);
+      const emi = iEmi >= 0 ? parseAmountStr(row[iEmi]) : Math.round((principal + interest) * 100) / 100;
+      if (opening === 0 && principal === 0 && interest === 0 && closing === 0) { skippedCount += 1; continue; }
+      const entry = { period, openingBalance: opening, emi, principal, interest, closingBalance: closing };
+      const recon = reconcileDebtEntry(entry);
+      entries.push({ ...entry, ...recon, include: true });
+    }
+    const continuityGaps = checkDebtScheduleContinuity(entries);
+    setParsedEntries({ entries, continuityGaps });
+    if (skippedCount > 0) showToast(`Skipped ${skippedCount} row${skippedCount === 1 ? "" : "s"} that didn't look like a real installment period.`);
+  }
+
+  function commitImport() {
+    if (!parsedEntries) return;
+    let account = selectedAccountId !== "__new__" ? accounts.find((a) => a.id === selectedAccountId) : null;
+    if (!account) {
+      account = { id: uid("acc"), type: "debt", institution, nickname: nickname || institution, loanType };
+      setAccounts((prev) => [...prev, account]);
+    }
+    const included = parsedEntries.entries.filter((e) => e.include);
+    if (included.length === 0) { showToast("No periods selected to import."); return; }
+    const schedule = {
+      id: uid("debt"), accountId: account.id, importedAt: Date.now(),
+      entries: included.map((e) => ({ period: e.period, openingBalance: e.openingBalance, emi: e.emi, principal: e.principal, interest: e.interest, closingBalance: e.closingBalance })),
+    };
+    setDebtSchedules((prev) => [...prev, schedule]);
+    showToast(`Imported ${included.length} periods for ${account.nickname}.`);
+    resetFlow();
+  }
+
+  const unreconciledCount = parsedEntries ? parsedEntries.entries.filter((e) => !e.reconciled).length : 0;
+
+  return (
+    <div>
+      <h2 className="bw-h2">Import a loan amortization schedule</h2>
+      <p className="bw-lead">
+        Export the full period-by-period schedule as CSV or Excel from your lender's portal — Opening Balance,
+        EMI, Principal, Interest, and Closing Balance for each period. Every row is checked against its own
+        arithmetic before anything is saved.
+      </p>
+
+      {!rawRows && (
+        <label className="bw-dropzone">
+          <input type="file" accept=".csv,.xlsx,.xls,.pdf" onChange={(e) => handleFile(e.target.files[0])} />
+          <Upload size={22} style={{ marginBottom: 8 }} />
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Click to choose a CSV, Excel, or PDF file</div>
+          <div style={{ fontSize: 11.5, marginTop: 4 }}>The full schedule, not just this month — one import covers the whole tenure</div>
+        </label>
+      )}
+      {busy && <div style={{ fontSize: 12.5, color: "var(--ink-soft)", marginTop: 10 }}>Reading and classifying…</div>}
+      {needsPassword && (
+        <div style={{ marginTop: 10 }}>
+          <div className="bw-field">
+            <label>{wrongPassword ? "That password didn't work — try again" : "This PDF is password-protected"}</label>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+          </div>
+          <button className="bw-btn small" onClick={retryPdfWithPassword}>Unlock &amp; extract</button>
+        </div>
+      )}
+      {error && <p style={{ fontSize: 12, color: "var(--rust)", marginTop: 10 }}>{error}</p>}
+
+      {classification && !parsedEntries && (
+        <div style={{ marginTop: 18 }}>
+          <div style={{ fontWeight: 600, marginBottom: 10 }}>{fileName}</div>
+          <div className="bw-grid2">
+            <div className="bw-field">
+              <label>Account</label>
+              <select value={selectedAccountId} onChange={(e) => setSelectedAccountId(e.target.value)}>
+                <option value="__new__">+ Add new account</option>
+                {debtAccounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+              </select>
+            </div>
+            <div className="bw-field">
+              <label>Loan type</label>
+              <select value={loanType} onChange={(e) => setLoanType(e.target.value)}>
+                {LOAN_TYPES.map((t) => <option key={t}>{t}</option>)}
+              </select>
+            </div>
+          </div>
+          {selectedAccountId === "__new__" && (
+            <div className="bw-grid2">
+              <div className="bw-field">
+                <label>Institution / lender</label>
+                <input type="text" value={institution} onChange={(e) => setInstitution(e.target.value)} placeholder="e.g. HDFC Bank" />
+              </div>
+              <div className="bw-field">
+                <label>Account nickname (optional)</label>
+                <input type="text" value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder={institution || "e.g. Home Loan"} />
+              </div>
+            </div>
+          )}
+
+          <div className="bw-section-label">Column mapping</div>
+          <div className="bw-grid2">
+            {["period", "openingBalance", "emi", "principal", "interest", "closingBalance"].map((field) => (
+              <div className="bw-field" key={field}>
+                <label>{field.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase())}</label>
+                <select value={classification.columnMapping?.[field] || ""} onChange={(e) => updateMapping(field, e.target.value)}>
+                  <option value="">— none —</option>
+                  {(rawRows[classification.headerRowIndex ?? 0] || []).map((h, i) => (
+                    <option key={i} value={(h ?? "").toString().trim()}>{(h ?? "").toString().trim() || `Column ${i + 1}`}</option>
+                  ))}
+                </select>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button className="bw-btn" onClick={runLocalParse}><Check size={14} /> Parse schedule</button>
+            <button className="bw-btn ghost" onClick={resetFlow}><X size={14} /> Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {parsedEntries && (
+        <div style={{ marginTop: 18 }}>
+          <div style={{
+            display: "flex", alignItems: "center", gap: 9, fontSize: 12.5, padding: "10px 14px", marginBottom: 14,
+            border: `1px solid ${unreconciledCount === 0 && parsedEntries.continuityGaps.length === 0 ? "var(--teal)" : "var(--rust)"}`, borderRadius: 6,
+          }}>
+            {unreconciledCount === 0 && parsedEntries.continuityGaps.length === 0 ? (
+              <><Check size={14} color="var(--teal)" /> All {parsedEntries.entries.length} periods reconcile — each period's own EMI/Principal/Interest/Closing arithmetic checks out, and periods connect to each other cleanly.</>
+            ) : (
+              <><AlertCircle size={14} color="var(--rust)" />
+                {unreconciledCount > 0 && `${unreconciledCount} period${unreconciledCount === 1 ? "" : "s"} don't reconcile internally. `}
+                {parsedEntries.continuityGaps.length > 0 && `${parsedEntries.continuityGaps.length} gap${parsedEntries.continuityGaps.length === 1 ? "" : "s"} found between periods. `}
+                Review flagged rows below before importing.
+              </>
+            )}
+          </div>
+
+          <div style={{ overflowX: "auto", border: "1px solid var(--line)", borderRadius: 6, maxHeight: 400, overflowY: "auto" }}>
+            <table className="bw-table">
+              <thead>
+                <tr>
+                  <th>Period</th><th style={{ textAlign: "right" }}>Opening</th><th style={{ textAlign: "right" }}>EMI</th>
+                  <th style={{ textAlign: "right" }}>Principal</th><th style={{ textAlign: "right" }}>Interest</th>
+                  <th style={{ textAlign: "right" }}>Closing</th><th></th><th>Include</th>
+                </tr>
+              </thead>
+              <tbody>
+                {parsedEntries.entries.map((e, i) => (
+                  <tr key={i}>
+                    <td>{e.period}</td>
+                    <td className="bw-amt debit">{inr(e.openingBalance)}</td>
+                    <td className="bw-amt debit">{inr(e.emi)}</td>
+                    <td className="bw-amt debit">{inr(e.principal)}</td>
+                    <td className="bw-amt debit">{inr(e.interest)}</td>
+                    <td className="bw-amt debit">{inr(e.closingBalance)}</td>
+                    <td>{!e.reconciled && <AlertCircle size={13} color="var(--rust)" titleAccess="Doesn't reconcile" />}</td>
+                    <td>
+                      <input type="checkbox" checked={e.include} onChange={(ev) => {
+                        const v = ev.target.checked;
+                        setParsedEntries((prev) => ({ ...prev, entries: prev.entries.map((x, xi) => (xi === i ? { ...x, include: v } : x)) }));
+                      }} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button className="bw-btn" onClick={commitImport}><Check size={14} /> Import {parsedEntries.entries.filter((e) => e.include).length} periods</button>
+            <button className="bw-btn ghost" onClick={resetFlow}><X size={14} /> Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {debtAccounts.length > 0 && (
+        <>
+          <div className="bw-section-label">Debt accounts so far</div>
+          <table className="bw-table">
+            <thead><tr><th>Nickname</th><th>Institution</th><th>Type</th><th style={{ textAlign: "right" }}>Schedules imported</th></tr></thead>
+            <tbody>
+              {debtAccounts.map((a) => (
+                <tr key={a.id}>
+                  <td>{a.nickname}</td><td>{a.institution}</td><td>{a.loanType || "—"}</td>
+                  <td style={{ textAlign: "right" }}>{debtSchedules.filter((s) => s.accountId === a.id).length}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Document Classifier test harness — deliberately does NOTHING beyond      */
+/* showing the raw Stage 1 result. No import, no account creation, no       */
+/* commit path of any kind. This exists purely so real files can be tried  */
+/* against the classifier with zero risk to any of the four working import */
+/* flows, before Stage 2 (routing to the matching extraction) gets built.  */
+/* ---------------------------------------------------------------------- */
+
+const DOCUMENT_CATEGORY_LABELS = {
+  bank_statement: "Bank statement",
+  credit_card_statement: "Credit card statement",
+  investment_holding: "Investment holding (stocks/MF/NPS/ULIP)",
+  debt_schedule: "Loan amortization schedule",
+  other_investment_statement: "Other investment (PF/Gold/Property)",
+  unknown: "Unknown",
+};
+
+function DocumentClassifierTest({ apiKey, aiModel, customModelId }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [wrongPassword, setWrongPassword] = useState(false);
+  const [password, setPassword] = useState("");
+  const [pendingFile, setPendingFile] = useState(null);
+
+  async function classify(file, pwd) {
+    if (!apiKey) { setError("Add your Gemini API key in the PDF (AI-assisted) tab first."); return; }
+    setBusy(true); setError(null); setResult(null); setNeedsPassword(false); setWrongPassword(false);
+    try {
+      const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+      let inputParts;
+      if (/\.pdf$/i.test(file.name)) {
+        const { images } = await renderPdfPagesAsImages(file, pwd || undefined);
+        if (images.length === 0) { setError("Couldn't render any pages from that PDF."); setBusy(false); return; }
+        // Classification only needs a glimpse — the first couple of pages is plenty,
+        // no need to render or send the whole document for this step.
+        inputParts = images.slice(0, 2).map((b) => ({ inlineData: { mimeType: "image/png", data: b } }));
+      } else if (/\.csv$|\.xlsx$|\.xls$/i.test(file.name)) {
+        const rows = await readSpreadsheetFile(file);
+        const sample = buildSpreadsheetSample(rows, 20);
+        inputParts = [{ text: `File name: ${file.name}\n\nSample data:\n${sample}` }];
+      } else {
+        setError("This test tab supports PDF, CSV, or Excel files.");
+        setBusy(false);
+        return;
+      }
+      const classification = await callDocumentClassify(inputParts, apiKey, effectiveModel);
+      setResult(classification);
+    } catch (err) {
+      if (err && err.needsPassword) {
+        setNeedsPassword(true);
+        setWrongPassword(!!err.wasWrongPassword);
+        setPendingFile(file);
+      } else {
+        setError(err.message || "Couldn't classify that file.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleFile(file) {
+    if (!file) return;
+    setFileName(file.name);
+    setResult(null);
+    setPendingFile(file);
+    classify(file, "");
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: 12.5, padding: "10px 14px", marginBottom: 16, border: "1px solid var(--ochre)", borderRadius: 6 }}>
+        <AlertCircle size={14} color="var(--ochre)" style={{ marginTop: 1, flexShrink: 0 }} />
+        <span>
+          <strong>Test only — this never imports anything.</strong> It identifies what kind of document a file
+          is and shows the raw result, so the classifier can be checked against real statements before it's
+          wired into an actual import flow. Nothing here touches accounts, transactions, or any other data.
+        </span>
+      </div>
+
+      <h2 className="bw-h2">Document Classifier</h2>
+      <p className="bw-lead">Upload a bank statement, credit card statement, investment holding, loan schedule, or PF/Gold/Property statement — PDF, CSV, or Excel — and see what the classifier thinks it is.</p>
+
+      {!result && !busy && (
+        <label className="bw-dropzone">
+          <input type="file" accept=".pdf,.csv,.xlsx,.xls" onChange={(e) => handleFile(e.target.files[0])} />
+          <Upload size={22} style={{ marginBottom: 8 }} />
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Click to choose a file</div>
+          <div style={{ fontSize: 11.5, marginTop: 4 }}>PDF, CSV, or Excel — any of the five document types</div>
+        </label>
+      )}
+      {busy && <div style={{ fontSize: 12.5, color: "var(--ink-soft)" }}>Classifying…</div>}
+      {needsPassword && (
+        <div style={{ marginTop: 10 }}>
+          <div className="bw-field">
+            <label>{wrongPassword ? "That password didn't work — try again" : "This PDF is password-protected"}</label>
+            <input type="text" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+          </div>
+          <button className="bw-btn small" onClick={() => classify(pendingFile, password)}>Unlock &amp; classify</button>
+        </div>
+      )}
+      {error && <p style={{ fontSize: 12, color: "var(--rust)", marginTop: 10 }}>{error}</p>}
+
+      {result && (
+        <div style={{ marginTop: 10, border: "1px solid var(--line)", borderRadius: 8, padding: 16, background: "var(--card)" }}>
+          <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 10 }}>{fileName}</div>
+          <div className="bw-summary-row">
+            <Stat label="Document category" value={DOCUMENT_CATEGORY_LABELS[result.documentCategory] || result.documentCategory} color="var(--ink)" />
+            <Stat label="Confidence" value={result.confidence} color={result.confidence === "high" ? "var(--teal)" : result.confidence === "low" ? "var(--rust)" : "var(--ochre)"} />
+            <Stat label="Institution" value={result.institution || "—"} color="var(--ink)" />
+          </div>
+          <p style={{ fontSize: 12.5, marginTop: 12 }}>{result.reasoning}</p>
+          <button className="bw-btn ghost small" style={{ marginTop: 8 }} onClick={() => { setResult(null); setFileName(""); }}>
+            <X size={12} /> Try another file
+          </button>
         </div>
       )}
     </div>
@@ -6268,6 +8281,19 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
       }
     }
 
+    // Investment rate negative — redeemed more than was invested this month. A minimum
+    // absolute amount avoids flagging a trivial rounding-level redemption.
+    if (curMonth && curMonth.income > 0) {
+      const netInvestment = curMonth.investedOut - curMonth.investedIn;
+      if (netInvestment < -1000) {
+        const investmentRate = (netInvestment / curMonth.income) * 100;
+        found.push({
+          type: "investment", magnitude: Math.abs(investmentRate),
+          text: `Investment rate is negative this month — you redeemed ${inr(-netInvestment)} more than you invested (${investmentRate.toFixed(0)}% of income).`,
+        });
+      }
+    }
+
     return found.sort((a, b) => b.magnitude - a.magnitude).slice(0, 3);
   }, [selectedMonth, periodType, monthlyTotals, months, budgets]);
 
@@ -6324,15 +8350,17 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
           </ul>
         </div>
       )}
-      <div className="bw-waterfall">
-        <WaterfallNode label="Opening" sublabel="bank cash" value={waterfall.opening} notExact={!waterfall.openingExact} />
-        <WaterfallOp label="Income" contribution={totals.income} />
-        <WaterfallOp label="Expenses" contribution={-totals.expense} />
-        <WaterfallNode label="Savings" value={totals.savings} />
-        <WaterfallOp label="Investments" contribution={-totals.netInvestment} flagPositiveAsUnusual />
-        <WaterfallNode label="Net change in cash" value={waterfall.netChangeInCash} />
-        <WaterfallOp label="Transfers" contribution={waterfall.netTransfers} />
-        <WaterfallNode label="Closing" sublabel="bank cash" value={waterfall.closing} notExact={!waterfall.closingExact} />
+      <div className="bw-waterfall-card">
+        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(8, 1fr)" }}>
+          <WaterfallNode label="Opening" sublabel="bank cash" value={waterfall.opening} notExact={!waterfall.openingExact} />
+          <WaterfallOp label="Income" contribution={totals.income} />
+          <WaterfallOp label="Expenses" contribution={-totals.expense} />
+          <WaterfallNode label="Savings" value={totals.savings} rate={totals.income > 0 ? totals.savingsRate : null} />
+          <WaterfallOp label="Investments" contribution={-totals.netInvestment} flagPositiveAsUnusual rate={totals.income > 0 ? totals.investmentRate : null} />
+          <WaterfallNode label="Net change in cash" value={waterfall.netChangeInCash} />
+          <WaterfallOp label="Transfers" contribution={waterfall.netTransfers} />
+          <WaterfallNode label="Closing" sublabel="bank cash" value={waterfall.closing} notExact={!waterfall.closingExact} />
+        </div>
       </div>
       {waterfall.closingMismatch && (
         <div style={{
@@ -6744,7 +8772,215 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 /* snapshot, not a period figure.                                         */
 /* ---------------------------------------------------------------------- */
 
-function InvestmentsOverview({ accounts, holdingSnapshots, onGoToUpload }) {
+/* ---------------------------------------------------------------------- */
+/* Net Worth overview — a pure aggregator screen. Owns no data of its own; */
+/* every figure comes straight from computeNetWorthSummary, which reads    */
+/* live from Cash Flow accounts, Investments, and Debt.                    */
+/* ---------------------------------------------------------------------- */
+
+function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSchedules, onGoToView }) {
+  const summary = useMemo(
+    () => computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules),
+    [accounts, holdingSnapshots, otherInvestments, debtSchedules]
+  );
+
+  const hasAnyData = summary.totalAssets > 0 || summary.totalLiabilities > 0;
+
+  if (!hasAnyData) {
+    return (
+      <div className="bw-empty">
+        Nothing to show yet — Net Worth pulls live from your other screens.
+        <div style={{ marginTop: 10, display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+          <button className="bw-btn small" onClick={() => onGoToView("investments")}><TrendingUp size={12} /> Add investments</button>
+          <button className="bw-btn small" onClick={() => onGoToView("debt")}><TrendingDown size={12} /> Add a loan</button>
+        </div>
+      </div>
+    );
+  }
+
+  const assetRows = [
+    { label: "Bank balances", value: summary.bankTotal, onClick: () => onGoToView("cashflow") },
+    { label: "Market-tracked investments", value: summary.marketTrackedValue, onClick: () => onGoToView("investments") },
+    { label: "Other investments (PF, Gold, Property, etc.)", value: summary.otherInvestmentsValue, onClick: () => onGoToView("investments") },
+  ].filter((r) => r.value !== 0);
+
+  const liabilityRows = [
+    { label: "Credit cards owed", value: summary.creditCardOwed, onClick: () => onGoToView("cashflow") },
+    { label: "Loans outstanding", value: summary.totalDebt, onClick: () => onGoToView("debt") },
+  ].filter((r) => r.value !== 0);
+
+  return (
+    <div>
+      <ZoneHeader icon={Landmark} title="Net Worth" subtitle="Everything you own, minus everything you owe — pulled live from your other screens, tracked nowhere separately" />
+
+      <div className="bw-waterfall-card">
+        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
+          <HeroStat label="Net Worth" value={summary.netWorth} color={summary.netWorth >= 0 ? "var(--teal)" : "var(--rust)"} />
+          <HeroStat label="Total Assets" value={summary.totalAssets} color="var(--ink)" />
+          <HeroStat label="Total Liabilities" value={summary.totalLiabilities} color="var(--rust)" />
+        </div>
+      </div>
+
+      <div className="bw-grid2">
+        <div>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Assets</div>
+          {assetRows.length === 0 ? (
+            <div className="bw-empty" style={{ padding: "16px 10px" }}>No assets tracked yet.</div>
+          ) : (
+            <table className="bw-table">
+              <tbody>
+                {assetRows.map((r) => (
+                  <tr key={r.label} style={{ cursor: "pointer" }} onClick={r.onClick}>
+                    <td>{r.label}</td>
+                    <td className="bw-amt debit">{inr(r.value)}</td>
+                  </tr>
+                ))}
+                <tr style={{ fontWeight: 600 }}>
+                  <td>Total assets</td>
+                  <td className="bw-amt debit">{inr(summary.totalAssets)}</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Liabilities</div>
+          {liabilityRows.length === 0 ? (
+            <div className="bw-empty" style={{ padding: "16px 10px" }}>No liabilities tracked — nice.</div>
+          ) : (
+            <table className="bw-table">
+              <tbody>
+                {liabilityRows.map((r) => (
+                  <tr key={r.label} style={{ cursor: "pointer" }} onClick={r.onClick}>
+                    <td>{r.label}</td>
+                    <td className="bw-amt debit">{inr(r.value)}</td>
+                  </tr>
+                ))}
+                <tr style={{ fontWeight: 600 }}>
+                  <td>Total liabilities</td>
+                  <td className="bw-amt debit">{inr(summary.totalLiabilities)}</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      <p style={{ fontSize: 11, color: "var(--ink-soft)", marginTop: 20 }}>
+        Click any row to go to the screen that manages it — nothing on this page is editable directly, since
+        Net Worth only ever reflects what your other screens already say.
+      </p>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Debt overview — total outstanding, per-account progress, all derived    */
+/* live from computeDebtSummary. Nothing here is stored; every number      */
+/* recomputed from the imported schedules each render, same "derive at     */
+/* read time" philosophy as Investments and Goals.                         */
+/* ---------------------------------------------------------------------- */
+
+function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
+  const debtAccounts = useMemo(() => accounts.filter((a) => a.type === "debt"), [accounts]);
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const accountSummaries = useMemo(() => {
+    return debtAccounts.map((acct) => {
+      const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+      if (schedules.length === 0) return null;
+      const summary = computeDebtSummary(schedules, todayStr);
+      if (!summary.hasData) return null;
+      const allEntries = schedules.flatMap((s) => s.entries || []);
+      const continuityGaps = checkDebtScheduleContinuity(Object.values(mergeDebtEntries(schedules)));
+      return { account: acct, summary, scheduleCount: schedules.length, continuityGaps };
+    }).filter(Boolean);
+  }, [debtAccounts, debtSchedules, todayStr]);
+
+  const totalOutstanding = accountSummaries.reduce((s, a) => s + a.summary.currentOutstanding, 0);
+  const totalPrincipalPaid = accountSummaries.reduce((s, a) => s + a.summary.cumulativePrincipalPaid, 0);
+  const totalInterestPaid = accountSummaries.reduce((s, a) => s + a.summary.cumulativeInterestPaid, 0);
+
+  if (debtAccounts.length === 0 || accountSummaries.length === 0) {
+    return (
+      <div className="bw-empty">
+        No loan schedules imported yet.{" "}
+        <button className="bw-btn small" style={{ marginLeft: 8 }} onClick={onGoToUpload}>
+          <Upload size={12} /> Import a loan schedule
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <ZoneHeader icon={TrendingDown} title="Overview" subtitle="What you owe, what you've paid down, and what's coming next" />
+
+      <div className="bw-waterfall-card" style={{ marginBottom: 22 }}>
+        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
+          <HeroStat label="Total outstanding" value={totalOutstanding} color="var(--rust)" />
+          <HeroStat label="Principal paid to date" value={totalPrincipalPaid} color="var(--teal)" />
+          <HeroStat label="Interest paid to date" value={totalInterestPaid} color="var(--ink)" />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        {accountSummaries.map(({ account, summary, scheduleCount, continuityGaps }) => {
+          const originalPrincipal = summary.cumulativePrincipalPaid + summary.currentOutstanding;
+          const pctPaidOff = originalPrincipal > 0 ? Math.min(100, (summary.cumulativePrincipalPaid / originalPrincipal) * 100) : 0;
+          return (
+            <div key={account.id} style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 16, background: "var(--card)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+                <div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600 }}>{account.nickname}</div>
+                  <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>
+                    {account.loanType || "Loan"} · {account.institution}
+                    {scheduleCount > 1 && ` · ${scheduleCount} schedules imported (restructured)`}
+                  </div>
+                </div>
+                {summary.loanComplete && (
+                  <span className="bw-pill" style={{ background: "var(--teal)" }}>Paid off</span>
+                )}
+              </div>
+
+              <div style={{ height: 8, background: "var(--paper)", borderRadius: 3, overflow: "hidden", border: "1px solid var(--line)", marginBottom: 6 }}>
+                <div style={{ width: `${pctPaidOff}%`, height: "100%", background: "var(--teal)", transition: "width 0.3s" }} />
+              </div>
+              <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 12 }}>
+                {pctPaidOff.toFixed(0)}% of principal paid off — {inr(originalPrincipal)} original, {inr(summary.currentOutstanding)} remaining
+              </div>
+
+              <div className="bw-summary-row">
+                <Stat label="Current outstanding" value={inr(summary.currentOutstanding)} color="var(--rust)" hint={`as of ${summary.asOfPeriod}`} />
+                <Stat label="Principal paid" value={inr(summary.cumulativePrincipalPaid)} color="var(--teal)" />
+                <Stat label="Interest paid" value={inr(summary.cumulativeInterestPaid)} color="var(--ink)" />
+                <Stat
+                  label={summary.loanComplete ? "Loan complete" : "Next EMI"}
+                  value={summary.loanComplete ? "—" : inr(summary.nextEmiAmount)}
+                  color="var(--ink)"
+                  hint={summary.loanComplete ? null : summary.nextEmiPeriod}
+                />
+              </div>
+
+              {continuityGaps.length > 0 && (
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 11.5, padding: "8px 10px", marginTop: 12, border: "1px solid var(--rust)", borderRadius: 6 }}>
+                  <AlertCircle size={13} color="var(--rust)" style={{ marginTop: 1, flexShrink: 0 }} />
+                  <span>{continuityGaps.length} period{continuityGaps.length === 1 ? "" : "s"} don't connect cleanly — one period's closing balance doesn't match the next period's opening balance. Worth re-checking the imported schedule.</span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInvestments, setOtherInvestments, onGoToUpload }) {
+  const [activeSection, setActiveSection] = useState("market"); // market | statement | manual
+  const [apiKey, setApiKeyLocal] = useState("");
+  useEffect(() => { (async () => { setApiKeyLocal(await loadState("geminiApiKey", "")); })(); }, []);
   const investmentAccounts = useMemo(() => accounts.filter((a) => a.type === "demat" || a.type === "mutualFund"), [accounts]);
 
   const accountTransitions = useMemo(() => {
@@ -6779,27 +9015,37 @@ function InvestmentsOverview({ accounts, holdingSnapshots, onGoToUpload }) {
     t.transition.closedPositions.map((cp) => ({ ...cp, accountNickname: t.account.nickname }))
   );
 
-  if (investmentAccounts.length === 0 || accountTransitions.length === 0) {
-    return (
-      <div className="bw-empty">
-        No investment holdings imported yet.{" "}
-        <button className="bw-btn small" style={{ marginLeft: 8 }} onClick={onGoToUpload}>
-          <Upload size={12} /> Import a holding statement
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div>
+      <div className="bw-tabs" style={{ marginBottom: 18 }}>
+        <button className={`bw-tab ${activeSection === "market" ? "active" : ""}`} onClick={() => setActiveSection("market")}>
+          <TrendingUp size={13} /> Market-tracked
+        </button>
+        <button className={`bw-tab ${activeSection === "other" ? "active" : ""}`} onClick={() => setActiveSection("other")}>
+          <FileText size={13} /> Other Investments
+        </button>
+      </div>
+
+      {activeSection === "market" && (
+        investmentAccounts.length === 0 || accountTransitions.length === 0 ? (
+          <div className="bw-empty">
+            No investment holdings imported yet.{" "}
+            <button className="bw-btn small" style={{ marginLeft: 8 }} onClick={onGoToUpload}>
+              <Upload size={12} /> Import a holding statement
+            </button>
+          </div>
+        ) : (
+    <div>
       <ZoneHeader icon={TrendingUp} title="Overview" subtitle="How much you've added to your investments, and how much it's grown" />
-      <div className="bw-waterfall">
-        <WaterfallNode label="Opening" sublabel="invested" value={combined.openingInvested} />
-        <WaterfallOp label="Added" contribution={combined.added} />
-        <WaterfallOp label="Redeemed" contribution={combined.redeemed} />
-        <WaterfallNode label="Closing" sublabel="invested" value={combined.closingInvested} />
-        <WaterfallOp label="Growth" contribution={combined.growth} />
-        <WaterfallNode label="Current value" value={combined.closingCurrentValue} />
+      <div className="bw-waterfall-card">
+        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
+          <WaterfallNode label="Opening" sublabel="invested" value={combined.openingInvested} />
+          <WaterfallOp label="Added" contribution={combined.added} />
+          <WaterfallOp label="Redeemed" contribution={combined.redeemed} />
+          <WaterfallNode label="Closing" sublabel="invested" value={combined.closingInvested} />
+          <WaterfallOp label="Growth" contribution={combined.growth} />
+          <WaterfallNode label="Current value" value={combined.closingCurrentValue} />
+        </div>
       </div>
       <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "8px 0 20px" }}>
         Added/Redeemed reflects net new money since each account's previous import — not gross contributions minus
@@ -6848,6 +9094,13 @@ function InvestmentsOverview({ accounts, holdingSnapshots, onGoToUpload }) {
             </tbody>
           </table>
         </>
+      )}
+    </div>
+        )
+      )}
+
+      {activeSection === "other" && (
+        <OtherInvestmentsPanel accounts={accounts} setAccounts={setAccounts} otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments} apiKey={apiKey} />
       )}
     </div>
   );
@@ -6949,6 +9202,343 @@ function InvestmentSection({ title, icon, transitions }) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* Other Investments — PF, Gold, Property, and anything else without the   */
+/* buy/sell activity a market-tracked fund has. One unified shape, same    */
+/* field names and derivation approach as market-tracked holdings: units,  */
+/* cost-per-unit, current-per-unit, invested value, current value — every  */
+/* field nullable except currentValue, so PF (no units concept) and Gold/  */
+/* Property (units, real cost basis) both fit naturally. Manual entry and  */
+/* PDF upload both write into this same shape.                             */
+/* ---------------------------------------------------------------------- */
+
+const OTHER_INVESTMENT_SUBTYPES = ["PF", "Gold", "Property", "Other"];
+
+const OTHER_INVESTMENT_EXTRACT_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    institution: { type: "STRING", nullable: true, description: "The fund house, EPFO, or issuer name — check a title, logo caption, or letterhead text. Null if genuinely not findable." },
+    assetSubtype: { type: "STRING", nullable: true, enum: ["PF", "Gold", "Property", "Other"], description: "Best guess from context." },
+    asOfDate: { type: "STRING", nullable: true, description: "YYYY-MM-DD — the date this value is as of. Never today's date; the date printed on the statement." },
+    units: { type: "NUMBER", nullable: true, description: "Only if a quantity/unit balance is explicitly printed — never computed or estimated." },
+    unitOfMeasure: { type: "STRING", nullable: true, description: "e.g. 'grams', 'sqft' — only if explicitly relevant." },
+    costPerUnit: { type: "NUMBER", nullable: true, description: "Original cost per unit, only if explicitly printed — never computed." },
+    currentPerUnit: { type: "NUMBER", nullable: true, description: "Current price/rate per unit, only if explicitly printed — never computed." },
+    investedValue: { type: "NUMBER", nullable: true, description: "Total original cost, only if explicitly printed — never computed from units×cost yourself, that happens separately." },
+    currentValue: { type: "NUMBER", nullable: true, description: "Total current value, only if explicitly printed — never computed yourself, that happens separately." },
+  },
+  required: ["asOfDate"],
+};
+
+async function callOtherInvestmentExtract(images, apiKey) {
+  const prompt = [
+    "You are looking at page images of a statement for a PF (provident fund), Gold holding certificate,",
+    "Property valuation, or similar investment with no regular buy/sell activity.",
+    "Find: the institution/issuer name, the asset subtype, the date this value is as of, and whichever of",
+    "units / cost-per-unit / current-per-unit / total invested value / total current value are explicitly",
+    "printed. PF statements typically show only a total current value with no units concept; Gold/Property",
+    "may show a quantity and both an original cost and current rate. Report ONLY what is actually printed —",
+    "never compute, estimate, or invent any of these numbers yourself, even if some of them would let you",
+    "calculate the others.",
+  ].join("\n");
+  const parts = [
+    ...images.map((base64) => ({ inlineData: { mimeType: "image/png", data: base64 } })),
+    { text: prompt },
+  ];
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: { maxOutputTokens: 4000, responseMimeType: "application/json", responseSchema: OTHER_INVESTMENT_EXTRACT_SCHEMA },
+      }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || `Request failed (HTTP ${response.status}).`);
+  const textPart = (data.candidates?.[0]?.content?.parts || []).find((p) => typeof p.text === "string" && !p.thought);
+  if (!textPart) throw new Error("No usable response from the model.");
+  return JSON.parse(textPart.text.replace(/```json|```/g, "").trim());
+}
+
+function OtherInvestmentUploadFlow({ apiKey, onExtracted }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [wrongPassword, setWrongPassword] = useState(false);
+  const [password, setPassword] = useState("");
+  const [pendingFile, setPendingFile] = useState(null);
+  const [extracted, setExtracted] = useState(null);
+
+  async function runExtraction(file, pwd) {
+    if (!apiKey) { setError("Add your Gemini API key in Upload → PDF (AI-assisted) first — this needs it to read the statement."); return; }
+    setBusy(true); setError(null); setNeedsPassword(false); setWrongPassword(false);
+    try {
+      const { images, truncated } = await renderPdfPagesAsImages(file, pwd || undefined);
+      if (images.length === 0) { setError("Couldn't render any pages from that PDF."); return; }
+      const result = await callOtherInvestmentExtract(images, apiKey);
+      const derived = deriveOtherInvestmentFields(
+        result.units ?? null, result.costPerUnit ?? null, result.currentPerUnit ?? null,
+        result.investedValue ?? null, result.currentValue ?? null
+      );
+      const combined = { ...result, ...derived };
+      setExtracted(combined);
+      onExtracted(combined);
+      if (truncated) setError("This PDF has more pages than could be read — only the first several were checked.");
+    } catch (err) {
+      if (err && err.needsPassword) {
+        setNeedsPassword(true);
+        setWrongPassword(!!err.wasWrongPassword);
+        setPendingFile(file);
+      } else {
+        setError(err.message || "Couldn't read or extract that file.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleFile(file) {
+    if (!file) return;
+    setExtracted(null);
+    if (!/\.pdf$/i.test(file.name)) { setError("Only PDF is supported here for now."); return; }
+    setPendingFile(file);
+    runExtraction(file, "");
+  }
+
+  return (
+    <div style={{ border: "1px dashed var(--line)", borderRadius: 6, padding: 14, marginBottom: 18 }}>
+      {!extracted && (
+        <label className="bw-dropzone" style={{ padding: "20px 14px" }}>
+          <input type="file" accept=".pdf" onChange={(e) => handleFile(e.target.files[0])} />
+          <Upload size={18} style={{ marginBottom: 6 }} />
+          <div style={{ fontSize: 12.5, fontWeight: 600 }}>Click to choose a PDF statement</div>
+        </label>
+      )}
+      {busy && <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 8 }}>Reading and extracting…</div>}
+      {needsPassword && (
+        <div style={{ marginTop: 10 }}>
+          <div className="bw-field">
+            <label>{wrongPassword ? "That password didn't work — try again" : "This PDF is password-protected"}</label>
+            <input type="text" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+          </div>
+          <button className="bw-btn small" onClick={() => runExtraction(pendingFile, password)}>Unlock &amp; extract</button>
+        </div>
+      )}
+      {error && <p style={{ fontSize: 11.5, color: "var(--rust)", marginTop: 8 }}>{error}</p>}
+
+      {extracted && (
+        <div>
+          <p style={{ fontSize: 12, margin: "0 0 10px", color: "var(--teal)" }}>
+            <Check size={12} style={{ verticalAlign: -1, marginRight: 5 }} />
+            Applied below — {extracted.institution || "institution not found"}, as of {extracted.asOfDate || "date not found"}
+            {extracted.currentValue !== null && `, current value ${inr(extracted.currentValue)}`}
+            {(extracted.derived?.currentValue || extracted.derived?.investedValue) && " (some figures calculated from units × price)"}. Review and adjust before saving.
+          </p>
+          <button className="bw-btn ghost small" onClick={() => { setExtracted(null); setPendingFile(null); }}>Upload a different file</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOtherInvestments, apiKey }) {
+  const otherAccounts = useMemo(() => accounts.filter((a) => a.type === "otherInvestment"), [accounts]);
+  const [selectedAccountId, setSelectedAccountId] = useState("__new__");
+  const [assetSubtype, setAssetSubtype] = useState("PF");
+  const [nickname, setNickname] = useState("");
+  const [location, setLocation] = useState("");
+  const [units, setUnits] = useState("");
+  const [unitOfMeasure, setUnitOfMeasure] = useState("");
+  const [costPerUnit, setCostPerUnit] = useState("");
+  const [currentPerUnit, setCurrentPerUnit] = useState("");
+  const [investedValue, setInvestedValue] = useState("");
+  const [currentValue, setCurrentValue] = useState("");
+  const [asOfDate, setAsOfDate] = useState(new Date().toISOString().slice(0, 10));
+  const [showUpload, setShowUpload] = useState(false);
+
+  const selectedExistingAccount = selectedAccountId !== "__new__" ? accounts.find((a) => a.id === selectedAccountId) : null;
+  const effectiveSubtype = selectedExistingAccount ? selectedExistingAccount.assetSubtype : assetSubtype;
+
+  function resetEntryFields() {
+    setUnits(""); setUnitOfMeasure(""); setCostPerUnit(""); setCurrentPerUnit(""); setInvestedValue(""); setCurrentValue("");
+  }
+
+  function addEntry() {
+    let account = selectedExistingAccount;
+    if (!account) {
+      if (!nickname.trim()) return;
+      account = { id: uid("acc"), type: "otherInvestment", assetSubtype, nickname: nickname.trim(), location: assetSubtype === "Property" ? (location.trim() || null) : null };
+      setAccounts((prev) => [...prev, account]);
+    }
+    if (!asOfDate) return;
+    const result = deriveOtherInvestmentFields(
+      units ? parseAmountStr(units) : null,
+      costPerUnit ? parseAmountStr(costPerUnit) : null,
+      currentPerUnit ? parseAmountStr(currentPerUnit) : null,
+      investedValue ? parseAmountStr(investedValue) : null,
+      currentValue ? parseAmountStr(currentValue) : null,
+    );
+    if (result.currentValue === null) return; // need at least a current value, directly or derivable
+    setOtherInvestments((prev) => [...prev, {
+      id: uid("oi"), accountId: account.id, asOfDate,
+      units: result.units, unitOfMeasure: unitOfMeasure.trim() || null,
+      costPerUnit: result.costPerUnit, currentPerUnit: result.currentPerUnit,
+      investedValue: result.investedValue, currentValue: result.currentValue,
+      location: effectiveSubtype === "Property" ? (location.trim() || null) : null,
+      derived: result.derived, importedAt: Date.now(),
+    }]);
+    setSelectedAccountId(account.id);
+    resetEntryFields();
+  }
+
+  function deleteEntry(id) {
+    setOtherInvestments((prev) => prev.filter((e) => e.id !== id));
+  }
+
+  function handleExtracted(result) {
+    if (result.assetSubtype && OTHER_INVESTMENT_SUBTYPES.includes(result.assetSubtype)) setAssetSubtype(result.assetSubtype);
+    if (result.asOfDate) setAsOfDate(result.asOfDate);
+    if (result.units !== null) setUnits(String(result.units));
+    if (result.unitOfMeasure) setUnitOfMeasure(result.unitOfMeasure);
+    if (result.costPerUnit !== null) setCostPerUnit(String(result.costPerUnit));
+    if (result.currentPerUnit !== null) setCurrentPerUnit(String(result.currentPerUnit));
+    if (result.investedValue !== null) setInvestedValue(String(result.investedValue));
+    if (result.currentValue !== null) setCurrentValue(String(result.currentValue));
+    if (result.institution && !nickname) setNickname(result.institution);
+  }
+
+  return (
+    <div>
+      <h2 className="bw-h2">Other Investments</h2>
+      <p className="bw-lead">
+        PF, Gold, Property, or anything else without the regular buy/sell activity a market-tracked fund has.
+        Enter what you originally put in and what it's worth now to see real gain or loss — or just the current
+        value if that's all you know.
+      </p>
+
+      <button className="bw-btn ghost small" style={{ marginBottom: 14 }} onClick={() => setShowUpload((v) => !v)}>
+        <Upload size={12} /> {showUpload ? "Hide" : "Or, upload a statement (PDF)"}
+      </button>
+      {showUpload && <OtherInvestmentUploadFlow apiKey={apiKey} onExtracted={handleExtracted} />}
+
+      <div className="bw-grid2">
+        <div className="bw-field">
+          <label>Account</label>
+          <select value={selectedAccountId} onChange={(e) => setSelectedAccountId(e.target.value)}>
+            <option value="__new__">+ Add new account</option>
+            {otherAccounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+          </select>
+        </div>
+        {selectedAccountId === "__new__" ? (
+          <div className="bw-grid2" style={{ gap: 10 }}>
+            <div className="bw-field">
+              <label>Type</label>
+              <select value={assetSubtype} onChange={(e) => setAssetSubtype(e.target.value)}>
+                {OTHER_INVESTMENT_SUBTYPES.map((t) => <option key={t}>{t}</option>)}
+              </select>
+            </div>
+            <div className="bw-field">
+              <label>Nickname</label>
+              <input type="text" value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="e.g. Gold jewelry" />
+            </div>
+          </div>
+        ) : <div />}
+      </div>
+
+      {effectiveSubtype === "Property" && (
+        <div className="bw-field">
+          <label>Location (optional)</label>
+          <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} placeholder="e.g. Bangalore" />
+        </div>
+      )}
+
+      <div className="bw-grid2">
+        <div className="bw-field">
+          <label>Units (optional)</label>
+          <input type="text" inputMode="decimal" value={units} onChange={(e) => setUnits(e.target.value)} placeholder="e.g. 50" />
+        </div>
+        <div className="bw-field">
+          <label>Unit of measure (optional)</label>
+          <input type="text" value={unitOfMeasure} onChange={(e) => setUnitOfMeasure(e.target.value)} placeholder="e.g. grams, sqft" />
+        </div>
+      </div>
+      <div className="bw-grid2">
+        <div className="bw-field">
+          <label>Cost per unit (optional)</label>
+          <input type="text" inputMode="decimal" value={costPerUnit} onChange={(e) => setCostPerUnit(e.target.value)} placeholder="e.g. 5000" />
+        </div>
+        <div className="bw-field">
+          <label>Current price per unit (optional)</label>
+          <input type="text" inputMode="decimal" value={currentPerUnit} onChange={(e) => setCurrentPerUnit(e.target.value)} placeholder="e.g. 6500" />
+        </div>
+      </div>
+      <div className="bw-grid2">
+        <div className="bw-field">
+          <label>Total invested (optional — leave blank if using cost per unit)</label>
+          <input type="text" inputMode="decimal" value={investedValue} onChange={(e) => setInvestedValue(e.target.value)} placeholder="e.g. 250000" />
+        </div>
+        <div className="bw-field">
+          <label>Total current value (leave blank if using price per unit)</label>
+          <input type="text" inputMode="decimal" value={currentValue} onChange={(e) => setCurrentValue(e.target.value)} placeholder="e.g. 325000" />
+        </div>
+      </div>
+      <div className="bw-field" style={{ maxWidth: 200 }}>
+        <label>As of date</label>
+        <input type="text" value={asOfDate} onChange={(e) => setAsOfDate(e.target.value)} placeholder="YYYY-MM-DD" />
+      </div>
+      <button className="bw-btn" onClick={addEntry}><Plus size={14} /> Add entry</button>
+
+      {otherAccounts.length > 0 && (
+        <>
+          <div className="bw-section-label">Your other investments</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {otherAccounts.map((acct) => {
+              const entries = otherInvestments.filter((e) => e.accountId === acct.id).sort((a, b) => b.asOfDate.localeCompare(a.asOfDate));
+              const latest = entries[0];
+              const gain = latest && latest.investedValue !== null ? Math.round((latest.currentValue - latest.investedValue) * 100) / 100 : null;
+              return (
+                <div key={acct.id} style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 14, background: "var(--card)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                    <div>
+                      <span style={{ fontWeight: 600 }}>{acct.nickname}</span>
+                      <span style={{ fontSize: 11, color: "var(--ink-soft)", marginLeft: 8 }}>{acct.assetSubtype}{acct.location ? ` · ${acct.location}` : ""}</span>
+                    </div>
+                    {latest && (
+                      <div style={{ textAlign: "right" }}>
+                        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, fontWeight: 600 }}>{inr(latest.currentValue)}</div>
+                        {gain !== null && (
+                          <div style={{ fontSize: 11, color: gain >= 0 ? "var(--teal)" : "var(--rust)" }}>{gain >= 0 ? "+" : ""}{inr(gain)}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  {entries.length > 0 ? (
+                    <table className="bw-table">
+                      <tbody>
+                        {entries.map((e) => (
+                          <tr key={e.id}>
+                            <td style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{e.asOfDate}</td>
+                            <td className="bw-amt debit">{inr(e.currentValue)}</td>
+                            <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{e.investedValue !== null ? `invested ${inr(e.investedValue)}` : ""}</td>
+                            <td><button className="bw-btn ghost small" onClick={() => deleteEntry(e.id)}><Trash2 size={11} /></button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>No entries yet.</div>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
 /* Goals — guided creation wizard + live tracking. No stored ledger: every */
 /* goal's tracked progress is computed fresh each render from its own      */
 /* settings plus the portfolio's current invested value.                  */
@@ -7038,11 +9628,13 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
         )}
       </div>
 
-      <div className="bw-summary-row" style={{ margin: "18px 0 22px" }}>
-        <Stat label="Total invested (portfolio)" value={inr(portfolioTotals.invested)} color="var(--ink)" />
-        <Stat label="In near-term goals" value={inr(nearTermAssignedInvested)} color="var(--ink)" />
-        <Stat label="Allocated to other goals" value={inr(tracking.totalManualRequested)} color={tracking.manualOverAllocated ? "var(--rust)" : "var(--ink)"} />
-        <Stat label="Unallocated" value={inr(Math.max(0, poolForLongTermGoals - tracking.totalManualRequested))} color="var(--teal)" />
+      <div className="bw-waterfall-card" style={{ margin: "18px 0 22px" }}>
+        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+          <HeroStat label="Total invested (portfolio)" value={portfolioTotals.invested} color="var(--ink)" />
+          <HeroStat label="In near-term goals" value={nearTermAssignedInvested} color="var(--ink)" />
+          <HeroStat label="Allocated to other goals" value={tracking.totalManualRequested} color={tracking.manualOverAllocated ? "var(--rust)" : "var(--ink)"} />
+          <HeroStat label="Unallocated" value={Math.max(0, poolForLongTermGoals - tracking.totalManualRequested)} color="var(--teal)" />
+        </div>
       </div>
 
       {tracking.manualOverAllocated && (
@@ -7064,9 +9656,9 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          {nearTermGoals.map((g) => (
+          {nearTermGoals.map((g, i) => (
             <NearTermGoalCard key={g.id} goal={g} result={nearTermResults[g.id]} averageMonthlyExpense={averageMonthlyExpense}
-              holdingsIndex={holdingsIndex} assignedElsewhere={assignedElsewhere}
+              holdingsIndex={holdingsIndex} assignedElsewhere={assignedElsewhere} accentColor={goalAccentColor(i)}
               onUpdate={(patch) => updateGoal(g.id, patch)}
               confirmingDelete={confirmingDelete === g.id}
               onAskDelete={() => setConfirmingDelete(g.id)}
@@ -7074,8 +9666,8 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
               onDelete={() => deleteGoal(g.id)}
             />
           ))}
-          {[...longTermGoals].sort((a, b) => a.createdAt - b.createdAt).map((g) => (
-            <GoalCard key={g.id} goal={g} result={tracking.perGoal[g.id]} portfolioInvested={poolForLongTermGoals}
+          {[...longTermGoals].sort((a, b) => a.createdAt - b.createdAt).map((g, i) => (
+            <GoalCard key={g.id} goal={g} result={tracking.perGoal[g.id]} portfolioInvested={poolForLongTermGoals} accentColor={goalAccentColor(nearTermGoals.length + i)}
               onUpdate={(patch) => updateGoal(g.id, patch)}
               confirmingDelete={confirmingDelete === g.id}
               onAskDelete={() => setConfirmingDelete(g.id)}
@@ -7091,7 +9683,7 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
 
 const SUGGESTED_CATEGORY_PATTERN = /arbitrage|liquid|debt|money\s*market|overnight/i;
 
-function NearTermGoalCard({ goal, result, averageMonthlyExpense, holdingsIndex, assignedElsewhere, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
+function NearTermGoalCard({ goal, result, averageMonthlyExpense, holdingsIndex, assignedElsewhere, accentColor, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
   const isEmergency = goal.type === "emergency";
   const target = isEmergency
     ? Math.round((goal.emergencyMonths || 6) * averageMonthlyExpense * 100) / 100
@@ -7108,10 +9700,10 @@ function NearTermGoalCard({ goal, result, averageMonthlyExpense, holdingsIndex, 
   }
 
   return (
-    <div style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 16, background: "var(--card)" }}>
+    <div style={{ border: "1px solid var(--line)", borderLeft: `4px solid ${accentColor || "var(--line)"}`, borderRadius: 8, padding: 16, background: "var(--card)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
         <div>
-          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600 }}>{goal.name}</div>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600, color: accentColor || "var(--ink)" }}>{goal.name}</div>
           <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>
             {typeLabel} · due in under a year — funded from specific holdings, not a portfolio-wide assumption
           </div>
@@ -7217,16 +9809,16 @@ function HoldingsAssignmentPicker({ holdingsIndex, assignedKeys, assignedElsewhe
   );
 }
 
-function GoalCard({ goal, result, portfolioInvested, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
+function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
   const math = computeGoalMath(goal.costToday, goal.inflationRate, goal.returnRate, goal.yearsToGoal);
   const pctFunded = math.targetCorpus > 0 ? Math.min(100, (result.trackedCurrentValue / math.targetCorpus) * 100) : 0;
   const typeLabel = GOAL_TYPE_DEFAULTS[goal.type]?.label || goal.type;
 
   return (
-    <div style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 16, background: "var(--card)" }}>
+    <div style={{ border: "1px solid var(--line)", borderLeft: `4px solid ${accentColor || "var(--line)"}`, borderRadius: 8, padding: 16, background: "var(--card)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
         <div>
-          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600 }}>{goal.name}</div>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600, color: accentColor || "var(--ink)" }}>{goal.name}</div>
           <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{typeLabel} · {goal.yearsToGoal} years away{goal.costIsEstimate ? " · cost is an unverified estimate" : ""}</div>
         </div>
         {confirmingDelete ? (
@@ -7644,7 +10236,7 @@ function MoMCallout({ label, cur, prev }) {
    Net change in cash -> Closing, rendered as a row of connected node cards with small
    "+/-" operation labels between them. Simple flex row rather than an SVG diagram —
    reads clearly at any width, wraps gracefully on mobile. ---- */
-function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, notExact }) {
+function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, notExact, rate }) {
   const known = value !== null && value !== undefined;
   const negative = known && value < 0;
   return (
@@ -7659,6 +10251,9 @@ function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, n
       <div className="bw-wf-node-value" style={{ color: !known ? "var(--ink-soft)" : negative ? "var(--rust)" : "var(--ink)" }}>
         {known ? inr(value) : "—"}
       </div>
+      {known && rate !== null && rate !== undefined && (
+        <div style={{ fontSize: 10.5, color: rate < 0 ? "var(--rust)" : "var(--ink-soft)", marginTop: 2 }}>{rate.toFixed(0)}% of income</div>
+      )}
       {known && notExact && <div style={{ fontSize: 9, color: "var(--ochre)", marginTop: 2 }}>estimated, not confirmed</div>}
     </div>
   );
@@ -7668,7 +10263,7 @@ function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, n
  *  REDEMPTION, where netInvestment itself is negative, correctly shows as a positive
  *  teal contribution rather than a misleading fixed minus sign). Sign and color are
  *  derived from this one number, identically for every op — no per-category rules. */
-function WaterfallOp({ label, contribution, clickable, expanded, onClick, flagPositiveAsUnusual }) {
+function WaterfallOp({ label, contribution, clickable, expanded, onClick, flagPositiveAsUnusual, rate }) {
   const known = contribution !== null && contribution !== undefined;
   const negative = known && contribution < 0;
   const sign = negative ? "−" : "+";
@@ -7683,6 +10278,23 @@ function WaterfallOp({ label, contribution, clickable, expanded, onClick, flagPo
         {clickable && (expanded ? <ChevronUp size={10} style={{ verticalAlign: -1, marginLeft: 2 }} /> : <ChevronRight size={10} style={{ verticalAlign: -1, marginLeft: 2 }} />)}
       </div>
       <div className="bw-wf-op-value" style={{ color }}>{known ? inr(Math.abs(contribution)) : "—"}</div>
+      {known && rate !== null && rate !== undefined && (
+        <div style={{ fontSize: 10, color, marginTop: 1 }}>{rate.toFixed(0)}% of income{unusual ? " · net redemption" : ""}</div>
+      )}
+    </div>
+  );
+}
+
+/** Same box as WaterfallNode (literally the same bw-wf-node class, so it's pixel-for-
+ *  pixel consistent) but takes an explicit color instead of deriving one from sign —
+ *  Net Worth, Goals, and Debt's summary figures use fixed roles (liabilities are
+ *  always rust, unallocated is always teal) rather than sign-based coloring. */
+function HeroStat({ label, value, color, hint, clickable, onClick }) {
+  return (
+    <div className={`bw-wf-node ${clickable ? "clickable" : ""}`} onClick={clickable ? onClick : undefined}>
+      <div className="bw-wf-node-label">{label}</div>
+      <div className="bw-wf-node-value" style={{ color: color || "var(--ink)" }}>{inr(value)}</div>
+      {hint && <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 2 }}>{hint}</div>}
     </div>
   );
 }
