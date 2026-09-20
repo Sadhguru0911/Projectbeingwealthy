@@ -16,10 +16,190 @@ import {
   Check, ChevronDown, Wallet, AlertCircle, RefreshCw, X, Sparkles, ClipboardPaste,
   TrendingUp, TrendingDown, Minus, Target, Merge, Sun, Moon, ArrowRight, ArrowDown,
   Repeat, Lightbulb, Landmark, LineChart as LineChartIcon, Flag, ChevronRight, ChevronUp,
-  Download,
+  Download, LayoutDashboard, Bell,
 } from "lucide-react";
 import { storage } from "./storage.js";
 import { renderPdfPagesAsImages, PAGE_BREAK_MARKER } from "./pdfExtract.js";
+
+/* ---------------------------------------------------------------------- */
+/* Licensing — signed license keys, verified entirely client-side via the  */
+/* browser's own Web Crypto API. No server is ever contacted to check a    */
+/* key; the signature alone proves it was issued by us. See                */
+/* /home/claude/licensing/ for the key-generation and signing scripts that  */
+/* live outside this app (the private key must never be embedded here).    */
+/* ---------------------------------------------------------------------- */
+
+// PLACEHOLDER — replace with the real public_key.json contents once generated.
+// This key can ONLY verify signatures; it cannot be used to forge new ones, so it's
+// safe to commit and ship inside the app bundle.
+const LICENSE_PUBLIC_KEY_JWK = {
+  key_ops: ["verify"], ext: true, kty: "EC", crv: "P-256",
+  x: "BXWflFguIvgmP-dx2hSvcl6_vu3iaBcu1kDC_3ZEAjM",
+  y: "uLOfSUQfnGPWYMIJE7TylNmrooKoTP95z_U3TI0zDgM",
+};
+
+/** Decodes a base64url-encoded string (the URL-safe base64 variant used in the pasted
+ *  license key, and in JWK's x/y coordinate fields) into raw bytes, for feeding into
+ *  the Web Crypto API. Standard atob() only understands regular base64, so the
+ *  URL-safe characters (- and _) are swapped back to +/  and padding is restored
+ *  before decoding. */
+function base64urlToBuf(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  const bin = atob(str);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** Verifies a pasted license key string against the embedded public key. Returns
+ *  { valid: false, reason } or { valid: true, payload: {email, tier, keyId, issuedAt, expiresAt} }.
+ *  Never trusts the payload's contents until the signature over it has been confirmed —
+ *  a tampered payload with a mismatched signature is rejected before its fields are ever read. */
+async function verifyLicenseKey(licenseKeyString) {
+  if (!licenseKeyString || typeof licenseKeyString !== "string" || !licenseKeyString.includes(".")) {
+    return { valid: false, reason: "That doesn't look like a valid license key." };
+  }
+  const [encodedPayload, encodedSig] = licenseKeyString.trim().split(".");
+  if (!encodedPayload || !encodedSig) return { valid: false, reason: "That doesn't look like a valid license key." };
+
+  let publicKey;
+  try {
+    publicKey = await crypto.subtle.importKey(
+      "jwk", LICENSE_PUBLIC_KEY_JWK, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]
+    );
+  } catch {
+    return { valid: false, reason: "Licensing isn't configured on this build yet." };
+  }
+
+  let isValid;
+  try {
+    isValid = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" }, publicKey,
+      base64urlToBuf(encodedSig), base64urlToBuf(encodedPayload)
+    );
+  } catch {
+    return { valid: false, reason: "That doesn't look like a valid license key." };
+  }
+  if (!isValid) return { valid: false, reason: "This key's signature doesn't check out — it may be corrupted or altered." };
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(base64urlToBuf(encodedPayload)));
+  } catch {
+    return { valid: false, reason: "This key's contents couldn't be read." };
+  }
+  if (!payload.tier || !payload.expiresAt) return { valid: false, reason: "This key is missing required information." };
+
+  return { valid: true, payload };
+}
+
+/** Free-tier limits — the only place these numbers are defined, so every enforcement
+ *  check reads from here rather than a scattered literal. Bank and Credit Card are
+ *  each their own separate limit of 1 — NOT a combined pool of 2, so someone can't use
+ *  both slots on two bank accounts and end up with no room for a credit card. Investments
+ *  is a single combined limit across demat, mutual fund, AND other-investment accounts. */
+const FREE_TIER_LIMITS = {
+  bankAccounts: 1,
+  creditCardAccounts: 1,
+  debtAccounts: 1,
+  investmentAccounts: 1, // demat + mutualFund + otherInvestment combined
+  goals: 3,
+};
+
+/** Which enforcement bucket an account type belongs to, or null if the type isn't
+ *  limited at all (accounts of unrecognized/future types are never blocked). Bank and
+ *  Credit Card are deliberately separate buckets, not merged — see FREE_TIER_LIMITS. */
+function accountBucket(type) {
+  if (type === "bank") return "bank";
+  if (type === "creditCard") return "creditCard";
+  if (type === "debt") return "debt";
+  if (type === "demat" || type === "mutualFund" || type === "otherInvestment") return "investment";
+  return null;
+}
+
+/** Free-tier account limit for a given bucket - the single lookup every enforcement
+ *  function (canCreateAccount, getActiveAccountIds, etc.) goes through, so a limit
+ *  only ever needs changing in one place (FREE_TIER_LIMITS). Buckets outside the
+ *  four enforced ones (e.g. null, for account types with no limit) return Infinity,
+ *  meaning "no restriction applies here." */
+function bucketLimit(bucket) {
+  if (bucket === "bank") return FREE_TIER_LIMITS.bankAccounts;
+  if (bucket === "creditCard") return FREE_TIER_LIMITS.creditCardAccounts;
+  if (bucket === "debt") return FREE_TIER_LIMITS.debtAccounts;
+  if (bucket === "investment") return FREE_TIER_LIMITS.investmentAccounts;
+  return Infinity;
+}
+
+const BUCKET_LABELS = { bank: "Bank", creditCard: "Credit Card", debt: "Debt", investment: "Investment" };
+
+/** Display label for an account's raw type field — shown directly in the Accounts
+ *  table so a mis-typed or unexpectedly-classified account is visible at a glance,
+ *  rather than something that has to be inferred from which screens it does or doesn't
+ *  show up in. */
+const ACCOUNT_TYPE_LABELS = {
+  bank: "Bank", creditCard: "Credit Card", debt: "Debt",
+  demat: "Demat", mutualFund: "Mutual Fund", otherInvestment: "Other Investment",
+};
+
+/** The single, canonical answer to "does this account belong in Cash Flow" — built
+ *  directly on accountBucket() rather than repeating a hand-written type === "bank" ||
+ *  type === "creditCard" check wherever it's needed. Every place that previously wrote
+ *  that check by hand independently is exactly how the last two Cash Flow bugs
+ *  happened — two separate, slightly different hand-rolled filters that quietly
+ *  diverged. This is the one place that definition lives now. */
+function isCashFlowAccountType(type) {
+  const bucket = accountBucket(type);
+  return bucket === "bank" || bucket === "creditCard";
+}
+
+/** Which accounts in a bucket currently accept new imports. Respects an explicit
+ *  account.active=true flag first (set via the Accounts screen's picker); if nobody
+ *  has explicitly chosen yet, defaults to the oldest accounts by array order — accounts
+ *  are always appended on creation, so earlier array position means earlier creation.
+ *  This default is deterministic and explainable, not arbitrary, until the person picks
+ *  differently themselves. On Licensed, or whenever the bucket is within its free limit
+ *  anyway, every account in it is active — this function only ever narrows the set when
+ *  there's an actual, real choice to make. */
+function getActiveAccountIds(accounts, effectiveTier, bucket) {
+  const bucketAccounts = accounts.filter((a) => accountBucket(a.type) === bucket);
+  const limit = bucketLimit(bucket);
+  if (effectiveTier === "licensed" || bucketAccounts.length <= limit) {
+    return new Set(bucketAccounts.map((a) => a.id));
+  }
+  const explicitlyActive = bucketAccounts.filter((a) => a.active === true);
+  if (explicitlyActive.length > 0) {
+    return new Set(explicitlyActive.slice(0, limit).map((a) => a.id));
+  }
+  return new Set(bucketAccounts.slice(0, limit).map((a) => a.id));
+}
+
+/** Can a brand-new account of this type be created right now? */
+function canCreateAccount(accounts, effectiveTier, type) {
+  if (effectiveTier === "licensed") return true;
+  const bucket = accountBucket(type);
+  if (!bucket) return true;
+  const count = accounts.filter((a) => accountBucket(a.type) === bucket).length;
+  return count < bucketLimit(bucket);
+}
+
+/** Can a new statement be imported into this specific EXISTING account right now?
+ *  Distinct from canCreateAccount — this governs accounts that already exist (e.g.
+ *  from a prior Licensed period) but are over today's Free-tier limit, which should be
+ *  read-only rather than blocking the whole account from existing or being viewed. */
+function canImportIntoAccount(accounts, effectiveTier, accountId) {
+  if (effectiveTier === "licensed") return true;
+  const account = accounts.find((a) => a.id === accountId);
+  if (!account) return true;
+  const bucket = accountBucket(account.type);
+  if (!bucket) return true;
+  return getActiveAccountIds(accounts, effectiveTier, bucket).has(accountId);
+}
+
+/** Free tier allows up to FREE_TIER_LIMITS.goals total goals; Licensed has no cap. */
+function canCreateGoal(goals, effectiveTier) {
+  return effectiveTier === "licensed" || goals.length < FREE_TIER_LIMITS.goals;
+}
 
 /* ---------------------------------------------------------------------- */
 /* Constants & helpers                                                    */
@@ -27,17 +207,261 @@ import { renderPdfPagesAsImages, PAGE_BREAK_MARKER } from "./pdfExtract.js";
 
 const CATEGORIES = ["Income", "Expense", "Investment", "Transfer"];
 const EXPENSE_SUB_CATEGORIES = ["Fixed", "Variable"];
-const TRANSFER_SUB_CATEGORIES = ["Self", "Credit card payment", "External"];
+const TRANSFER_SUB_CATEGORIES = ["Self", "Credit card payment", "External", "Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"];
 const INCOME_SUB_CATEGORIES = ["Salary", "Dividend", "Rent", "Others"];
+const INVESTMENT_SUB_CATEGORIES = ["SIP", "Lumpsum", "Redemption"];
 const TAGS = ["Household", "Personal"];
-const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"]; // Fixed expenses only
+const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"]; // Fixed expenses, SIPs, and EMIs
 const PURPOSES = ["Personal", "Business"];
 
+/** The valid subcategory options for a given top-level category, used to populate
+ *  every subcategory dropdown in the app (Review tab, Rules tab, bulk actions) from
+ *  one shared source rather than each UI surface hardcoding its own list. Categories
+ *  with no subcategory concept (none currently) fall through to an empty array. */
 function subCategoryOptionsFor(category) {
   if (category === "Expense") return EXPENSE_SUB_CATEGORIES;
   if (category === "Transfer") return TRANSFER_SUB_CATEGORIES;
   if (category === "Income") return INCOME_SUB_CATEGORIES;
+  if (category === "Investment") return INVESTMENT_SUB_CATEGORIES;
   return [];
+}
+
+/** Whether a category/subCategory combination represents a recurring commitment that
+ *  should carry a frequency - Fixed expenses, SIPs, Debt-EMIs, and the recurring Income
+ *  subcategories (Salary, Dividend, Rent). Deliberately excludes one-off counterparts
+ *  (Variable, Lumpsum, Debt-Disbursement, Debt-Lumpsum Payment, Redemption, and Income's
+ *  "Others") which by nature don't recur on a predictable schedule. */
+function isFrequencyEligible(category, subCategory) {
+  return (
+    (category === "Expense" && subCategory === "Fixed") ||
+    (category === "Investment" && subCategory === "SIP") ||
+    (category === "Transfer" && subCategory === "Debt-EMI") ||
+    (category === "Income" && ["Salary", "Dividend", "Rent"].includes(subCategory))
+  );
+}
+
+/** Which account TYPES are valid targets for the optional "which account does this
+ *  belong to" link - one generic linkedAccountId field, not three separate ones, since
+ *  category+subCategory already disambiguate what kind of account makes sense. Only
+ *  meaningful for subcategories where more than one matching account could plausibly
+ *  exist (e.g. two SIPs, two loans) - returns [] for anything else, meaning "no link
+ *  makes sense here at all". Optional everywhere it applies, never required. */
+function linkableAccountTypesFor(category, subCategory) {
+  if (category === "Investment" && ["SIP", "Lumpsum", "Redemption"].includes(subCategory)) {
+    return ["demat", "mutualFund", "otherInvestment"];
+  }
+  if (category === "Transfer" && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(subCategory)) {
+    return ["debt"];
+  }
+  if (category === "Transfer" && subCategory === "Credit card payment") {
+    return ["creditCard"];
+  }
+  if (category === "Transfer" && subCategory === "Self") {
+    return ["bank"];
+  }
+  return [];
+}
+
+/* ---------------------------------------------------------------------- */
+/* Recurring commitment pattern learning - for the Cash Flow Calendar.     */
+/* Learns WHICH DAY a recurring transaction actually lands on, from real   */
+/* history, rather than asking the person to type it in or guessing from   */
+/* a single occurrence. frequency (isFrequencyEligible) only says how      */
+/* OFTEN something recurs; this says WHICH DAY, which a calendar needs.    */
+/* ---------------------------------------------------------------------- */
+
+function dayOfMonth(dateStr) {
+  return parseInt(dateStr.slice(8, 10), 10);
+}
+
+/** For a given date, returns its weekday (0=Sun..6=Sat), which occurrence of that
+ *  weekday it is within its month counting from the start (1st, 2nd, 3rd, 4th), and
+ *  whether it's the LAST occurrence of that weekday in its month - needed to detect
+ *  a floating pattern like "the last Friday", which "which Friday, counting from the
+ *  start" alone can't reliably identify, since months have a different number of
+ *  Fridays. */
+function weekdayInfo(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const dow = d.getUTCDay();
+  const dom = d.getUTCDate();
+  const ordinalFromStart = Math.ceil(dom / 7);
+  const daysInMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  const isLast = dom + 7 > daysInMonth;
+  return { dow, ordinalFromStart, isLast };
+}
+
+/** Learns whether a set of dated occurrences (all already known to be the same
+ *  recurring thing - see computeRecurringCommitments for how they're grouped)
+ *  follows a fixed day-of-month pattern (e.g. "the 1st") or a floating day-of-week
+ *  pattern (e.g. "the last Friday") - whichever actually clusters tightly in the
+ *  real data, never assumed. Requires at least 3 occurrences; fewer can't
+ *  distinguish a real pattern from coincidence, and is reported as such rather than
+ *  guessed. Tolerates a small amount of drift (a payment landing a day or two late
+ *  because the expected day fell on a weekend or holiday) - and a single outlier
+ *  among an otherwise clean pattern doesn't prevent the real pattern from being
+ *  recognized, since a missed or unusually-timed month happens without meaning the
+ *  underlying commitment stopped being regular. */
+function learnRecurringDay(dates, { minOccurrences = 3, domTolerance = 2, confidenceThreshold = 0.7 } = {}) {
+  const sorted = [...dates].sort();
+  if (sorted.length < minOccurrences) {
+    return { hasPattern: false, reason: "insufficient_data", occurrenceCount: sorted.length };
+  }
+
+  const doms = sorted.map(dayOfMonth);
+  const medianDom = [...doms].sort((a, b) => a - b)[Math.floor(doms.length / 2)];
+  const domConfidence = doms.filter((d) => Math.abs(d - medianDom) <= domTolerance).length / doms.length;
+
+  // "Last Friday" framing is preferred over a fixed ordinal ("4th Friday") since
+  // it's the more robust, more common real-world pattern - a fixed ordinal breaks
+  // in a month where a 5th occurrence of that weekday doesn't exist.
+  const dowKeys = sorted.map(weekdayInfo).map((w) => (w.isLast ? `${w.dow}-last` : `${w.dow}-${w.ordinalFromStart}`));
+  const keyFreq = {};
+  dowKeys.forEach((k) => { keyFreq[k] = (keyFreq[k] || 0) + 1; });
+  const bestKey = Object.entries(keyFreq).sort((a, b) => b[1] - a[1])[0];
+  const dowConfidence = bestKey[1] / dowKeys.length;
+
+  if (domConfidence < confidenceThreshold && dowConfidence < confidenceThreshold) {
+    return { hasPattern: false, reason: "no_clear_pattern", occurrenceCount: sorted.length, domConfidence, dowConfidence };
+  }
+
+  // Day-of-month preferred on a tie - simpler, and easier for a person to recognize
+  // and confirm at a glance than a floating weekday pattern.
+  if (domConfidence >= dowConfidence) {
+    return { hasPattern: true, patternType: "dayOfMonth", expectedDay: medianDom, confidence: domConfidence, occurrenceCount: sorted.length };
+  }
+  const [dow, ordinalPart] = bestKey[0].split("-");
+  return {
+    hasPattern: true, patternType: "dayOfWeek",
+    expectedWeekday: parseInt(dow, 10), expectedOrdinal: ordinalPart, // "last" or "1".."4"
+    confidence: dowConfidence, occurrenceCount: sorted.length,
+  };
+}
+
+/** Groups every frequency-eligible transaction into "the same recurring thing" and
+ *  learns each group's day pattern. Grouping key priority: linkedAccountId first
+ *  (the most precise identity available - which specific loan or investment this
+ *  is), falling back to matchedRuleId (the closest available identity for Fixed
+ *  expenses and Income, which don't carry a linkedAccountId), falling back to the
+ *  merchant text itself only as a last resort (least reliable, but better than
+ *  dropping a transaction from consideration entirely). One-off subcategories
+ *  (Variable, Lumpsum, Redemption, Disbursement, Income's Others) are never
+ *  included - isFrequencyEligible already establishes that a pattern isn't
+ *  meaningful to look for on these. */
+function computeRecurringCommitments(transactions, accounts, rules) {
+  const groups = {};
+  transactions
+    .filter((t) => t.category && isFrequencyEligible(t.category, t.subCategory))
+    .forEach((t) => {
+      const key = t.linkedAccountId ? `acct:${t.linkedAccountId}`
+        : t.matchedRuleId ? `rule:${t.matchedRuleId}`
+        : `merchant:${t.merchant || t.description}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    });
+
+  return Object.entries(groups).map(([key, txns]) => {
+    const sorted = [...txns].sort((a, b) => a.date.localeCompare(b.date));
+    const dates = sorted.map((t) => t.date);
+    const pattern = learnRecurringDay(dates);
+    const latest = sorted[sorted.length - 1];
+    const linkedAccount = latest.linkedAccountId ? accounts.find((a) => a.id === latest.linkedAccountId) : null;
+    const rule = latest.matchedRuleId ? rules.find((r) => r.id === latest.matchedRuleId) : null;
+    return {
+      key,
+      category: latest.category, subCategory: latest.subCategory, frequency: latest.frequency,
+      name: linkedAccount?.nickname || rule?.pattern || latest.merchant || latest.description,
+      linkedAccountId: latest.linkedAccountId || null,
+      lastAmount: Math.abs(latest.amount),
+      lastSeenDate: latest.date,
+      occurrenceCount: sorted.length,
+      transactionIds: sorted.map((t) => t.id),
+      pattern,
+    };
+  });
+}
+
+const FREQUENCY_STEP_MONTHS = { Monthly: 1, Quarterly: 3, "Semi-Annual": 6, Annual: 12 };
+
+/** Given a learned commitment and a target year/month, decides whether it's expected
+ *  to land in that month at all, and if so, on which specific date. A Quarterly
+ *  commitment shouldn't appear in every month's calendar just because its day is
+ *  known - it only recurs every 3rd month, counted forward from when it actually
+ *  last happened, not from some fixed calendar anchor. Returns null when the
+ *  commitment has no learned pattern at all, or when this specific month isn't one
+ *  of its recurring months. */
+function projectOccurrenceForMonth(commitment, targetYear, targetMonth /* 1-12 */) {
+  if (!commitment.pattern.hasPattern) return null;
+  const step = FREQUENCY_STEP_MONTHS[commitment.frequency] || 1;
+
+  const [lastYear, lastMonth] = commitment.lastSeenDate.split("-").map(Number);
+  const monthsSince = (targetYear - lastYear) * 12 + (targetMonth - lastMonth);
+  if (monthsSince <= 0 || monthsSince % step !== 0) return null;
+
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+
+  if (commitment.pattern.patternType === "dayOfMonth") {
+    const day = Math.min(commitment.pattern.expectedDay, daysInTargetMonth); // clamp e.g. 31st in a 30-day month
+    return `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  // dayOfWeek pattern: walk the target month's days to find the matching weekday occurrence
+  const { expectedWeekday, expectedOrdinal } = commitment.pattern;
+  const matches = [];
+  for (let d = 1; d <= daysInTargetMonth; d++) {
+    const dow = new Date(Date.UTC(targetYear, targetMonth - 1, d)).getUTCDay();
+    if (dow === expectedWeekday) matches.push(d);
+  }
+  const day = expectedOrdinal === "last" ? matches[matches.length - 1] : matches[parseInt(expectedOrdinal, 10) - 1];
+  if (!day) return null;
+  return `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/** Median monthly discretionary (Variable) spend across recent complete months - the
+ *  daily rate used to spread an estimate across the remaining days of an in-progress
+ *  month. Deliberately excludes the currently-viewed month itself, since a partial
+ *  month's actual-so-far total isn't a fair stand-in for a typical whole month, and
+ *  would understate the real average the earlier it's checked in a month. Median, not
+ *  mean, so one unusually large month doesn't skew the daily estimate - same
+ *  reasoning as the existing suggested-budget calculation on the Cash Flow screen. */
+function computeMedianMonthlyDiscretionary(transactions, viewYear, viewMonth) {
+  const currentMonthKey = `${viewYear}-${String(viewMonth).padStart(2, "0")}`;
+  const monthTotals = {};
+  transactions.forEach((t) => {
+    if (t.category === "Expense" && t.subCategory === "Variable") {
+      const mk = t.date.slice(0, 7);
+      if (mk === currentMonthKey) return;
+      monthTotals[mk] = (monthTotals[mk] || 0) + Math.abs(t.amount);
+    }
+  });
+  const recentMonths = Object.keys(monthTotals).sort().slice(-6);
+  return median(recentMonths.map((mk) => monthTotals[mk]));
+}
+
+/** Walks forward day by day from today's real, resolved bank balance through the end
+ *  of the viewed month, applying known commitment occurrences on their exact expected
+ *  days plus an evenly-spread daily share of typical discretionary spend - the
+ *  forward-looking mirror of resolveAccountBalanceForPeriod's backward-looking
+ *  resolver, not a reuse of it, since projecting forward and resolving backward are
+ *  genuinely different problems. Today itself gets no discretionary share added -
+ *  the starting balance, resolved as of today, already reflects whatever's actually
+ *  been spent today if it's been imported; adding another day's worth on top would
+ *  double-count it. Only non-"actual" events (projected/overdue) get applied day by
+ *  day - real transactions dated today or earlier are already baked into the
+ *  starting balance by the resolver. */
+function computeProjectedDailyBalances(startBalance, todayStr, monthEndStr, monthEvents, dailyDiscretionary) {
+  const results = [];
+  let balance = startBalance;
+  let d = new Date(todayStr + "T00:00:00Z");
+  const end = new Date(monthEndStr + "T00:00:00Z");
+  while (d <= end) {
+    const dateStr = d.toISOString().slice(0, 10);
+    const dayEvents = monthEvents.filter((e) => e.date === dateStr && e.kind !== "actual");
+    dayEvents.forEach((e) => { balance += e.direction === "credit" ? e.amount : -e.amount; });
+    if (dateStr > todayStr) balance -= dailyDiscretionary;
+    results.push({ date: dateStr, balance: Math.round(balance * 100) / 100, events: dayEvents });
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return results;
 }
 
 const PALETTE = {
@@ -84,6 +508,9 @@ const monthLabel = (mk) => {
   return new Date(Number(y), Number(m) - 1, 1).toLocaleString("en-IN", { month: "short", year: "numeric" });
 };
 
+/** Flattens a raw CSV/Excel header cell into a consistent, comparable form -
+ *  lowercased, trimmed, internal whitespace collapsed to single spaces - so
+ *  "Transaction  Date" and "transaction date" match the same alias. */
 function normalizeHeader(h) {
   return (h || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -184,10 +611,18 @@ function detectHeaderRow(rawRows, maxScan = 20) {
   return bestIdx;
 }
 
+/** Whether a string is already a clean, parseable ISO date (yyyy-mm-dd) - used to
+ *  reject rows where parseDateStr couldn't make sense of the raw cell and just
+ *  returned it unchanged. */
 function isLikelyValidDate(iso) {
   return /^\d{4}-\d{2}-\d{2}$/.test(iso || "");
 }
 
+/** Best-guess match of a spreadsheet column to one of a field's known aliases (e.g.
+ *  DATE_ALIASES) - tries an exact normalized match first across all headers, then
+ *  falls back to a substring match, so "Txn Date" matches the "date" alias family
+ *  even though it isn't an exact hit. Returns the header's original (non-normalized)
+ *  text, since that's what's actually used to key into each row's object. */
 function guessColumn(headers, aliases) {
   const norm = headers.map(normalizeHeader);
   for (const alias of aliases) {
@@ -201,6 +636,10 @@ function guessColumn(headers, aliases) {
   return "";
 }
 
+/** Parses a raw amount cell into a number, stripping thousands separators, the ₹
+ *  symbol, and whitespace, and treating accounting-style parentheses - e.g. "(500)" -
+ *  as a negative number. Anything unparseable becomes 0, not NaN, so downstream sums
+ *  never silently break. */
 function parseAmountStr(v) {
   if (v === undefined || v === null) return 0;
   const cleaned = v.toString().replace(/[,₹\s]/g, "").replace(/^\((.*)\)$/, "-$1");
@@ -218,6 +657,12 @@ function parseAmountOrNull(v) {
   return parseAmountStr(v);
 }
 
+/** Normalizes a raw date cell (in whatever format a bank's export happens to use) into
+ *  a clean ISO yyyy-mm-dd string. Tries formats in order of confidence: already-ISO,
+ *  then dd/mm/yyyy or dd-mm-yyyy (using whichever of the two ambiguous numbers is >12
+ *  to disambiguate day from month when possible), then "12 Jan 2026"-style text dates,
+ *  falling back to JS's native Date parsing as a last resort. Returns the original
+ *  string unchanged if nothing matches, rather than throwing or returning empty. */
 function parseDateStr(v) {
   if (!v) return "";
   const s = v.toString().trim();
@@ -248,6 +693,12 @@ function parseDateStr(v) {
   return s;
 }
 
+/** Collapses a transaction description down to a short, mergeable "merchant key" -
+ *  the first three cleaned-up words, e.g. "UPI/SWIGGY/419803038/BILL" becomes
+ *  "SWIGGY BILL" (digits and punctuation already stripped by normalizeForMatch).
+ *  This is what lets near-identical bank descriptions for the same merchant group
+ *  together in the Review tab and merchant-based reports, rather than every
+ *  transaction reference number producing its own unique, ungroupable row. */
 function normalizeMerchant(desc) {
   return normalizeForMatch(desc).split(" ").slice(0, 3).join(" ");
 }
@@ -264,6 +715,9 @@ function normalizeForMatch(desc) {
     .trim();
 }
 
+/** Standard median of a numeric array - used instead of the average for suggested
+ *  budgets and recurring-spend estimates specifically because one unusually large or
+ *  small month shouldn't skew the suggestion the way it would skew a mean. */
 function median(arr) {
   if (!arr || arr.length === 0) return 0;
   const sorted = [...arr].sort((a, b) => a - b);
@@ -275,34 +729,53 @@ function median(arr) {
  *  Cash Flow dashboard resolve "what was my opening/closing balance" for ANY past
  *  period, not just whatever the most recent import happened to be. Returns null if
  *  every snapshot for this account is after the requested date (or there are none). */
-function resolveBalanceAtDate(account, dateStr) {
-  const history = account?.balanceHistory || [];
-  let best = null;
-  history.forEach((h) => {
-    if (h.date <= dateStr && (best === null || h.date > best.date)) best = h;
-  });
-  return best ? best.balance : null;
+/** Resolves an account's balance as of a specific date, with three tiers of confidence:
+ *  "exact" (a statement directly confirmed this exact date), "derived" (no direct
+ *  confirmation for this date, but a confirmed prior point exists AND this account's
+ *  own real, dated transactions bridge the gap between that point and this date — so
+ *  the result is computed from genuine activity, not guessed), or "estimate" (no
+ *  confirmed point for this date and no transaction data to bridge the gap either —
+ *  a pure carry-forward with nothing behind it). Returns { value, tier, exact };
+ *  value is null with tier "unknown" if there's no confirmed point on or before the
+ *  date at all. `exact` is a backward-compatible boolean (tier === "exact") for call
+ *  sites not yet migrated to read `tier` directly. */
+function resolveBalanceAsOfDate(account, transactions, targetDate) {
+  // Defensive: an entry saved before this session's date -> asOfDate rename would have
+  // no asOfDate at all, only the old 'date' field - normalize on read rather than
+  // assuming every stored entry already matches the current schema. This is exactly
+  // what caused the app to fail to load entirely for any existing saved data.
+  const history = [...(account?.balanceHistory || [])]
+    .map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date }))
+    .sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+  const eligible = history.filter((h) => h.asOfDate <= targetDate);
+  if (eligible.length === 0) return { value: null, tier: "unknown", exact: false };
+  const basePoint = eligible[eligible.length - 1];
+
+  if (basePoint.asOfDate === targetDate) return { value: basePoint.balance, tier: "exact", exact: true };
+
+  const uploadHistory = account?.uploadHistory || [];
+  const coveringBatch = uploadHistory.find((h) => h.periodStart <= targetDate && targetDate <= h.periodEnd);
+  if (!coveringBatch) return { value: basePoint.balance, tier: "estimate", exact: false };
+
+  const acctId = account.id;
+  const bridgeTxns = transactions.filter((t) => t.accountId === acctId && t.date > basePoint.asOfDate && t.date <= targetDate);
+  const delta = bridgeTxns.reduce((s, t) => s + (t.direction === "credit" ? t.amount : -t.amount), 0);
+  return { value: Math.round((basePoint.balance + delta) * 100) / 100, tier: "derived", exact: false };
 }
 
-/** Resolves an account's opening or closing balance for a specific period, preferring
- *  an EXACT statement match — that period's own confirmed number, from the specific
- *  import that covered exactly this period — over a fuzzy carried-forward snapshot.
- *  Returns { value, exact }: exact:false means this is an estimate borrowed from a
- *  different (earlier) confirmed snapshot, not a confirmed number for the period
- *  actually being viewed — the distinction that was previously invisible and made a
- *  missing confirmation look identical to a real one. */
-function resolveAccountBalanceForPeriod(account, periodStart, periodEnd, which) {
-  const uploadHistory = account?.uploadHistory || [];
-  const exactMatch = uploadHistory.find((h) => h.periodStart === periodStart && h.periodEnd === periodEnd);
-  if (exactMatch) {
-    const val = which === "opening" ? exactMatch.openingBalance : exactMatch.closingBalance;
-    if (val !== null && val !== undefined) return { value: val, exact: true };
-  }
-  const dateStr = which === "opening"
+/** Resolves an account's opening or closing balance for a specific period. Opening and
+ *  Closing are resolved INDEPENDENTLY — each is just "the balance as of this one
+ *  boundary date" — rather than requiring a single import to have confirmed the ENTIRE
+ *  period at once, which broke down the moment an account had more than one statement
+ *  (Standard Chartered, multiple monthly imports, "All time" selected — no single
+ *  upload spans the combined range even though every individual statement was
+ *  correctly confirmed). Just delegates to the one shared resolver for whichever
+ *  boundary date is being asked about. */
+function resolveAccountBalanceForPeriod(account, transactions, periodStart, periodEnd, which) {
+  const targetDate = which === "opening"
     ? (() => { const d = new Date(periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
     : periodEnd;
-  const fallback = resolveBalanceAtDate(account, dateStr);
-  return { value: fallback, exact: false };
+  return resolveBalanceAsOfDate(account, transactions, targetDate);
 }
 
 /** Every period-like signal an upload has, as comparable keys. An entry can have up to
@@ -576,6 +1049,9 @@ function computeGoalMath(costToday, inflationRatePct, returnRatePct, years) {
   return { targetCorpus, lumpsumRequired, sipRequired };
 }
 
+/** Whole calendar months between two dates (not days÷30) - so "Jan 15 to Mar 1" reads
+ *  as 1 completed month, matching how a goal's remaining-months countdown should feel,
+ *  not a fractional day-count. Clamped to never go negative. */
 function monthsBetween(startDateStr, endDateStr) {
   const start = new Date(startDateStr), end = new Date(endDateStr);
   if (isNaN(start.getTime()) || isNaN(end.getTime())) return 0;
@@ -873,6 +1349,14 @@ async function callDocumentClassify(inputParts, apiKey, aiModel) {
 /* any UI.                                                                  */
 /* ------------------------------------------------------------------------ */
 
+/** The current, "as-of-today" Net Worth figure - Assets (bank balances + latest
+ *  investment holding values + latest other-investment values) minus Liabilities
+ *  (credit card balances + current debt outstanding, sourced from each loan's
+ *  amortization schedule via computeDebtSummary). Each account type's contribution
+ *  comes from wherever ITS most current, real data actually lives (lastKnownBalance
+ *  for bank/CC, the latest holding snapshot for investments, the schedule's current
+ *  period for debt) - not from one shared "balance" field, since each account type's
+ *  balance is confirmed through a genuinely different mechanism. */
 function computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules) {
   const bankTotal = accounts.filter((a) => a.type === "bank").reduce((s, a) => s + (a.lastKnownBalance || 0), 0);
   // A credit card's balance is a LIABILITY (money owed), not an asset — kept separate
@@ -912,6 +1396,118 @@ function computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, de
   };
 }
 
+/** Same shape as computeNetWorthSummary, but using each account's SECOND-MOST-RECENT
+ *  data point instead of its latest — the "vs last snapshot" comparison. Deliberately
+ *  never fabricates a historical value: an account with only one data point contributes
+ *  the same number to both "current" and "previous" (no visible change from it), rather
+ *  than guessing at what it might have been before. Debt isn't rolled back at all — there's
+ *  no discrete "previous debt snapshot" event the way there is for a bank import or a
+ *  holdings statement, so debt is held constant in both calculations rather than inventing
+ *  an arbitrary comparison date for it. */
+function computeNetWorthSummaryAsOfPrevious(accounts, holdingSnapshots, otherInvestments, debtSchedules) {
+  const secondToLast = (sorted) => (sorted.length >= 2 ? sorted[sorted.length - 2] : sorted[sorted.length - 1]);
+
+  const bankTotal = accounts.filter((a) => a.type === "bank").reduce((s, a) => {
+    const hist = [...(a.balanceHistory || [])].map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date })).sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
+    if (hist.length === 0) return s + (a.lastKnownBalance || 0);
+    return s + secondToLast(hist).balance;
+  }, 0);
+  const creditCardOwed = accounts.filter((a) => a.type === "creditCard").reduce((s, a) => {
+    const hist = [...(a.balanceHistory || [])].map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date })).sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
+    if (hist.length === 0) return s + (a.lastKnownBalance || 0);
+    return s + secondToLast(hist).balance;
+  }, 0);
+
+  const investmentAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
+  let marketTrackedValue = 0;
+  investmentAccounts.forEach((acct) => {
+    const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (snaps.length > 0) marketTrackedValue += secondToLast(snaps).totalCurrentValue || 0;
+  });
+
+  const otherInvestmentAccounts = accounts.filter((a) => a.type === "otherInvestment");
+  let otherInvestmentsValue = 0;
+  otherInvestmentAccounts.forEach((acct) => {
+    const entries = otherInvestments.filter((e) => e.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (entries.length > 0) otherInvestmentsValue += secondToLast(entries).currentValue || 0;
+  });
+
+  // Debt held constant — see comment above.
+  const debtAccounts = accounts.filter((a) => a.type === "debt");
+  const todayStr = new Date().toISOString().slice(0, 10);
+  let totalDebt = 0;
+  debtAccounts.forEach((acct) => {
+    const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+    if (schedules.length > 0) {
+      const summary = computeDebtSummary(schedules, todayStr);
+      if (summary.hasData) totalDebt += summary.currentOutstanding;
+    }
+  });
+
+  const totalAssets = Math.round((bankTotal + marketTrackedValue + otherInvestmentsValue) * 100) / 100;
+  const totalLiabilities = Math.round((creditCardOwed + totalDebt) * 100) / 100;
+  return {
+    bankTotal, creditCardOwed, marketTrackedValue, otherInvestmentsValue, totalDebt,
+    totalAssets, totalLiabilities, netWorth: Math.round((totalAssets - totalLiabilities) * 100) / 100,
+  };
+}
+
+/** Net worth as it would have appeared using only data available on or before a given
+ *  cutoff date — the building block for a monthly trend. For each account, uses the
+ *  latest balance/snapshot ON OR BEFORE the cutoff, never a future one. A genuine,
+ *  named limitation: an account with no data point before the cutoff contributes 0 for
+ *  that period, not its current balance — honest given what's actually known as of that
+ *  date, but it can understate early history if an account existed in reality before it
+ *  was ever imported into the app. Debt uses computeDebtSummary's own native point-in-time
+ *  support directly, since that's amortization math, not an import-dependent snapshot. */
+function computeNetWorthAsOfDate(accounts, holdingSnapshots, otherInvestments, debtSchedules, cutoffDateStr) {
+  const latestOnOrBefore = (sorted, dateField) => {
+    const eligible = sorted.filter((x) => x[dateField] <= cutoffDateStr);
+    return eligible.length > 0 ? eligible[eligible.length - 1] : null;
+  };
+
+  const bankTotal = accounts.filter((a) => a.type === "bank").reduce((s, a) => {
+    const hist = [...(a.balanceHistory || [])].map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date })).sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
+    const point = latestOnOrBefore(hist, "asOfDate");
+    return s + (point ? point.balance : 0);
+  }, 0);
+  const creditCardOwed = accounts.filter((a) => a.type === "creditCard").reduce((s, a) => {
+    const hist = [...(a.balanceHistory || [])].map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date })).sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
+    const point = latestOnOrBefore(hist, "asOfDate");
+    return s + (point ? point.balance : 0);
+  }, 0);
+
+  const investmentAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
+  let marketTrackedValue = 0;
+  investmentAccounts.forEach((acct) => {
+    const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    const point = latestOnOrBefore(snaps, "asOfDate");
+    if (point) marketTrackedValue += point.totalCurrentValue || 0;
+  });
+
+  const otherInvestmentAccounts = accounts.filter((a) => a.type === "otherInvestment");
+  let otherInvestmentsValue = 0;
+  otherInvestmentAccounts.forEach((acct) => {
+    const entries = otherInvestments.filter((e) => e.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    const point = latestOnOrBefore(entries, "asOfDate");
+    if (point) otherInvestmentsValue += point.currentValue || 0;
+  });
+
+  const debtAccountsAsOf = accounts.filter((a) => a.type === "debt");
+  let totalDebtAsOf = 0;
+  debtAccountsAsOf.forEach((acct) => {
+    const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+    if (schedules.length > 0) {
+      const summary = computeDebtSummary(schedules, cutoffDateStr);
+      if (summary.hasData) totalDebtAsOf += summary.currentOutstanding;
+    }
+  });
+
+  const totalAssetsAsOf = Math.round((bankTotal + marketTrackedValue + otherInvestmentsValue) * 100) / 100;
+  const totalLiabilitiesAsOf = Math.round((creditCardOwed + totalDebtAsOf) * 100) / 100;
+  return { netWorth: Math.round((totalAssetsAsOf - totalLiabilitiesAsOf) * 100) / 100 };
+}
+
 /* ------------------------------------------------------------------------ */
 /* AI Analyst & Personal CFO — every number the model ever sees comes from   */
 /* these functions, computed here in plain code and verified the same way   */
@@ -930,6 +1526,9 @@ const PLACEHOLDER_TYPES = {
   amount: { token: "[amount]", label: "amount" },
 };
 
+/** Which placeholder tokens (e.g. "[category]", "[account]") a saved prompt template
+ *  actually uses - drives TokenResolutionModal, which asks the person to fill in only
+ *  the placeholders a given prompt contains, not every possible one. */
 function extractPlaceholderTokens(template) {
   const found = new Set();
   Object.values(PLACEHOLDER_TYPES).forEach((p) => { if (template.includes(p.token)) found.add(p.token); });
@@ -1441,12 +2040,19 @@ const MERCHANT_STOPWORDS = new Set([
   "SOLUTIONS", "INC", "CORP", "COMPANY", "CO", "THE", "AND", "BILL", "TXN", "REF", "ONLINE",
 ]);
 
+/** Strips generic banking/corporate noise words (UPI, LTD, TECHNOLOGY, etc.) from a
+ *  merchant key, leaving just the distinctive part - this is what lets "UPI SCAPIA
+ *  SCAPIA" and "UPI SCAPIA TECHNOLOGY" both reduce to "SCAPIA" and be recognized as
+ *  the same underlying merchant, feeding computeSuggestedMerchantClusters. */
 function merchantCore(key) {
   const tokens = (key || "").split(" ").filter(Boolean).filter((t) => !MERCHANT_STOPWORDS.has(t));
   const core = tokens.length ? tokens.join(" ") : (key || "");
   return core.trim();
 }
 
+/** Converts an all-caps or lowercase merchant string into a readable "Title Case"
+ *  suggestion (e.g. "SCAPIA" -> "Scapia") for the default name proposed when merging
+ *  a cluster of near-duplicate merchant strings into one canonical group. */
 function titleCase(s) {
   return (s || "").toLowerCase().split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
 }
@@ -1491,6 +2097,11 @@ function computeSuggestedMerchantClusters(transactions, aliases) {
     .sort((a, b) => b.variants.length - a.variants.length);
 }
 
+/** The starter categorization rules every new install begins with - common merchant/
+ *  keyword patterns mapped to a sensible default category, so a first import isn't
+ *  entirely uncategorized. These are "system" source rules, lowest priority tier
+ *  (priority = pattern length, same as any other rule) - a user-added or learned rule
+ *  with the same or a more specific pattern always wins a tie via matchRule's sort. */
 function seedRules() {
   const seed = [
     ["salary", "Income", null, null],
@@ -1562,6 +2173,11 @@ function seedRules() {
   }));
 }
 
+/** Finds the best-matching categorization rule for a transaction description, or null
+ *  if nothing matches. "Best" means highest priority among all rules whose pattern
+ *  appears in the (normalized) description - priority defaults to pattern length, so
+ *  a more specific pattern naturally outranks a shorter, more generic one, and a
+ *  user-added or learned rule can be given an explicit priority to win ties. */
 function matchRule(description, rules) {
   // Normalize both sides the same way: rules learned from "remember this merchant" store a
   // space-joined pattern (e.g. "upi swiggy bangalore"), but real bank descriptions usually
@@ -1599,6 +2215,10 @@ function findTransferCandidates(txn, allTransactions) {
     .sort((a, b) => Math.abs(new Date(a.date).getTime() - txnTime) - Math.abs(new Date(b.date).getTime() - txnTime));
 }
 
+/** Whether a transaction is one of the two Transfer subcategories that genuinely have
+ *  a real "other side" to expect and verify - Self (moves between the person's own
+ *  accounts) and Credit card payment (settles a card statement). External deliberately
+ *  isn't included here - see findTransferCandidates for why. */
 function isSubstantiableTransfer(t) {
   return t.category === "Transfer" && (t.subCategory === "Self" || t.subCategory === "Credit card payment");
 }
@@ -1621,6 +2241,11 @@ function transferStatus(txn, allTransactions, accounts) {
   return candidates.length > 0 ? { status: "suggested", candidate: candidates[0] } : { status: "pending", candidate: null };
 }
 
+/** Resolves a transaction's category/subCategory/tag into a key for looking up its
+ *  display color/label in PALETTE - Expense gets its Fixed/Variable-Household/
+ *  Variable-Personal split, Income gets a per-subcategory color if one's defined
+ *  (falling back to the plain "Income" color otherwise), everything else uses its
+ *  bare category name directly. */
 function pillClass(category, subCategory, tag) {
   if (!category) return "Uncategorized";
   if (category === "Expense") {
@@ -1708,6 +2333,10 @@ async function clearBackupFolderHandle() {
 /* progress) — nothing here is an invented metric.                        */
 /* ---------------------------------------------------------------------- */
 
+/** The marketing landing page shown before the person enters the app proper - static
+ *  content and its own scoped CSS (the lp- prefix keeps every style local to this
+ *  page, so nothing here can leak into or collide with the main app's own styling).
+ *  onGetStarted is the single action: dismiss this page and move into the real app. */
 function LandingPage({ onGetStarted }) {
   return (
     <div className="lp-root">
@@ -1780,6 +2409,20 @@ function LandingPage({ onGetStarted }) {
         }
         .lp-howitworks-title { font-family: 'Fraunces', serif; font-weight: 600; font-size: 16px; margin-bottom: 4px; }
         .lp-howitworks-desc { font-size: 13.5px; color: var(--lp-ink-soft); line-height: 1.6; }
+        .lp-pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 44px; text-align: left; }
+        .lp-pricing-card { border: 1px solid var(--lp-line); border-radius: 8px; padding: 24px 20px; background: var(--lp-card); }
+        .lp-pricing-card.featured { background: var(--lp-ink); border-color: var(--lp-teal); }
+        .lp-pricing-badge { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-teal); font-weight: 600; margin-bottom: 10px; }
+        .lp-pricing-name { font-family: 'Fraunces', serif; font-weight: 600; font-size: 17px; color: var(--lp-ink); margin-bottom: 6px; }
+        .lp-pricing-card.featured .lp-pricing-name { color: var(--lp-card); }
+        .lp-pricing-price { font-family: 'Fraunces', serif; font-weight: 600; font-size: 28px; color: var(--lp-teal); margin-bottom: 2px; }
+        .lp-pricing-sub { font-size: 11.5px; font-style: italic; color: var(--lp-ink-soft); margin-bottom: 16px; }
+        .lp-pricing-card.featured .lp-pricing-sub { color: #9AA0A6; }
+        .lp-pricing-item { font-size: 12.5px; color: var(--lp-ink-soft); padding: 7px 0; border-bottom: 1px solid var(--lp-line); }
+        .lp-pricing-card.featured .lp-pricing-item { color: #C8CCD0; border-bottom-color: #3A424B; }
+        .lp-pricing-item:last-child { border-bottom: none; }
+        .lp-pricing-note { font-size: 11.5px; color: var(--lp-ink-soft); font-style: italic; margin-top: 18px; }
+        @media (max-width: 700px) { .lp-pricing-grid { grid-template-columns: 1fr; } }
         .lp-footer { text-align: center; padding: 70px 0 90px; }
         .lp-footer .lp-wordmark { margin-bottom: 10px; }
         .lp-footer .lp-tagline { font-family: 'Fraunces', serif; font-style: italic; font-size: 15px; color: var(--lp-ink-soft); }
@@ -1935,6 +2578,45 @@ function LandingPage({ onGetStarted }) {
         <hr className="lp-hr" />
 
         <section className="lp-story lp-section">
+          <h2>Priced for what BYOK actually changes.</h2>
+          <p>No server to run, no AI markup to charge for — the fee pays for the software, not a tax on someone else's model.</p>
+          <div className="lp-pricing-grid">
+            <div className="lp-pricing-card">
+              <div className="lp-pricing-name">Free</div>
+              <div className="lp-pricing-price">₹0</div>
+              <div className="lp-pricing-sub">forever</div>
+              <div className="lp-pricing-item">1 Bank account + 1 Credit Card account</div>
+              <div className="lp-pricing-item">1 Debt account · 1 Investment account</div>
+              <div className="lp-pricing-item">3 Goals, near-term or long-term</div>
+              <div className="lp-pricing-item">Full Analyst & Personal CFO — built-in prompts</div>
+              <div className="lp-pricing-item">Your own Gemini key, always</div>
+            </div>
+            <div className="lp-pricing-card featured">
+              <div className="lp-pricing-badge">Most Popular</div>
+              <div className="lp-pricing-name">Licensed</div>
+              <div className="lp-pricing-price">₹499</div>
+              <div className="lp-pricing-sub">/yr — illustrative, TBC</div>
+              <div className="lp-pricing-item">Unlimited accounts, every screen</div>
+              <div className="lp-pricing-item">Save your own custom AI prompts</div>
+              <div className="lp-pricing-item">Continued feature enhancements</div>
+              <div className="lp-pricing-item">Priority support</div>
+              <div className="lp-pricing-item">Your own Gemini key — never marked up</div>
+            </div>
+            <div className="lp-pricing-card">
+              <div className="lp-pricing-name">Managed AI</div>
+              <div className="lp-pricing-price" style={{ fontSize: 20 }}>Coming Soon</div>
+              <div className="lp-pricing-sub">for heavy users</div>
+              <div className="lp-pricing-item">No API key to set up or manage</div>
+              <div className="lp-pricing-item">We handle the AI relationship</div>
+              <div className="lp-pricing-item">Usage-based, built for power users</div>
+              <div className="lp-pricing-item">Everything in Licensed, included</div>
+            </div>
+          </div>
+        </section>
+
+        <hr className="lp-hr" />
+
+        <section className="lp-story lp-section">
           <h2>Your money. Your data. Your device.</h2>
           <div className="lp-privacy-subhead">Privacy by design. Local-first by default.</div>
           <p>Your financial life stays on your device. Being Wealthy doesn't need a central database of your financial information, and we don't sell your data.</p>
@@ -1969,6 +2651,7 @@ export default function BeingWealthyLedger() {
   const [rules, setRules] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [budgets, setBudgets] = useState({}); // { "Expense-Fixed": 15000, ... }
+  const [cashBuffer, setCashBuffer] = useState(0); // Cash Flow Calendar's minimum-balance preference - a temporary home until a general settings screen exists
   const [merchantAliases, setMerchantAliases] = useState([]); // [{ id, canonical, variants: [rawMerchantKey, ...] }]
   // One entry per investment holding-statement import. Each is self-contained (asOfDate,
   // totals, full holdings list) — the SAME pattern as an uploadHistory batch for a bank
@@ -2007,6 +2690,11 @@ export default function BeingWealthyLedger() {
   const [tutorialActive, setTutorialActive] = useState(false);
   const [tutorialStep, setTutorialStep] = useState(0);
   const [hasSeenTutorial, setHasSeenTutorial] = useState(true); // true until proven otherwise, to avoid a flash of the tour before load completes
+  const [license, setLicense] = useState(null); // null = Free tier; { email, tier, keyId, issuedAt, expiresAt } once a valid key is stored
+  const [showLicenseModal, setShowLicenseModal] = useState(false);
+  const [licenseKeyInput, setLicenseKeyInput] = useState("");
+  const [licenseError, setLicenseError] = useState("");
+  const [licenseChecking, setLicenseChecking] = useState(false);
   const [theme, setTheme] = useState("light"); // light | dark
   const saveTimerRef = useRef(null);
 
@@ -2045,6 +2733,7 @@ export default function BeingWealthyLedger() {
         setTransactions(combined.transactions || []);
         setRules(combined.rules || seedRules());
         setBudgets(combined.budgets || {});
+        setCashBuffer(combined.cashBuffer || 0);
         setMerchantAliases(combined.merchantAliases || []);
         setHoldingSnapshots(combined.holdingSnapshots || []);
         setGoals(combined.goals || []);
@@ -2086,6 +2775,14 @@ export default function BeingWealthyLedger() {
         setSavedPrompts([]);
       }
       setHasSeenTutorial(await loadState("hasSeenTutorial", false));
+      const storedLicenseKey = await loadState("licenseKey", null);
+      if (storedLicenseKey) {
+        const result = await verifyLicenseKey(storedLicenseKey);
+        if (result.valid) setLicense(result.payload);
+        // An invalid stored key (corrupted, tampered, or signed by an old/different key)
+        // is silently treated as no license, rather than surfacing an error on every
+        // load — the person only sees an error if THEY paste in a bad key themselves.
+      }
       setReady(true);
     })();
   }, []);
@@ -2111,6 +2808,36 @@ export default function BeingWealthyLedger() {
     setTutorialStep(0);
     setTutorialActive(true);
   }
+
+  async function submitLicenseKey() {
+    setLicenseChecking(true);
+    setLicenseError("");
+    const result = await verifyLicenseKey(licenseKeyInput);
+    setLicenseChecking(false);
+    if (!result.valid) {
+      setLicenseError(result.reason);
+      return;
+    }
+    setLicense(result.payload);
+    saveState("licenseKey", licenseKeyInput.trim());
+    setLicenseKeyInput("");
+    setShowLicenseModal(false);
+    showToast("License verified — you're on the Licensed plan.");
+  }
+
+  function removeLicense() {
+    setLicense(null);
+    saveState("licenseKey", null);
+    showToast("License removed. You're back on the Free plan — nothing you've already added is deleted.");
+  }
+
+  // The single source of truth for "is this person actually Licensed right now" — a
+  // stored key that verified successfully on load can still be expired by today's date,
+  // so tier status is always this derived check, never just "is `license` non-null".
+  const todayDateStr = new Date().toISOString().slice(0, 10);
+  const isLicenseValid = license !== null && license.expiresAt >= todayDateStr;
+  const effectiveTier = isLicenseValid ? "licensed" : "free";
+  const licenseDaysRemaining = license ? Math.ceil((new Date(license.expiresAt) - new Date(todayDateStr)) / (1000 * 60 * 60 * 24)) : null;
 
   // Navigates the actual app to match whatever the current tutorial step is
   // describing, so the overlay always sits on top of the real screen it's talking
@@ -2164,7 +2891,7 @@ export default function BeingWealthyLedger() {
     if (!ready) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveState("appData", { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts });
+      saveState("appData", { transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts });
       // Same trigger as the regular save — if a folder is actively connected, write a
       // fresh backup there too, throttled to at most once every 5 minutes so rapid
       // edits don't hammer the disk with a new file on every keystroke.
@@ -2174,7 +2901,7 @@ export default function BeingWealthyLedger() {
       }
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, ready]);
+  }, [transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, ready]);
 
   function showToast(msg) {
     setToast(msg);
@@ -2205,7 +2932,7 @@ export default function BeingWealthyLedger() {
       beingWealthyBackup: true,
       exportedAt: new Date().toISOString(),
       version: 1,
-      data: { transactions, rules, accounts, budgets, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts },
+      data: { transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts },
     };
   }
 
@@ -2328,6 +3055,7 @@ export default function BeingWealthyLedger() {
     setTransactions(d.transactions || []);
     setRules(d.rules || seedRules());
     setBudgets(d.budgets || {});
+    setCashBuffer(d.cashBuffer || 0);
     setMerchantAliases(d.merchantAliases || []);
     setHoldingSnapshots(d.holdingSnapshots || []);
     setGoals(d.goals || []);
@@ -2510,7 +3238,7 @@ export default function BeingWealthyLedger() {
 
         .bw-toast {
           position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
-          background: var(--ink); color: #fff; padding: 10px 18px; border-radius: 5px; font-size: 12.5px;
+          background: #21262B; color: #fff; padding: 10px 18px; border-radius: 5px; font-size: 12.5px;
           display: flex; align-items: center; gap: 8px; z-index: 50;
         }
         .bw-empty { padding: 40px 10px; text-align: center; color: var(--ink-soft); font-size: 13px; }
@@ -2529,6 +3257,22 @@ export default function BeingWealthyLedger() {
         .bw-zone-header h3 { font-family: 'Fraunces', serif; font-size: 17px; font-weight: 600; margin: 0; }
         .bw-zone-header p { font-size: 12px; color: var(--ink-soft); margin: 1px 0 0; }
         .bw-hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
+
+        .bw-insight-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 16px 0 22px; }
+        .bw-insight-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+        .bw-insight-card.clickable { cursor: pointer; transition: border-color 0.15s; }
+        .bw-insight-card.clickable:hover { border-color: var(--teal); }
+        .bw-insight-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; }
+        .bw-insight-title { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--ink); }
+        .bw-insight-badge { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 20px; white-space: nowrap; }
+        .bw-insight-value { font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 600; color: var(--ink); }
+        .bw-insight-delta { font-size: 10.5px; margin: 3px 0 10px; }
+        .bw-insight-footer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+        .bw-insight-footer-item { background: var(--paper); border-radius: 6px; padding: 7px 10px; }
+        .bw-insight-footer-label { font-size: 9.5px; color: var(--ink-soft); }
+        .bw-insight-footer-value { font-size: 12px; font-weight: 600; color: var(--ink); }
+        .bw-insight-line { display: flex; justify-content: space-between; font-size: 11px; padding: 4px 0; }
+        .bw-insight-sparkline { display: block; margin-top: 4px; }
 
         .bw-waterfall-card {
           border: 1px solid var(--line); border-radius: 12px; background: var(--card);
@@ -2579,11 +3323,21 @@ export default function BeingWealthyLedger() {
       <div className="bw-shell">
         <div className="bw-head">
           <div>
-            <div className="bw-title" style={{ cursor: "pointer" }} onClick={() => setView("landing")} title="Back to the front page">Being <em>Wealthy</em></div>
+            <div className="bw-title" style={{ cursor: "pointer" }} onClick={() => setView("landing")} title="Back to the front page">
+              Being <em>Wealthy</em> <span style={{ fontSize: 11, fontWeight: 400, color: "var(--ink-soft)", verticalAlign: "middle" }}>v{__APP_VERSION__}</span>
+            </div>
             <div className="bw-tagline">See your money clearly.</div>
             <div className="bw-sub">Private, on this device only · every number stays local</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button
+              className="bw-reset"
+              style={effectiveTier === "licensed" ? { borderColor: "var(--teal)", color: "var(--teal)" } : undefined}
+              onClick={() => setShowLicenseModal(true)}
+              title={effectiveTier === "licensed" ? `Licensed \u00B7 ${licenseDaysRemaining} day${licenseDaysRemaining === 1 ? "" : "s"} remaining` : "You're on the Free plan"}
+            >
+              {effectiveTier === "licensed" ? `Licensed \u00B7 ${licenseDaysRemaining}d left` : "Free plan"}
+            </button>
             <button className="bw-reset" onClick={() => setView("landing")} title="About Being Wealthy">
               About Us
             </button>
@@ -2669,12 +3423,13 @@ export default function BeingWealthyLedger() {
 
         <div className="bw-screen-name">
           {{
-            cashflow: "Cash Flow", networth: "Net Worth", investments: "Investments", debt: "Debt", goals: "Goals",
+            dashboard: "Dashboard", cashflow: "Cash Flow", networth: "Net Worth", investments: "Investments", debt: "Debt", goals: "Goals",
             analyst: "Analyst", cfo: "Personal CFO", upload: "Upload", review: "Review", rules: "Rules", accounts: "Accounts",
           }[view] || ""}
         </div>
 
         <div className="bw-pillars">
+          <PillarButton id="dashboard" icon={LayoutDashboard} label="Dashboard" view={view} setView={setView} />
           <PillarButton id="cashflow" icon={LineChartIcon} label="Cash Flow" view={view} setView={setView} />
           <PillarButton id="networth" icon={Landmark} label="Net Worth" view={view} setView={setView} />
           <PillarButton id="investments" icon={TrendingUp} label="Investments" view={view} setView={setView} />
@@ -2701,6 +3456,7 @@ export default function BeingWealthyLedger() {
               showToast={showToast}
               holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
               debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
+              effectiveTier={effectiveTier}
             />
           )}
           {view === "review" && (
@@ -2711,12 +3467,14 @@ export default function BeingWealthyLedger() {
               merchantAliases={merchantAliases}
               showToast={showToast}
               onGoToUpload={() => setView("upload")}
+              holdingSnapshots={holdingSnapshots}
+              debtSchedules={debtSchedules}
             />
           )}
           {view === "rules" && (
             <RulesTab
               rules={rules} setRules={setRules} transactions={transactions} onReapplyRules={reapplyRules}
-              merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases}
+              merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} accounts={accounts}
             />
           )}
           {view === "accounts" && (
@@ -2724,14 +3482,24 @@ export default function BeingWealthyLedger() {
               accounts={accounts} setAccounts={setAccounts}
               transactions={transactions} setTransactions={setTransactions}
               holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
-              showToast={showToast}
+              debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
+              otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments}
+              showToast={showToast} effectiveTier={effectiveTier}
+            />
+          )}
+          {view === "dashboard" && (
+            <DashboardOverview
+              transactions={transactions} accounts={accounts} budgets={budgets} merchantAliases={merchantAliases}
+              holdingSnapshots={holdingSnapshots} otherInvestments={otherInvestments} debtSchedules={debtSchedules}
+              goals={goals} onGoToView={setView}
             />
           )}
           {view === "cashflow" && (
             <CashFlowOverview
               transactions={transactions} setTransactions={setTransactions}
               accounts={accounts} budgets={budgets} setBudgets={setBudgets}
-              merchantAliases={merchantAliases}
+              cashBuffer={cashBuffer} setCashBuffer={setCashBuffer}
+              merchantAliases={merchantAliases} rules={rules}
               onGoToUpload={() => setView("upload")}
               onGoToReview={() => setView("review")}
             />
@@ -2749,6 +3517,7 @@ export default function BeingWealthyLedger() {
               accounts={accounts} setAccounts={setAccounts} holdingSnapshots={holdingSnapshots}
               otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments}
               onGoToUpload={() => setView("upload")}
+              effectiveTier={effectiveTier} showToast={showToast}
             />
           )}
           {view === "debt" && (
@@ -2761,6 +3530,7 @@ export default function BeingWealthyLedger() {
             <GoalsOverview
               goals={goals} setGoals={setGoals}
               accounts={accounts} holdingSnapshots={holdingSnapshots} transactions={transactions}
+              effectiveTier={effectiveTier}
             />
           )}
           {view === "analyst" && (
@@ -2770,6 +3540,7 @@ export default function BeingWealthyLedger() {
               merchantAliases={merchantAliases}
               chatThreads={chatThreads} setChatThreads={setChatThreads}
               savedPrompts={savedPrompts} setSavedPrompts={setSavedPrompts}
+              effectiveTier={effectiveTier} showToast={showToast}
             />
           )}
           {view === "cfo" && (
@@ -2779,6 +3550,7 @@ export default function BeingWealthyLedger() {
               merchantAliases={merchantAliases}
               chatThreads={chatThreads} setChatThreads={setChatThreads}
               savedPrompts={savedPrompts} setSavedPrompts={setSavedPrompts}
+              effectiveTier={effectiveTier} showToast={showToast}
             />
           )}
         </div>
@@ -2793,10 +3565,59 @@ export default function BeingWealthyLedger() {
           onSkip={finishTutorial} onFinish={finishTutorial}
         />
       )}
+      {showLicenseModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(20,22,26,0.55)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+          <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, padding: 24, maxWidth: 420, width: "100%" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, margin: 0 }}>License</h3>
+              <button onClick={() => { setShowLicenseModal(false); setLicenseError(""); setLicenseKeyInput(""); }} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink-soft)" }}>
+                <X size={16} />
+              </button>
+            </div>
+
+            {effectiveTier === "licensed" ? (
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ fontSize: 13, color: "var(--ink)", marginBottom: 4 }}>
+                  You're on the <strong>Licensed</strong> plan.
+                </div>
+                <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>
+                  Expires {license.expiresAt} · {licenseDaysRemaining} day{licenseDaysRemaining === 1 ? "" : "s"} remaining
+                </div>
+                <button className="bw-btn ghost small" style={{ marginTop: 12 }} onClick={removeLicense}>
+                  Remove license
+                </button>
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: "var(--ink-soft)", marginBottom: 14 }}>
+                {license ? "Your license has expired." : "You're on the Free plan."} Paste a license key below to unlock unlimited accounts and custom AI prompts.
+              </div>
+            )}
+
+            <div className="bw-field">
+              <label>License key</label>
+              <input
+                type="text" value={licenseKeyInput}
+                onChange={(e) => { setLicenseKeyInput(e.target.value); setLicenseError(""); }}
+                placeholder="Paste your license key here"
+                style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11 }}
+              />
+            </div>
+            {licenseError && (
+              <div style={{ fontSize: 12, color: "var(--rust)", marginBottom: 10 }}>{licenseError}</div>
+            )}
+            <button className="bw-btn" disabled={!licenseKeyInput.trim() || licenseChecking} onClick={submitLicenseKey}>
+              {licenseChecking ? "Verifying\u2026" : "Verify & activate"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
+/** One button in the main pillar navigation bar (Dashboard, Cash Flow, Net Worth,
+ *  Investments, Debt, Goals, Analyst, Personal CFO). "soon" renders a badge for
+ *  pillars not yet built, without disabling the click itself. */
 function PillarButton({ id, icon: Icon, label, view, setView, soon }) {
   return (
     <button className={`bw-pillar ${view === id ? "active" : ""} ${soon ? "soon" : ""}`} onClick={() => setView(id)}>
@@ -2806,6 +3627,8 @@ function PillarButton({ id, icon: Icon, label, view, setView, soon }) {
   );
 }
 
+/** Generic empty-state shown for a pillar screen with no data yet, or one still
+ *  marked "Soon" in the nav - an icon, a title, and a one-line explanation. */
 function PillarPlaceholder({ icon: Icon, title, blurb }) {
   return (
     <div className="bw-pillar-placeholder">
@@ -2832,6 +3655,10 @@ const TUTORIAL_STEPS = [
   { view: null, title: "That's the whole picture", body: "Upload your first statement whenever you're ready. Retake this tour anytime from the \"Take a tour\" button, top right." },
 ];
 
+/** One step of the first-run tutorial - a bottom-sheet card over whichever screen
+ *  TUTORIAL_STEPS says this step targets (the screen switch itself happens in the
+ *  parent, not here). Back is hidden, not just disabled, on the first step; the
+ *  primary button reads "Finish" instead of "Next" on the last. */
 function TutorialOverlay({ step, totalSteps, title, body, onNext, onBack, onSkip, onFinish }) {
   const isLast = step === totalSteps - 1;
   const isFirst = step === 0;
@@ -2855,6 +3682,9 @@ function TutorialOverlay({ step, totalSteps, title, body, onNext, onBack, onSkip
   );
 }
 
+/** One button in a secondary (within-screen) tab row - e.g. Upload/Review/Rules/
+ *  Accounts under Data, or a screen's own sub-tabs. Distinct from PillarButton, which
+ *  is specifically the top-level app navigation. */
 function TabButton({ id, icon: Icon, label, tab, setTab, badge }) {
   return (
     <button className={`bw-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
@@ -2993,6 +3823,13 @@ function interpretPasteChunk(dateToken, restLines, columnFormat) {
 /* Import-completion prompt: "does this import settle a pending transfer?" */
 /* ---------------------------------------------------------------------- */
 
+/** Prompt shown right after finishing an import, when other accounts have pending
+ *  (unlinked) Self/Credit-card-payment transfers that this new statement might settle
+ *  - lets the person check off which ones this import resolves, in one place, rather
+ *  than having to go find and confirm each one separately afterward. Flags a soft
+ *  mismatch warning (>15% off) when a credit card payment's amount doesn't closely
+ *  match that cycle's actual Expense total, without blocking confirmation - a partial
+ *  payment or a credit/reversal are both legitimate reasons for the numbers to differ. */
 function ImportCompletionPromptPanel({ prompt, accounts, onConfirm, onSkip }) {
   const [selected, setSelected] = useState(new Set());
   const accountName = (id) => accounts.find((a) => a.id === id)?.nickname || "—";
@@ -3058,12 +3895,53 @@ function ImportCompletionPromptPanel({ prompt, accounts, onConfirm, onSkip }) {
 /* moved here unchanged.                                                   */
 /* ---------------------------------------------------------------------- */
 
-function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransactions, holdingSnapshots, setHoldingSnapshots, showToast }) {
+/** The Accounts screen (under Data) — lists every account across every bucket, each
+ *  showing its current balance, upload/statement history, and account-level actions:
+ *  activate/deactivate within the Free-tier bucket limit, delete a single import batch
+ *  or holding snapshot, or delete the whole account (cascading across transactions,
+ *  balanceHistory, holdingSnapshots, debtSchedules, and otherInvestments together,
+ *  since an account can have data in more than one of these depending on its type).
+ *  Also hosts the "Confirm" workflow for a parsed-but-not-yet-trusted opening/closing
+ *  balance, which writes directly to balanceHistory - the single source of truth for
+ *  confirmed balances - rather than to any field on uploadHistory itself. */
+function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransactions, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules, otherInvestments, setOtherInvestments, showToast, effectiveTier }) {
   const [showUploadHistory, setShowUploadHistory] = useState(true);
   const [confirmingDeleteBatch, setConfirmingDeleteBatch] = useState(null);
   const [confirmingDeleteSnapshot, setConfirmingDeleteSnapshot] = useState(null);
+  const [confirmingDeleteAccount, setConfirmingDeleteAccount] = useState(null);
 
-  function deleteUploadBatch(accountId, batchId) {
+  /** Counts everything that would be removed with an account, so the confirmation can
+   *  say exactly what's about to be lost rather than a generic warning. */
+  function accountDeletionSummary(accountId) {
+    return {
+      transactions: transactions.filter((t) => t.accountId === accountId).length,
+      snapshots: holdingSnapshots.filter((s) => s.accountId === accountId).length,
+      debtPeriods: debtSchedules.filter((s) => s.accountId === accountId).reduce((sum, s) => sum + (s.entries?.length || 0), 0),
+      otherEntries: otherInvestments.filter((e) => e.accountId === accountId).length,
+    };
+  }
+
+  /** Deletes an account and every record across every data array that references it.
+   *  Cascades regardless of the account's type — an array with nothing matching that
+   *  accountId is simply unaffected, so this stays correct even for account types that
+   *  only ever populate one or two of these arrays. Irreversible; the confirmation UI
+   *  is what protects against this being triggered by accident. */
+  function deleteAccount(account) {
+    setTransactions((prev) => prev.filter((t) => t.accountId !== account.id));
+    setHoldingSnapshots((prev) => prev.filter((s) => s.accountId !== account.id));
+    setDebtSchedules((prev) => prev.filter((s) => s.accountId !== account.id));
+    setOtherInvestments((prev) => prev.filter((e) => e.accountId !== account.id));
+    setAccounts((prev) => prev.filter((a) => a.id !== account.id));
+    setConfirmingDeleteAccount(null);
+    showToast(`Deleted "${account.nickname}" and everything imported into it.`);
+  }
+
+  /** Removes one import's transactions and its trace in the account's history, without
+ *  touching rules - re-importing the same statement later will re-categorize exactly
+ *  as it did the first time. Any transaction elsewhere that was linked to one of the
+ *  deleted transactions (a matched transfer) has that link cleared, rather than being
+ *  left pointing at an id that no longer exists. */
+function deleteUploadBatch(accountId, batchId) {
     setTransactions((prev) => {
       const deletedIds = new Set(prev.filter((t) => t.importBatchId === batchId).map((t) => t.id));
       return prev
@@ -3081,7 +3959,10 @@ function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransact
     showToast("Deleted that import. Rules are untouched — re-importing will re-categorize automatically.");
   }
 
-  function deleteHoldingSnapshot(accountId, snapshotId) {
+  /** Removes one holding-statement snapshot and its trace in the account's upload
+ *  history - the neighboring snapshots on either side are untouched, so a gap just
+ *  means one less confirmed point for computeSnapshotTransition to diff against. */
+function deleteHoldingSnapshot(accountId, snapshotId) {
     setHoldingSnapshots((prev) => prev.filter((s) => s.id !== snapshotId));
     setAccounts((prev) => prev.map((a) => (a.id === accountId
       ? { ...a, uploadHistory: (a.uploadHistory || []).filter((h) => h.snapshotId !== snapshotId) }
@@ -3099,18 +3980,51 @@ function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransact
       const dateStr = which === "opening"
         ? (() => { const d = new Date(entry.periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
         : entry.periodEnd;
-      let balanceHistory = (a.balanceHistory || []).filter((h) => h.date !== dateStr);
-      balanceHistory.push({ date: dateStr, balance: value, importBatchId: batchId });
-      balanceHistory.sort((x, y) => x.date.localeCompare(y.date));
-      const uploadHistory = (a.uploadHistory || []).map((h) => (h.batchId === batchId
-        ? { ...h, [which === "opening" ? "openingBalance" : "closingBalance"]: value }
-        : h));
+      let balanceHistory = (a.balanceHistory || [])
+        .map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date }))
+        .filter((h) => h.asOfDate !== dateStr);
+      balanceHistory.push({ asOfDate: dateStr, balance: value, importBatchId: batchId });
+      balanceHistory.sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
       return {
-        ...a, balanceHistory, uploadHistory,
+        ...a, balanceHistory,
         lastKnownBalance: which === "closing" ? value : a.lastKnownBalance,
       };
     }));
     showToast("Confirmed — this balance now feeds the Cash Flow dashboard.");
+  }
+
+  /** Whether a given upload's own opening/closing date has an exact confirmed point in
+   *  balanceHistory — the single source of truth, replacing the openingBalance/
+   *  closingBalance fields that used to be duplicated directly on uploadHistory itself.
+   *  Returns null if nothing's confirmed there yet (falls through to the parsed,
+   *  not-yet-confirmed value in the UI). */
+  function getConfirmedBalance(h, which) {
+    const account = accounts.find((a) => a.id === h.accountId);
+    if (!account) return null;
+    const targetDate = which === "opening"
+      ? (() => { const d = new Date(h.periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
+      : h.periodEnd;
+    const point = (account.balanceHistory || []).find((b) => (b.asOfDate || b.date) === targetDate);
+    return point ? point.balance : null;
+  }
+
+  /** Toggles one account's active status within its bucket — instant, no cooldown.
+   *  Unchecking an active account always succeeds. Checking an inactive one succeeds
+   *  only if the bucket has a free slot (fewer than its limit currently active) — Cash
+   *  Flow's limit is 2, so up to two accounts can be active there at once, not just one;
+   *  Debt and Investment's limit of 1 means checking a second while one is already
+   *  active is correctly blocked, same effective behavior as a radio button but driven
+   *  by the actual limit rather than hardcoded into the UI. */
+  function toggleActiveAccountForBucket(bucket, accountId) {
+    const activeIds = getActiveAccountIds(accounts, effectiveTier, bucket);
+    const isCurrentlyActive = activeIds.has(accountId);
+    const limit = bucketLimit(bucket);
+    if (!isCurrentlyActive && activeIds.size >= limit) {
+      showToast(`Already at your limit of ${limit} active ${BUCKET_LABELS[bucket]} account${limit === 1 ? "" : "s"} — switch one off first.`);
+      return;
+    }
+    setAccounts((prev) => prev.map((a) => (a.id === accountId ? { ...a, active: !isCurrentlyActive } : a)));
+    showToast(isCurrentlyActive ? "Account set to read-only." : "Account is now active.");
   }
 
   const allUploadHistory = accounts
@@ -3133,18 +4047,80 @@ function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransact
       <p className="bw-lead">Every account you've created, and everything you've imported into it — review, confirm parsed balances, or delete an import.</p>
 
       <div className="bw-section-label" style={{ marginTop: 0 }}>Accounts</div>
+      {effectiveTier === "free" && ["bank", "creditCard", "debt", "investment"].some((b) => accounts.filter((a) => accountBucket(a.type) === b).length > bucketLimit(b)) && (
+        <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 10px" }}>
+          Where you have more accounts than the Free plan allows in a group, tick which ones stay active right in the Status
+          column below — the rest remain fully visible but won't accept new imports. Switch anytime, no cooldown.
+        </p>
+      )}
       <table className="bw-table">
-        <thead><tr><th>Nickname</th><th>Institution</th><th style={{ textAlign: "right" }}>Transactions</th></tr></thead>
+        <thead>
+          <tr>
+            <th>Nickname</th><th>Institution</th><th>Type</th><th style={{ textAlign: "right" }}>Transactions</th>
+            {effectiveTier === "free" && <th>Status</th>}
+            <th></th>
+          </tr>
+        </thead>
         <tbody>
-          {accounts.map((a) => (
-            <tr key={a.id}>
-              <td>{a.nickname}</td>
-              <td>{a.institution}</td>
-              <td style={{ textAlign: "right" }}>{transactions.filter((t) => t.accountId === a.id).length}</td>
-            </tr>
-          ))}
+          {accounts.map((a) => {
+            const bucket = accountBucket(a.type);
+            const bucketCount = bucket ? accounts.filter((acc) => accountBucket(acc.type) === bucket).length : 0;
+            const overLimit = bucket && bucketCount > bucketLimit(bucket);
+            const isActive = !bucket || canImportIntoAccount(accounts, effectiveTier, a.id);
+            return (
+              <tr key={a.id}>
+                <td>{a.nickname}</td>
+                <td>{a.institution}</td>
+                <td style={{ color: "var(--ink-soft)" }}>{ACCOUNT_TYPE_LABELS[a.type] || a.type || "—"}</td>
+                <td style={{ textAlign: "right" }}>{transactions.filter((t) => t.accountId === a.id).length}</td>
+                {effectiveTier === "free" && (
+                  <td>
+                    {!bucket ? "—" : overLimit ? (
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 7, cursor: "pointer" }}>
+                        <input type="checkbox" checked={isActive} onChange={() => toggleActiveAccountForBucket(bucket, a.id)} />
+                        <span className="bw-pill" style={{ background: isActive ? "var(--teal)" : "var(--line)", color: isActive ? "#fff" : "var(--ink-soft)" }}>
+                          {isActive ? "Active" : "Read-only"}
+                        </span>
+                      </label>
+                    ) : (
+                      <span className="bw-pill" style={{ background: "var(--teal)", color: "#fff" }}>Active</span>
+                    )}
+                  </td>
+                )}
+                <td>
+                  {confirmingDeleteAccount === a.id ? (() => {
+                    const summary = accountDeletionSummary(a.id);
+                    const parts = [];
+                    if (summary.transactions > 0) parts.push(`${summary.transactions} transaction${summary.transactions === 1 ? "" : "s"}`);
+                    if (summary.snapshots > 0) parts.push(`${summary.snapshots} snapshot${summary.snapshots === 1 ? "" : "s"}`);
+                    if (summary.debtPeriods > 0) parts.push(`${summary.debtPeriods} debt period${summary.debtPeriods === 1 ? "" : "s"}`);
+                    if (summary.otherEntries > 0) parts.push(`${summary.otherEntries} entr${summary.otherEntries === 1 ? "y" : "ies"}`);
+                    return (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", whiteSpace: "nowrap" }}>
+                        <span style={{ fontSize: 11, color: "var(--rust)" }}>
+                          Delete "{a.nickname}"{parts.length > 0 ? ` and ${parts.join(", ")}` : ""}? Can't be undone.
+                        </span>
+                        <button
+                          className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
+                          onClick={() => deleteAccount(a)}
+                        >
+                          Yes, delete
+                        </button>
+                        <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteAccount(null)}>Cancel</button>
+                      </div>
+                    );
+                  })() : (
+                    <button className="bw-btn ghost small" onClick={() => setConfirmingDeleteAccount(a.id)}>
+                      <Trash2 size={12} /> Delete
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
+
 
       {allUploadHistory.length > 0 && (
         <div style={{ marginTop: 24 }}>
@@ -3190,8 +4166,8 @@ function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransact
                       )}
                     </td>
                     <td style={{ fontSize: 11 }}>
-                      <div>{h.accountIsCC ? "Previous balance" : "Opening"}: {renderBalance(h.openingBalance, h.parsedOpeningBalance, "opening", h)}</div>
-                      <div>{h.accountIsCC ? "Outstanding" : "Closing"}: {renderBalance(h.closingBalance, h.parsedClosingBalance, "closing", h)}</div>
+                      <div>{h.accountIsCC ? "Previous balance" : "Opening"}: {renderBalance(getConfirmedBalance(h, "opening"), h.parsedOpeningBalance, "opening", h)}</div>
+                      <div>{h.accountIsCC ? "Outstanding" : "Closing"}: {renderBalance(getConfirmedBalance(h, "closing"), h.parsedClosingBalance, "closing", h)}</div>
                     </td>
                     <td style={{ textAlign: "right" }}>{h.transactionCount}</td>
                     <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{new Date(h.importedAt).toLocaleDateString()}</td>
@@ -3265,7 +4241,21 @@ function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransact
   );
 }
 
-function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules }) {
+/** The Upload tab for bank and credit card statements specifically (Investment and
+ *  Debt each have their own separate flows - InvestmentImportFlow, DebtImportFlow -
+ *  since a holdings statement and an amortization schedule need entirely different
+ *  parsing). Three ways in, all converging on the same finalize step:
+ *   1. Unified upload - one dropzone, an AI classification pass (handleUnifiedFile)
+ *      reads the file and decides what it is and how to structure it; showManualTabs
+ *      is the escape hatch if that classification is wrong or unconfident.
+ *   2. CSV/Excel with manual column mapping (doImport) - header-row detection, then
+ *      the person confirms which column is Date/Description/Debit/Credit/Amount.
+ *   3. Paste-from-PDF - a heuristic line-by-line parser for statement text copied
+ *      directly out of a PDF viewer, with an editable preview before committing.
+ *  Whichever path a statement takes, it ends at the same shared finalize step:
+ *  resolve which account it belongs to, dedupe against already-imported transactions,
+ *  auto-categorize via existing rules, and commit. */
+function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules, effectiveTier }) {
   const [source, setSource] = useState("csv"); // csv | paste | llmpdf
   // Unified upload — one dropzone, Stage 1 classification routes to whichever flow
   // below actually handles the file. showManualTabs is the escape hatch: if
@@ -3422,6 +4412,22 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       }
     }
 
+    if (!account && !canCreateAccount(accounts, effectiveTier, accountType)) {
+      const bucket = accountBucket(accountType);
+      showToast(
+        `Free plan limit reached (${bucketLimit(bucket)} ${BUCKET_LABELS[bucket]} account${bucketLimit(bucket) === 1 ? "" : "s"}) — ` +
+        `go to Accounts to switch which one stays active, or upgrade for unlimited accounts.`
+      );
+      return { rejected: true, tierLimited: true };
+    }
+    if (account && !canImportIntoAccount(accounts, effectiveTier, account.id)) {
+      showToast(
+        `"${account.nickname}" is read-only on the Free plan — go to Accounts to switch which account stays active, ` +
+        `or upgrade for unlimited accounts.`
+      );
+      return { rejected: true, tierLimited: true };
+    }
+
     if (!account) {
       account = { id: uid("acc"), institution, nickname: nickname || institution, type: accountType, uploadHistory: [] };
       setAccounts((prev) => [...prev, account]);
@@ -3476,21 +4482,19 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     })();
     setAccounts((prev) => prev.map((a) => {
       if (a.id !== acctId) return a;
-      let balanceHistory = a.balanceHistory || [];
+      let balanceHistory = (a.balanceHistory || []).map((h) => (h.asOfDate ? h : { ...h, asOfDate: h.date }));
       if (hasOpening) {
-        balanceHistory = balanceHistory.filter((h) => h.date !== dayBeforeEarliest);
-        balanceHistory.push({ date: dayBeforeEarliest, balance: openingBalanceOverride, importBatchId: batchId });
+        balanceHistory = balanceHistory.filter((h) => h.asOfDate !== dayBeforeEarliest);
+        balanceHistory.push({ asOfDate: dayBeforeEarliest, balance: openingBalanceOverride, importBatchId: batchId });
       }
       if (hasClosing) {
-        balanceHistory = balanceHistory.filter((h) => h.date !== periodEnd);
-        balanceHistory.push({ date: periodEnd, balance: closingBalanceOverride, importBatchId: batchId });
+        balanceHistory = balanceHistory.filter((h) => h.asOfDate !== periodEnd);
+        balanceHistory.push({ asOfDate: periodEnd, balance: closingBalanceOverride, importBatchId: batchId });
       }
-      balanceHistory.sort((x, y) => x.date.localeCompare(y.date));
+      balanceHistory.sort((x, y) => x.asOfDate.localeCompare(y.asOfDate));
       const uploadHistory = [...(a.uploadHistory || []), {
         batchId, importedAt: Date.now(), periodStart, periodEnd, transactionCount: imported.length,
         extractedPeriodStart, extractedPeriodEnd, statementDate,
-        openingBalance: hasOpening ? openingBalanceOverride : null,
-        closingBalance: hasClosing ? closingBalanceOverride : null,
         // Always recorded, regardless of trust — e.g. an opening balance that had to be
         // derived (no explicit label found) and whose reconciliation didn't quite clear
         // the bar still shows up HERE for reference, even though it won't feed the
@@ -3566,6 +4570,15 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     }
   }
 
+  /** Entry point for the unified dropzone: takes any file, uses AI to figure out what
+   *  kind of document it is (bank statement, CC statement, holdings, loan schedule,
+   *  etc.) via callDocumentClassify, then hands off to routeClassifiedFile to send it
+   *  down the right flow. A PDF is rendered to page images first (only the first 2
+   *  pages - enough for classification, without spending tokens on the whole
+   *  document); a spreadsheet sends a small text sample of its rows instead. A
+   *  password-protected PDF surfaces as a distinct needsPassword state rather than a
+   *  generic error, so the UI can prompt for it and retry with retryUnifiedWithPassword
+   *  instead of making the person start over. */
   async function handleUnifiedFile(file, pwd) {
     if (!file) return;
     setUnifiedClassifying(true);
@@ -3717,6 +4730,14 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     setFileName("");
   }
 
+  /** Converts the person's confirmed column mapping (CSV/Excel path) into a plain
+   *  list of {date, description, amount, direction} rows and hands off to
+   *  importTransactionList for dedup/categorization/commit. Debit/Credit direction
+   *  is resolved per amountMode: "split" trusts whichever of the two columns is
+   *  actually populated for a given row; "single" reads an explicit type column if
+   *  one exists, falling back to the amount's own sign when it doesn't. Resets both
+   *  the import form and the account-context fields afterward, then checks whether
+   *  this import might settle a pending transfer elsewhere. */
   function doImport() {
     if (!dateCol || !descCol) { showToast("Please map at least Date and Description columns."); return; }
     if (amountMode === "split" && !debitCol && !creditCol) { showToast("Map at least one of Debit / Credit columns."); return; }
@@ -4504,6 +5525,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
           callClassifyAndMap={callClassifyAndMap}
           showToast={showToast}
           initialFile={investmentInitialFile} initialPassword={investmentInitialPassword}
+          effectiveTier={effectiveTier}
         />
       ) : source === "debt" ? (
         <DebtImportFlow
@@ -4512,6 +5534,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
           apiKey={apiKey} aiModel={aiModel} customModelId={customModelId}
           showToast={showToast}
           initialFile={debtInitialFile} initialPassword={debtInitialPassword}
+          effectiveTier={effectiveTier}
         />
       ) : (
       <>
@@ -5041,7 +6064,19 @@ const ACCOUNT_TYPE_BY_DOC_TYPE = { equity_holding: "demat", mutual_fund_holding:
 // function), this just lets the UI show "NPS" or "ULIP" instead of a generic label.
 const ASSET_LABEL_BY_DOC_TYPE = { nps_holding: "NPS", ulip_holding: "ULIP" };
 
-function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast, initialFile, initialPassword }) {
+/** Import flow for investment holding statements — equity/demat, mutual fund, NPS, or
+ *  ULIP — reachable from the unified upload dropzone once it's classified the file as
+ *  one of these, or directly if the person picks it manually. Two paths in: a
+ *  spreadsheet goes through handleFile's column mapping, a PDF is rendered to page
+ *  images and read by callHoldingsPdfExtract (never computing a value itself - every
+ *  number comes directly off the page, since a mis-inferred ISIN/folio number would
+ *  silently corrupt which holding is which across snapshots). Both converge on the
+ *  same reconciliation step - comparing the sum of individual holdings against any
+ *  stated grand total the statement itself prints - and the same commitImport, which
+ *  resolves or creates the account (respecting the Free-tier one-investment-account
+ *  limit) and writes one new holdingSnapshots entry, the single data point every
+ *  Investment Control and Net Worth computation later diffs against. */
+function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast, initialFile, initialPassword, effectiveTier }) {
   const [file, setFile] = useState(null);
   const [fileName, setFileName] = useState("");
   const [rawRows, setRawRows] = useState(null);
@@ -5439,6 +6474,13 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
     if (acct) { setInstitution(acct.institution); setNickname(acct.nickname); }
   }
 
+  /** Final write step: resolves or creates the investment account (respecting the
+   *  Free-tier limit and read-only enforcement), decides which totals to trust -
+   *  the statement's own printed total where it matches the sum of individual
+   *  holdings, the summed figure otherwise - and writes one new holdingSnapshots
+   *  entry. This snapshot is the single new data point everything downstream
+   *  (computeSnapshotTransition, Net Worth, Investments Control) will later diff
+   *  against the previous one. */
   function commitImport() {
     if (!parsedHoldings || !asOfDate) { showToast("Enter the holding/statement date before importing."); return; }
     const included = parsedHoldings.filter((h) => h.include);
@@ -5447,6 +6489,17 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
 
     let account = accounts.find((a) => a.id === selectedAccountId) ||
       accounts.find((a) => a.institution === institution && a.nickname === (nickname || institution) && (a.type === "demat" || a.type === "mutualFund"));
+    if (!account && !canCreateAccount(accounts, effectiveTier, accountType)) {
+      showToast(
+        `Free plan limit reached (${FREE_TIER_LIMITS.investmentAccounts} Investment account) — go to Accounts to switch ` +
+        `which one stays active, or upgrade for unlimited accounts.`
+      );
+      return;
+    }
+    if (account && !canImportIntoAccount(accounts, effectiveTier, account.id)) {
+      showToast(`"${account.nickname}" is read-only on the Free plan — go to Accounts to switch which account stays active, or upgrade.`);
+      return;
+    }
     let accountId;
     if (account) {
       accountId = account.id;
@@ -5739,7 +6792,18 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
 
 const LOAN_TYPES = ["Home Loan", "Car Loan", "Personal Loan", "Education Loan", "Loan Against Property", "Other"];
 
-function DebtImportFlow({ accounts, setAccounts, debtSchedules, setDebtSchedules, apiKey, aiModel, customModelId, showToast, initialFile, initialPassword }) {
+/** Import flow for a loan's amortization schedule (CSV/Excel only - unlike Investment
+ *  holdings and bank/CC statements, there's no PDF path here, since these exports are
+ *  virtually always spreadsheets in practice). AI-assisted column mapping
+ *  (callDebtClassify) finds the real header row - amortization exports often have
+ *  loan summary details printed above the actual period table - and maps each column
+ *  (period, opening balance, EMI, principal, interest, closing balance) to its exact
+ *  header text, leaving any field with no matching column null rather than guessing.
+ *  Commits as a new debtSchedules entry tied to the resolved/created debt account;
+ *  multiple schedules for the same account (e.g. after a prepayment triggers a fresh,
+ *  revised upload) coexist, with the most-recently-imported one winning for any
+ *  period they both cover. */
+function DebtImportFlow({ accounts, setAccounts, debtSchedules, setDebtSchedules, apiKey, aiModel, customModelId, showToast, initialFile, initialPassword, effectiveTier }) {
   const [fileName, setFileName] = useState("");
   const [rawRows, setRawRows] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -6038,12 +7102,23 @@ function DebtImportFlow({ accounts, setAccounts, debtSchedules, setDebtSchedules
   function commitImport() {
     if (!parsedEntries) return;
     let account = selectedAccountId !== "__new__" ? accounts.find((a) => a.id === selectedAccountId) : null;
+    const included = parsedEntries.entries.filter((e) => e.include);
+    if (included.length === 0) { showToast("No periods selected to import."); return; }
+    if (!account && !canCreateAccount(accounts, effectiveTier, "debt")) {
+      showToast(
+        `Free plan limit reached (${FREE_TIER_LIMITS.debtAccounts} Debt account) — go to Accounts to switch which one ` +
+        `stays active, or upgrade for unlimited accounts.`
+      );
+      return;
+    }
+    if (account && !canImportIntoAccount(accounts, effectiveTier, account.id)) {
+      showToast(`"${account.nickname}" is read-only on the Free plan — go to Accounts to switch which account stays active, or upgrade.`);
+      return;
+    }
     if (!account) {
       account = { id: uid("acc"), type: "debt", institution, nickname: nickname || institution, loanType };
       setAccounts((prev) => [...prev, account]);
     }
-    const included = parsedEntries.entries.filter((e) => e.include);
-    if (included.length === 0) { showToast("No periods selected to import."); return; }
     const schedule = {
       id: uid("debt"), accountId: account.id, importedAt: Date.now(),
       entries: included.map((e) => ({ period: e.period, openingBalance: e.openingBalance, emi: e.emi, principal: e.principal, interest: e.interest, closingBalance: e.closingBalance })),
@@ -6229,6 +7304,11 @@ const DOCUMENT_CATEGORY_LABELS = {
   unknown: "Unknown",
 };
 
+/** A standalone diagnostic tool - runs the same document-classification call the
+ *  unified upload dropzone uses (callDocumentClassify) and shows the raw result, but
+ *  never actually imports anything. Exists to let the person (or a developer)
+ *  sanity-check what the classifier thinks a given file is before trusting it with a
+ *  real upload. */
 function DocumentClassifierTest({ apiKey, aiModel, customModelId }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -6339,8 +7419,23 @@ function DocumentClassifierTest({ apiKey, aiModel, customModelId }) {
 /* Review tab                                                              */
 /* ---------------------------------------------------------------------- */
 
-function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, merchantAliases, showToast, onGoToUpload }) {
-  const [mode, setMode] = useState("byMerchant"); // byMerchant | byTransaction | transfers
+/** The Review & Categorize screen - five modes, switched via the top tab row:
+ *   - By merchant (bulk): group all currently-uncategorized transactions by merchant
+ *     and tag a whole group at once (commitMerchantGroup) - the fastest path for a
+ *     first-time import, since one tag usually clears many transactions.
+ *   - By transaction: fine-grained, one-row-at-a-time categorization
+ *     (commitCategory), with an inline dropdown per field including the optional
+ *     linkedAccountId - this is the surface every categorization decision ultimately
+ *     goes through if not handled in bulk.
+ *   - Transfers Control, Investments Control, Debt Control: the three reconciliation
+ *     screens (each its own top-level component, just hosted as tabs here) checking
+ *     bank-side activity against a derived figure from elsewhere in the app.
+ *  Also hosts the dormant Self/Credit-card-payment substantiation system
+ *  (transferRows, transferStatus, confirmTransferLink and friends) - superseded by
+ *  the simpler Transfers Control table, kept intact rather than deleted in case it's
+ *  wanted again. */
+function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, merchantAliases, showToast, onGoToUpload, holdingSnapshots, debtSchedules }) {
+  const [mode, setMode] = useState("byMerchant"); // byMerchant | byTransaction | transfers | investmentsControl | debtControl
   const [showAll, setShowAll] = useState(false);
   const [rememberFor, setRememberFor] = useState({});
   const [selectedIds, setSelectedIds] = useState([]);
@@ -6355,7 +7450,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
      real other side somewhere in the data. External transfers are excluded entirely —
      money to a landlord or friend has no "other side" in this app, ever.
      NOTE: this matching/linking system is currently DORMANT — Review → Transfers now
-     shows the simpler side-by-side table view instead (TransfersSimpleView below), per
+     shows the simpler side-by-side table view instead (TransfersControlView below), per
      the redesign that dropped algorithmic matching in favor of just letting the user
      see everything and judge for themselves. Left fully intact, not deleted, in case
      it's wanted again later. ---- */
@@ -6442,10 +7537,11 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   function commitMerchantGroup(group, patch, remember) {
     const { category } = patch;
     if (!category) return;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income") ? patch.subCategory : null;
+    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? patch.subCategory : null;
     const finalTag = category === "Expense" ? patch.tag : null;
-    const finalFreq = (category === "Expense" && finalSub === "Fixed") ? (patch.frequency || "Monthly") : null;
+    const finalFreq = isFrequencyEligible(category, finalSub) ? (patch.frequency || "Monthly") : null;
     const finalPurpose = patch.purpose || "Personal";
+    const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (patch.linkedAccountId || null) : null;
     const rawKeys = [...group.rawKeys];
     const ruleIdByRaw = {};
 
@@ -6460,7 +7556,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           ruleIdByRaw[raw] = ruleId;
           const rule = {
             id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag,
-            frequency: finalFreq, purpose: finalPurpose, source: "learned", priority: pattern.length,
+            frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
+            source: "learned", priority: pattern.length,
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
         });
@@ -6473,6 +7570,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       const raw = t.merchant || normalizeMerchant(t.description) || t.description;
       return {
         ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose,
+        linkedAccountId: finalLinkedAccountId,
         matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
       };
     }));
@@ -6534,10 +7632,11 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
 
   function commitCategory(txn, patch) {
     const { category } = patch;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income") ? patch.subCategory : null;
+    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? patch.subCategory : null;
     const finalTag = category === "Expense" ? patch.tag : null;
-    const finalFreq = (category === "Expense" && finalSub === "Fixed") ? (patch.frequency || "Monthly") : null;
+    const finalFreq = isFrequencyEligible(category, finalSub) ? (patch.frequency || "Monthly") : null;
     const finalPurpose = patch.purpose || "Personal";
+    const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (patch.linkedAccountId || null) : null;
     const shouldRemember = rememberFor[txn.id] !== false;
     let ruleId = null; // stays null => this transaction is treated as a manual, protected override
     let pattern = null;
@@ -6549,15 +7648,15 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
         if (existing) {
           ruleId = existing.id;
           if (existing.category !== category || existing.subCategory !== finalSub || existing.tag !== finalTag
-              || existing.frequency !== finalFreq || existing.purpose !== finalPurpose) {
+              || existing.frequency !== finalFreq || existing.purpose !== finalPurpose || existing.linkedAccountId !== finalLinkedAccountId) {
             setRules((prev) => prev.map((r) => (r.id === ruleId
-              ? { ...r, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose } : r)));
+              ? { ...r, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId } : r)));
           }
         } else {
           ruleId = uid("rule");
           setRules((prev) => [
             ...prev,
-            { id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, source: "learned", priority: pattern.length },
+            { id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, source: "learned", priority: pattern.length },
           ]);
         }
       }
@@ -6569,10 +7668,10 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     // down the rest by hand.
     let cascadedCount = 0;
     setTransactions((prev) => prev.map((t) => {
-      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, matchedRuleId: ruleId };
+      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
       if (pattern && !t.category && t.description.toLowerCase().includes(pattern)) {
         cascadedCount += 1;
-        return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, matchedRuleId: ruleId };
+        return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
       }
       return t;
     }));
@@ -6586,12 +7685,13 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   }
 
   /* ---- multi-select bulk tagging: pick an arbitrary set of rows and tag them all at once ---- */
-  function commitBulkSelection(category, subCategory, tag, frequency, purpose, remember) {
+  function commitBulkSelection(category, subCategory, tag, frequency, purpose, linkedAccountId, remember) {
     if (!category || selectedIds.length === 0) return;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income") ? subCategory : null;
+    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? subCategory : null;
     const finalTag = category === "Expense" ? tag : null;
-    const finalFreq = (category === "Expense" && finalSub === "Fixed") ? (frequency || "Monthly") : null;
+    const finalFreq = isFrequencyEligible(category, finalSub) ? (frequency || "Monthly") : null;
     const finalPurpose = purpose || "Personal";
+    const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (linkedAccountId || null) : null;
     const selectedTxns = transactions.filter((t) => selectedIds.includes(t.id));
     const rawKeys = [...new Set(selectedTxns.map((t) => t.merchant || normalizeMerchant(t.description) || t.description))];
     const ruleIdByRaw = {};
@@ -6607,7 +7707,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           ruleIdByRaw[raw] = ruleId;
           const rule = {
             id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag,
-            frequency: finalFreq, purpose: finalPurpose, source: "learned", priority: pattern.length,
+            frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
+            source: "learned", priority: pattern.length,
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
         });
@@ -6620,6 +7721,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       const raw = t.merchant || normalizeMerchant(t.description) || t.description;
       return {
         ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose,
+        linkedAccountId: finalLinkedAccountId,
         matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
       };
     }));
@@ -6652,18 +7754,28 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           <ListChecks size={13} /> By transaction
         </button>
         <button className={`bw-tab ${mode === "transfers" ? "active" : ""}`} onClick={() => setMode("transfers")}>
-          <Repeat size={13} /> Transfers
+          <Repeat size={13} /> Transfers Control
+        </button>
+        <button className={`bw-tab ${mode === "investmentsControl" ? "active" : ""}`} onClick={() => setMode("investmentsControl")}>
+          <TrendingUp size={13} /> Investments Control
+        </button>
+        <button className={`bw-tab ${mode === "debtControl" ? "active" : ""}`} onClick={() => setMode("debtControl")}>
+          <TrendingDown size={13} /> Debt Control
         </button>
       </div>
 
       {mode === "transfers" ? (
-        <TransfersSimpleView
+        <TransfersControlView
           transactions={transactions}
           accounts={accounts}
           transferMonths={transferMonths}
           transferPeriod={transferPeriod}
           setTransferPeriod={setTransferPeriod}
         />
+      ) : mode === "investmentsControl" ? (
+        <InvestmentsControlView transactions={transactions} accounts={accounts} holdingSnapshots={holdingSnapshots} />
+      ) : mode === "debtControl" ? (
+        <DebtControlView transactions={transactions} accounts={accounts} debtSchedules={debtSchedules} />
       ) : mode === "byMerchant" ? (
         merchantGroups.length === 0 ? (
           <div className="bw-empty">
@@ -6678,12 +7790,12 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
               <thead>
                 <tr>
                   <th>Merchant</th><th style={{ textAlign: "right" }}>Count</th><th style={{ textAlign: "right" }}>Total</th>
-                  <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th></th>
+                  <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th>Account</th><th></th>
                 </tr>
               </thead>
               <tbody>
                 {merchantGroups.map((g) => (
-                  <MerchantRow key={g.key} group={g} onCommit={commitMerchantGroup} />
+                  <MerchantRow key={g.key} group={g} onCommit={commitMerchantGroup} accounts={accounts} />
                 ))}
               </tbody>
             </table>
@@ -6744,6 +7856,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                   count={selectedIds.length}
                   onApply={commitBulkSelection}
                   onClear={() => setSelectedIds([])}
+                  accounts={accounts}
                 />
               )}
               <table className="bw-table">
@@ -6758,7 +7871,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                       />
                     </th>
                     <th>Date</th><th>Account</th><th>Description</th><th style={{ textAlign: "right" }}>Amount</th>
-                    <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th>Remember</th>
+                    <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th>Linked account</th><th>Remember</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -6807,9 +7920,9 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
                           <td>
-                            {t.category === "Expense" && t.subCategory === "Fixed" ? (
+                            {isFrequencyEligible(t.category, t.subCategory) ? (
                               <select className="bw-select-inline" value={t.frequency || "Monthly"}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: e.target.value, purpose: t.purpose })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: e.target.value, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
@@ -6817,7 +7930,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           <td>
                             {t.category === "Expense" ? (
                               <select className="bw-select-inline" value={t.tag || ""}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: e.target.value || null, frequency: t.frequency, purpose: t.purpose })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: e.target.value || null, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 <option value="">—</option>
                                 {TAGS.map((tg) => <option key={tg}>{tg}</option>)}
                               </select>
@@ -6826,8 +7939,19 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           <td>
                             {t.category ? (
                               <select className="bw-select-inline" value={t.purpose || "Personal"}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: t.frequency, purpose: e.target.value })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: t.frequency, purpose: e.target.value, linkedAccountId: t.linkedAccountId })}>
                                 {PURPOSES.map((p) => <option key={p}>{p}</option>)}
+                              </select>
+                            ) : <span style={{ color: "var(--line)" }}>—</span>}
+                          </td>
+                          <td>
+                            {linkableAccountTypesFor(t.category, t.subCategory).length > 0 ? (
+                              <select className="bw-select-inline" value={t.linkedAccountId || ""}
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: t.frequency, purpose: t.purpose, linkedAccountId: e.target.value || null })}>
+                                <option value="">— optional —</option>
+                                {accounts.filter((a) => linkableAccountTypesFor(t.category, t.subCategory).includes(a.type) && a.id !== t.accountId).map((a) => (
+                                  <option key={a.id} value={a.id}>{a.nickname}</option>
+                                ))}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
@@ -6851,19 +7975,30 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   );
 }
 
-function BulkActionBar({ count, onApply, onClear }) {
+/** The sticky action bar shown when one or more rows are checked in "By transaction"
+ *  mode - pick category/subcategory/frequency/tag/purpose/linked-account once and
+ *  apply it to every selected row at once (commitBulkSelection), instead of setting
+ *  each field per row. Every field here mirrors MerchantRow's and the per-row
+ *  dropdown's conditional visibility (isFrequencyEligible, linkableAccountTypesFor),
+ *  so bulk tagging behaves identically to tagging one row at a time. */
+function BulkActionBar({ count, onApply, onClear, accounts }) {
   const [category, setCategory] = useState("");
   const [subCategory, setSubCategory] = useState("Variable");
   const [frequency, setFrequency] = useState("Monthly");
   const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
+  const [linkedAccountId, setLinkedAccountId] = useState("");
   const [remember, setRemember] = useState(true);
 
   function handleCategoryChange(v) {
     setCategory(v);
     const opts = subCategoryOptionsFor(v);
     setSubCategory(opts.length > 0 ? opts[0] : "");
+    setLinkedAccountId("");
   }
+
+  const linkableTypes = linkableAccountTypesFor(category, subCategory);
+  const linkableAccounts = linkableTypes.length > 0 ? accounts.filter((a) => linkableTypes.includes(a.type)) : [];
 
   return (
     <div style={{
@@ -6881,7 +8016,7 @@ function BulkActionBar({ count, onApply, onClear }) {
           {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
         </select>
       )}
-      {category === "Expense" && subCategory === "Fixed" && (
+      {isFrequencyEligible(category, subCategory) && (
         <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
           {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
         </select>
@@ -6896,11 +8031,17 @@ function BulkActionBar({ count, onApply, onClear }) {
           {PURPOSES.map((p) => <option key={p}>{p}</option>)}
         </select>
       )}
+      {linkableTypes.length > 0 && (
+        <select className="bw-select-inline" value={linkedAccountId} onChange={(e) => setLinkedAccountId(e.target.value)}>
+          <option value="">Account (optional) —</option>
+          {linkableAccounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+        </select>
+      )}
       <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "var(--ink-soft)" }}>
         <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
         Remember (create rules)
       </label>
-      <button className="bw-btn small" disabled={!category} onClick={() => onApply(category, subCategory, tag, frequency, purpose, remember)}>
+      <button className="bw-btn small" disabled={!category} onClick={() => onApply(category, subCategory, tag, frequency, purpose, linkedAccountId, remember)}>
         <Check size={12} /> Apply to {count}
       </button>
       <button className="bw-btn ghost small" onClick={onClear}><X size={12} /> Clear</button>
@@ -6915,10 +8056,20 @@ function BulkActionBar({ count, onApply, onClear }) {
 /* just from looking, without an algorithm deciding what "matches."       */
 /* ---------------------------------------------------------------------- */
 
-function TransfersSimpleView({ transactions, accounts, transferMonths, transferPeriod, setTransferPeriod }) {
-  const bankAccounts = useMemo(() => accounts.filter((a) => a.type !== "creditCard"), [accounts]);
-  const creditCardAccounts = useMemo(() => accounts.filter((a) => a.type === "creditCard"), [accounts]);
+/** The "Transfers Control" tab - reconciliation for Self transfers only (External is
+ *  informational elsewhere in this same component, no zero-check, since money there
+ *  genuinely leaves the tracked system with no "other side" to expect). The hero
+ *  table is a matrix: one row and column per bank account, diagonal always blank.
+ *  Cell[row, col] = the sum of row's own Self-transfer transactions linked
+ *  (linkedAccountId) to col - never mirrored from the other side. A zero grand total
+ *  means every transfer has been linked from both directions; non-zero honestly
+ *  names which account's side is still missing a link, rather than guessing at it.
+ *  The plain transaction list below stays visible (not yet collapsed behind a click,
+ *  by deliberate choice while this table shape is still being evaluated). */
+function TransfersControlView({ transactions, accounts, transferMonths, transferPeriod, setTransferPeriod }) {
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
   const bankAccountIds = useMemo(() => new Set(bankAccounts.map((a) => a.id)), [bankAccounts]);
+  const [accountFilter, setAccountFilter] = useState("all");
 
   // Self and External transfers on bank accounts — one row per transaction, amount
   // placed under whichever account it belongs to. A Self transfer's outflow and
@@ -6926,64 +8077,105 @@ function TransfersSimpleView({ transactions, accounts, transferMonths, transferP
   // both statements are imported, sorting by date puts them right next to each other.
   const selfExternalRows = useMemo(() => {
     return transactions
-      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId) && t.subCategory !== "Credit card payment")
+      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId) && (t.subCategory === "Self" || t.subCategory === "External" || !t.subCategory))
       .filter((t) => transferPeriod === "all" || t.date.slice(0, 7) === transferPeriod)
+      .filter((t) => accountFilter === "all" || t.accountId === accountFilter)
       .map((t) => ({
         id: t.id, date: t.date, description: t.description, type: t.subCategory || "Self",
-        accountId: t.accountId, amount: t.direction === "credit" ? t.amount : -t.amount,
+        accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
+        amount: t.direction === "credit" ? t.amount : -t.amount,
       }))
       .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  }, [transactions, bankAccountIds, transferPeriod, accountFilter]);
+
+  // Self-transfer matrix - one row and column per bank account, diagonal always blank.
+  // Cell[row, col] = sum of row's OWN Self-transfer transactions linked to col - no
+  // mirroring. If only one side of a transfer is ever categorized and linked, the
+  // other cell just stays at zero and the grand total won't land on zero - an honest,
+  // visible signal something's still missing, not a guess filling in the other side.
+  const selfMatrix = useMemo(() => {
+    const cells = {}; // `${rowId}|${colId}` -> amount
+    transactions
+      .filter((t) => t.category === "Transfer" && t.subCategory === "Self" && bankAccountIds.has(t.accountId) && t.linkedAccountId)
+      .filter((t) => transferPeriod === "all" || t.date.slice(0, 7) === transferPeriod)
+      .forEach((t) => {
+        const key = `${t.accountId}|${t.linkedAccountId}`;
+        const amount = t.direction === "credit" ? t.amount : -t.amount;
+        cells[key] = (cells[key] || 0) + amount;
+      });
+    return cells;
   }, [transactions, bankAccountIds, transferPeriod]);
 
-  // Credit card payments (the bank-side outflow, a real transaction) and card
-  // statement summaries (one row per import — no per-transaction "transfer" exists on
-  // the card side, since a purchase is an Expense, not a Transfer). Aligned by the
-  // payment's own date on one side and the statement's own date on the other, merged
-  // into one date-sorted list — a payment and the statement it settles land near each
-  // other without needing to explicitly link them.
-  const ccCombinedRows = useMemo(() => {
-    const bankRows = transactions
-      .filter((t) => t.category === "Transfer" && t.subCategory === "Credit card payment" && bankAccountIds.has(t.accountId))
-      .filter((t) => transferPeriod === "all" || t.date.slice(0, 7) === transferPeriod)
-      .map((t) => ({
-        kind: "bankPayment", id: t.id, date: t.date, description: t.description,
-        accountId: t.accountId, amount: t.direction === "credit" ? t.amount : -t.amount,
-      }));
-
-    const statementRows = [];
-    creditCardAccounts.forEach((a) => {
-      (a.uploadHistory || []).forEach((h) => {
-        const rowDate = h.statementDate || h.periodEnd;
-        if (!rowDate) return;
-        if (transferPeriod !== "all" && rowDate.slice(0, 7) !== transferPeriod) return;
-        const totalExpense = transactions
-          .filter((t) => t.importBatchId === h.batchId && t.category === "Expense")
-          .reduce((s, t) => s + (t.direction === "credit" ? -t.amount : t.amount), 0);
-        statementRows.push({
-          kind: "cardStatement", id: h.batchId, date: rowDate,
-          description: `${h.periodStart} – ${h.periodEnd}`,
-          accountId: a.id, amount: totalExpense,
-        });
-      });
-    });
-
-    return [...bankRows, ...statementRows].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
-  }, [transactions, bankAccountIds, creditCardAccounts, transferPeriod]);
+  const externalTotal = selfExternalRows.filter((r) => r.type === "External").reduce((s, r) => s + r.amount, 0);
+  const rowTotals = bankAccounts.map((row) => bankAccounts.reduce((s, col) => s + (selfMatrix[`${row.id}|${col.id}`] || 0), 0));
+  const colTotals = bankAccounts.map((col) => bankAccounts.reduce((s, row) => s + (selfMatrix[`${row.id}|${col.id}`] || 0), 0));
+  const grandTotal = rowTotals.reduce((s, v) => s + v, 0);
+  const isReconciled = Math.abs(grandTotal) < 1;
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
         <p className="bw-lead" style={{ margin: 0, flex: 1, minWidth: 240 }}>
-          No matching to do here — everything's laid out by date and account, so the two sides of a real transfer
-          naturally land near each other once both statements are imported, and a gap is just as easy to see.
+          Each cell is that account's own transactions, linked to that column's account — nothing is mirrored.
+          A zero grand total means every transfer's been linked from both sides; non-zero flags exactly which
+          account's side is still missing.
         </p>
-        <select className="bw-select-inline" value={transferPeriod} onChange={(e) => setTransferPeriod(e.target.value)}>
-          <option value="all">All time</option>
-          {transferMonths.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
-        </select>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <select className="bw-select-inline" value={transferPeriod} onChange={(e) => setTransferPeriod(e.target.value)}>
+            <option value="all">All time</option>
+            {transferMonths.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+          </select>
+          <select className="bw-select-inline" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+            <option value="all">All accounts</option>
+            {bankAccounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+          </select>
+        </div>
       </div>
 
-      <div className="bw-section-label" style={{ marginTop: 0 }}>Transfers (Self &amp; External)</div>
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Self transfers</div>
+      {bankAccounts.length === 0 ? (
+        <div className="bw-empty">No bank accounts yet.</div>
+      ) : (
+        <div style={{ overflowX: "auto", marginBottom: 22 }}>
+          <table className="bw-table">
+            <thead>
+              <tr>
+                <th>Account</th>
+                {bankAccounts.map((a) => <th key={a.id} style={{ textAlign: "right" }}>{a.nickname}</th>)}
+                <th style={{ textAlign: "right" }}>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bankAccounts.map((row) => (
+                <tr key={row.id}>
+                  <td>{row.nickname}</td>
+                  {bankAccounts.map((col) => {
+                    if (row.id === col.id) return <td key={col.id} style={{ textAlign: "right", color: "var(--line)" }}>—</td>;
+                    const val = selfMatrix[`${row.id}|${col.id}`] || 0;
+                    return (
+                      <td key={col.id} className={val !== 0 ? `bw-amt ${val >= 0 ? "credit" : "debit"}` : undefined} style={{ textAlign: "right" }}>
+                        {val !== 0 ? inr(val) : ""}
+                      </td>
+                    );
+                  })}
+                  <td className="bw-amt" style={{ textAlign: "right", fontWeight: 600 }}>{inr(rowTotals[bankAccounts.indexOf(row)])}</td>
+                </tr>
+              ))}
+              <tr style={{ borderTop: "2px solid var(--ink)" }}>
+                <td style={{ fontWeight: 600 }}>Total</td>
+                {bankAccounts.map((col, i) => <td key={col.id} style={{ textAlign: "right", fontWeight: 600 }}>{inr(colTotals[i])}</td>)}
+                <td style={{ textAlign: "right", fontWeight: 700, color: isReconciled ? "var(--teal)" : "var(--rust)" }}>{inr(grandTotal)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="bw-summary-row" style={{ marginBottom: 20 }}>
+        <Stat label="External transfers (informational)" value={inr(externalTotal)} color="var(--ink-soft)" hint="No zero-check - money genuinely leaves the tracked system" />
+      </div>
+
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Transfers (Self &amp; External), by account</div>
       {bankAccounts.length === 0 || selfExternalRows.length === 0 ? (
         <div className="bw-empty">No Self or External transfers on bank accounts yet for this period.</div>
       ) : (
@@ -7012,67 +8204,21 @@ function TransfersSimpleView({ transactions, accounts, transferMonths, transferP
           </table>
         </div>
       )}
-
-      <div className="bw-section-label">Credit card payments &amp; statements</div>
-      <p className="bw-lead" style={{ marginBottom: 12 }}>
-        A payment leaving a bank account and the card statement it settles will land near each other by date. A
-        payment with nothing nearby on the right is your cue to upload that card's statement — no need to be told.
-      </p>
-      {(bankAccounts.length === 0 && creditCardAccounts.length === 0) || ccCombinedRows.length === 0 ? (
-        <div className="bw-empty">No credit card payments or statements yet for this period.</div>
-      ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table className="bw-table">
-            <thead>
-              <tr>
-                <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Date</th>
-                <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Description</th>
-                <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Type</th>
-                {bankAccounts.length > 0 && <th colSpan={bankAccounts.length} style={{ textAlign: "center" }}>Bank Payment</th>}
-                {creditCardAccounts.length > 0 && <th colSpan={creditCardAccounts.length} style={{ textAlign: "center" }}>Expense Statement</th>}
-              </tr>
-              <tr>
-                {bankAccounts.map((a) => <th key={a.id} style={{ textAlign: "right" }}>{a.nickname}</th>)}
-                {creditCardAccounts.map((a) => <th key={a.id} style={{ textAlign: "right" }}>{a.nickname}</th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {ccCombinedRows.map((r) => (
-                <tr key={r.id}>
-                  <td style={{ whiteSpace: "nowrap", fontSize: 11.5, color: "var(--ink-soft)" }}>{r.date}</td>
-                  <td>{r.description}</td>
-                  <td>
-                    <span className="bw-pill" style={{ background: r.kind === "bankPayment" ? "var(--slate)" : "var(--ochre)", fontSize: 10 }}>
-                      {r.kind === "bankPayment" ? "Payment" : "Statement"}
-                    </span>
-                  </td>
-                  {bankAccounts.map((a) => (
-                    <td key={a.id} className={r.kind === "bankPayment" && a.id === r.accountId ? "bw-amt debit" : undefined} style={{ textAlign: "right" }}>
-                      {r.kind === "bankPayment" && a.id === r.accountId ? `−${inr(Math.abs(r.amount))}` : ""}
-                    </td>
-                  ))}
-                  {creditCardAccounts.map((a) => (
-                    <td key={a.id} className={r.kind === "cardStatement" && a.id === r.accountId ? "bw-amt debit" : undefined} style={{ textAlign: "right" }}>
-                      {r.kind === "cardStatement" && a.id === r.accountId ? inr(Math.abs(r.amount)) : ""}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
 /* Transfers review panel — DORMANT, not deleted. Algorithmic suggested-  */
-/* match detection + explicit linking, superseded by TransfersSimpleView  */
+/* match detection + explicit linking, superseded by TransfersControlView  */
 /* above per the redesign, but left fully intact in case it's wanted      */
 /* again later. Nothing below this point is currently called.             */
 /* ---------------------------------------------------------------------- */
 
+/** Renders transferRows split into three sections: needs attention (suggested or
+ *  pending), settled (linked or substantiated - a confirmed link is deduplicated to
+ *  one row per pair, picked deterministically by id, since both sides of a link
+ *  independently qualify as their own row), and dismissed (collapsed by default). */
 function TransfersReviewPanel({
   transferRows, accountName, accounts, onConfirm, onUnlink, onDismiss, onRestore, onUnsubstantiate, onGoToUpload,
   manualLinkFor, setManualLinkFor, manualLinkCandidates, showDismissed, setShowDismissed,
@@ -7188,6 +8334,12 @@ function TransfersReviewPanel({
   );
 }
 
+/** One transfer's card in the dormant substantiation UI - shows its current status
+ *  (suggested/pending/linked/substantiated/dismissed) and the action set that status
+ *  allows: confirm or reject a suggested match, upload the other side or search
+ *  manually while pending, unlink a confirmed match, undo a substantiation, or
+ *  restore a dismissed one. Part of the system superseded by TransfersControlView -
+ *  see the note on ReviewTab. */
 function TransferRow({ row, accountName, onConfirm, onUnlink, onDismiss, onRestore, onUnsubstantiate, onGoToUpload, manualLinkFor, setManualLinkFor, manualLinkCandidates }) {
   const { txn, status, candidate } = row;
   const isPicking = manualLinkFor === txn.id;
@@ -7281,6 +8433,9 @@ function TransferRow({ row, accountName, onConfirm, onUnlink, onDismiss, onResto
   );
 }
 
+/** Fallback picker shown when the automatic match for a transfer is wrong or doesn't
+ *  exist - lets the person search manually among opposite-direction transactions on
+ *  other accounts instead. Part of the dormant substantiation system. */
 function ManualLinkPicker({ txn, accountName, candidates, onPick, onCancel }) {
   const [selected, setSelected] = useState("");
   return (
@@ -7307,19 +8462,30 @@ function ManualLinkPicker({ txn, accountName, candidates, onPick, onCancel }) {
   );
 }
 
-function MerchantRow({ group, onCommit }) {
+/** One row of the "By merchant (bulk)" table - lets the person tag every currently-
+ *  uncategorized transaction sharing this merchant key at once. Category/subcategory/
+ *  frequency/tag/purpose/linked-account dropdowns each show conditionally exactly the
+ *  way the per-transaction row does (subCategoryOptionsFor, isFrequencyEligible,
+ *  linkableAccountTypesFor), so bulk-by-merchant tagging behaves identically to
+ *  tagging one transaction at a time - just applied to the whole group on Apply. */
+function MerchantRow({ group, onCommit, accounts }) {
   const [category, setCategory] = useState("");
   const [subCategory, setSubCategory] = useState("Variable");
   const [frequency, setFrequency] = useState("Monthly");
   const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
+  const [linkedAccountId, setLinkedAccountId] = useState("");
   const [remember, setRemember] = useState(true);
 
   function handleCategoryChange(v) {
     setCategory(v);
     const opts = subCategoryOptionsFor(v);
     setSubCategory(opts.length > 0 ? opts[0] : "");
+    setLinkedAccountId("");
   }
+
+  const linkableTypes = linkableAccountTypesFor(category, subCategory);
+  const linkableAccounts = linkableTypes.length > 0 ? accounts.filter((a) => linkableTypes.includes(a.type)) : [];
 
   return (
     <tr>
@@ -7350,7 +8516,7 @@ function MerchantRow({ group, onCommit }) {
         ) : <span style={{ color: "var(--line)" }}>—</span>}
       </td>
       <td>
-        {category === "Expense" && subCategory === "Fixed" ? (
+        {isFrequencyEligible(category, subCategory) ? (
           <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
             {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
           </select>
@@ -7369,8 +8535,16 @@ function MerchantRow({ group, onCommit }) {
         </select>
       </td>
       <td>
+        {linkableTypes.length > 0 ? (
+          <select className="bw-select-inline" value={linkedAccountId} onChange={(e) => setLinkedAccountId(e.target.value)}>
+            <option value="">— optional —</option>
+            {linkableAccounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+          </select>
+        ) : <span style={{ color: "var(--line)" }}>—</span>}
+      </td>
+      <td>
         <button className="bw-btn small" disabled={!category}
-          onClick={() => onCommit(group, { category, subCategory, tag, frequency, purpose }, remember)}>
+          onClick={() => onCommit(group, { category, subCategory, tag, frequency, purpose, linkedAccountId }, remember)}>
           <Check size={12} /> Apply
         </button>
       </td>
@@ -7382,7 +8556,18 @@ function MerchantRow({ group, onCommit }) {
 /* Rules tab                                                               */
 /* ---------------------------------------------------------------------- */
 
-function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAliases, setMerchantAliases }) {
+/** The Rules screen (under Data), two sub-tabs:
+ *   - Categorization rules: the manual rule-creation form (addRule) plus the full
+ *     list of every rule (system-seeded, learned from tagging a transaction, or
+ *     user-added here directly), and "Re-apply rules to existing data" - re-checks
+ *     every rule-derived or still-uncategorized transaction against the current rule
+ *     set, deliberately leaving manually-categorized transactions untouched
+ *     (eligibleCount/manualCount split), so editing a rule can't silently overwrite
+ *     a deliberate manual override elsewhere.
+ *   - Merchant groups: MerchantGroupsPanel, for combining near-duplicate merchant
+ *     strings under one display name (this only affects display - categorization
+ *     rules still match the original text). */
+function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAliases, setMerchantAliases, accounts }) {
   const [subTab, setSubTab] = useState("rules"); // rules | merchants
   const [pattern, setPattern] = useState("");
   const [category, setCategory] = useState("Expense");
@@ -7390,6 +8575,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
   const [frequency, setFrequency] = useState("Monthly");
   const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
+  const [linkedAccountId, setLinkedAccountId] = useState("");
   const [confirmingReapply, setConfirmingReapply] = useState(false);
   const [confirmingRulesReset, setConfirmingRulesReset] = useState(false);
 
@@ -7397,13 +8583,15 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
     setCategory(v);
     const opts = subCategoryOptionsFor(v);
     setSubCategory(opts.length > 0 ? opts[0] : "");
+    setLinkedAccountId("");
   }
 
   function addRule() {
     const p = pattern.trim().toLowerCase();
     if (!p) return;
     const finalSub = subCategoryOptionsFor(category).length > 0 ? subCategory : null;
-    const finalFreq = (category === "Expense" && finalSub === "Fixed") ? frequency : null;
+    const finalFreq = isFrequencyEligible(category, finalSub) ? frequency : null;
+    const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (linkedAccountId || null) : null;
     setRules((prev) => [
       ...prev.filter((r) => r.pattern.toLowerCase() !== p),
       {
@@ -7412,10 +8600,12 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
         tag: category === "Expense" ? tag : null,
         frequency: finalFreq,
         purpose: purpose || "Personal",
+        linkedAccountId: finalLinkedAccountId,
         source: "user", priority: p.length + 1000, // user rules win ties
       },
     ]);
     setPattern("");
+    setLinkedAccountId("");
   }
 
   function removeRule(id) {
@@ -7529,7 +8719,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
               {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
             </select>
           </div>
-          {category === "Expense" && subCategory === "Fixed" ? (
+          {isFrequencyEligible(category, subCategory) ? (
             <div className="bw-field">
               <label>Frequency</label>
               <select value={frequency} onChange={(e) => setFrequency(e.target.value)}>
@@ -7546,7 +8736,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
           ) : <div />}
         </div>
       )}
-      {category === "Expense" && subCategory === "Fixed" && (
+      {isFrequencyEligible(category, subCategory) && category === "Expense" && (
         <div className="bw-grid2">
           <div className="bw-field">
             <label>Tag</label>
@@ -7563,6 +8753,17 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
           {PURPOSES.map((p) => <option key={p}>{p}</option>)}
         </select>
       </div>
+      {linkableAccountTypesFor(category, subCategory).length > 0 && (
+        <div className="bw-field" style={{ maxWidth: 260 }}>
+          <label>Which account (optional)</label>
+          <select value={linkedAccountId} onChange={(e) => setLinkedAccountId(e.target.value)}>
+            <option value="">— not specified —</option>
+            {accounts.filter((a) => linkableAccountTypesFor(category, subCategory).includes(a.type)).map((a) => (
+              <option key={a.id} value={a.id}>{a.nickname}</option>
+            ))}
+          </select>
+        </div>
+      )}
       <button className="bw-btn" onClick={addRule}><Plus size={14} /> Add rule</button>
 
       <div className="bw-section-label">All rules ({sorted.length})</div>
@@ -7600,6 +8801,12 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
 /* Merchant groups panel — combine near-duplicate merchant strings         */
 /* ---------------------------------------------------------------------- */
 
+/** The Merchant groups sub-tab of Rules - combines near-duplicate merchant strings
+ *  (e.g. "UPI SCAPIA SCAPIA" and "UPI SCAPIA TECHNOLOGY") under one display name for
+ *  reporting purposes only; the raw text each rule matches against is never altered,
+ *  so future imports keep working. Suggestions come from computeSuggestedMerchantClusters
+ *  (algorithmic, based on shared "core" text after stripping banking noise words);
+ *  groups can also be built or edited entirely by hand below. */
 function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases }) {
   const suggestions = useMemo(
     () => computeSuggestedMerchantClusters(transactions, merchantAliases),
@@ -7693,6 +8900,8 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
   );
 }
 
+/** One algorithmically-suggested merchant cluster, with an editable proposed name and
+ *  a one-click "Merge as one" to accept it as a real merchant group. */
 function SuggestedClusterRow({ cluster, onMerge }) {
   const [name, setName] = useState(cluster.suggestedName);
   return (
@@ -7708,6 +8917,9 @@ function SuggestedClusterRow({ cluster, onMerge }) {
   );
 }
 
+/** One existing merchant group, editable in place - rename it, remove a variant
+ *  (deleting the group entirely once its last variant is gone), add another
+ *  ungrouped raw merchant string to it, or delete the whole group. */
 function MerchantGroupRow({ group, availableToAdd, onRename, onRemoveVariant, onAddVariant, onDelete }) {
   const [addValue, setAddValue] = useState("");
   return (
@@ -7743,6 +8955,9 @@ function MerchantGroupRow({ group, availableToAdd, onRename, onRemoveVariant, on
   );
 }
 
+/** Builds a brand-new merchant group from scratch - name it, then check off any
+ *  number of ungrouped raw merchant strings to combine under that name, for cases
+ *  the algorithmic suggestions above don't catch. */
 function ManualMerchantGroupCreator({ availableRaw, onCreate }) {
   const [name, setName] = useState("");
   const [selected, setSelected] = useState([]);
@@ -7791,7 +9006,221 @@ const BUDGET_BUCKETS = [
   { key: "Expense-Variable-Personal", label: "Variable · Personal" },
 ];
 
-function CashFlowOverview({ transactions, setTransactions, accounts, budgets, setBudgets, merchantAliases, onGoToUpload, onGoToReview }) {
+/** The unified dashboard — one screen, one card per pillar, each linking to its full
+ *  screen. Every number here is computed directly from the same source data every other
+ *  screen uses; nothing is duplicated logic that could quietly drift from what those
+ *  screens themselves show. The one deliberate exception: Goals shows a simple count and
+ *  aggregate target rather than a per-goal "on track" verdict, since that verdict depends
+ *  on GoalsOverview's own near-term/long-term pool allocation — reusing it properly means
+ *  lifting that computation up, which is real follow-up work, not something to duplicate
+ *  here and risk disagreeing with the real Goals screen. */
+function DashboardOverview({ transactions, accounts, budgets, merchantAliases, holdingSnapshots, otherInvestments, debtSchedules, goals, onGoToView }) {
+  const nwCurrent = useMemo(
+    () => computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules),
+    [accounts, holdingSnapshots, otherInvestments, debtSchedules]
+  );
+  const nwPrevious = useMemo(
+    () => computeNetWorthSummaryAsOfPrevious(accounts, holdingSnapshots, otherInvestments, debtSchedules),
+    [accounts, holdingSnapshots, otherInvestments, debtSchedules]
+  );
+  const nwDelta = nwCurrent.netWorth - nwPrevious.netWorth;
+
+  const monthlyTotals = useMemo(() => {
+    const map = {};
+    transactions.forEach((t) => {
+      const mk = monthKey(t.date);
+      if (!map[mk]) map[mk] = { income: 0, expense: 0, buckets: {} };
+      const m = map[mk];
+      if (t.category === "Income" && t.direction === "credit") m.income += t.amount;
+      if (t.category === "Expense") {
+        const signed = t.direction === "credit" ? -t.amount : t.amount;
+        m.expense += signed;
+        const key = pillClass(t.category, t.subCategory, t.tag);
+        m.buckets[key] = (m.buckets[key] || 0) + signed;
+      }
+    });
+    return map;
+  }, [transactions]);
+
+  const months = useMemo(() => [...new Set(transactions.map((t) => monthKey(t.date)))].sort(), [transactions]);
+  const lastMonthKey = months.length > 0 ? months[months.length - 1] : null;
+  const lastMonthIdx = lastMonthKey ? months.indexOf(lastMonthKey) : -1;
+  const prevMonthKeyForDash = lastMonthIdx > 0 ? months[lastMonthIdx - 1] : null;
+  const curM = lastMonthKey ? monthlyTotals[lastMonthKey] : null;
+  const prevM = prevMonthKeyForDash ? monthlyTotals[prevMonthKeyForDash] : null;
+
+  const savingsRate = curM && curM.income > 0 ? ((curM.income - curM.expense) / curM.income) * 100 : 0;
+  const savingsAmount = curM ? curM.income - curM.expense : 0;
+  const prevSavingsRate = prevM && prevM.income > 0 ? ((prevM.income - prevM.expense) / prevM.income) * 100 : null;
+  const savingsRatePoints = months.slice(-6).map((mk) => {
+    const m = monthlyTotals[mk];
+    return m && m.income > 0 ? ((m.income - m.expense) / m.income) * 100 : 0;
+  });
+
+  function pctDelta(cur, prev) {
+    if (prev === null || prev === 0) return null;
+    const d = ((cur - prev) / prev) * 100;
+    return { text: `${d >= 0 ? "\u25B2" : "\u25BC"} ${Math.abs(d).toFixed(0)}%`, color: d >= 0 ? "var(--rust)" : "var(--teal)" };
+  }
+  const curHousehold = curM ? (curM.buckets["Expense-Variable-Household"] || 0) : 0;
+  const curPersonal = curM ? (curM.buckets["Expense-Variable-Personal"] || 0) : 0;
+  const prevHousehold = prevM ? (prevM.buckets["Expense-Variable-Household"] || 0) : null;
+  const prevPersonal = prevM ? (prevM.buckets["Expense-Variable-Personal"] || 0) : null;
+  const householdDelta = pctDelta(curHousehold, prevHousehold);
+  const personalDelta = pctDelta(curPersonal, prevPersonal);
+  const expenseDelta = pctDelta(curM?.expense || 0, prevM?.expense ?? null);
+
+  let totalInvested = 0;
+  accounts.filter((a) => a.type === "demat" || a.type === "mutualFund").forEach((acct) => {
+    const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (snaps.length > 0) totalInvested += snaps[snaps.length - 1].totalInvestedValue || 0;
+  });
+  accounts.filter((a) => a.type === "otherInvestment").forEach((acct) => {
+    const entries = otherInvestments.filter((e) => e.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    if (entries.length > 0) totalInvested += entries[entries.length - 1].investedValue || 0;
+  });
+  const totalInvestmentsCurrent = nwCurrent.marketTrackedValue + nwCurrent.otherInvestmentsValue;
+  const investmentGrowthPct = totalInvested > 0 ? ((totalInvestmentsCurrent - totalInvested) / totalInvested) * 100 : 0;
+  const investmentsPreviousSnapshotValue = nwPrevious.marketTrackedValue + nwPrevious.otherInvestmentsValue;
+  const investmentsVsSnapshotDelta = totalInvestmentsCurrent - investmentsPreviousSnapshotValue;
+
+  const debtAccounts = accounts.filter((a) => a.type === "debt");
+  const hasDebt = debtAccounts.length > 0 && nwCurrent.totalDebt > 0;
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  let debtThirtyDaysAgo = 0;
+  debtAccounts.forEach((acct) => {
+    const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+    if (schedules.length > 0) {
+      const summary = computeDebtSummary(schedules, thirtyDaysAgo);
+      if (summary.hasData) debtThirtyDaysAgo += summary.currentOutstanding;
+    }
+  });
+  const debtPaidDown = debtThirtyDaysAgo - nwCurrent.totalDebt;
+
+  // Near-term goals (Emergency Fund, Short-term) use a completely different target
+  // formula than long-term goals — emergencyMonths x average expense, not inflated
+  // cost-today math. Using computeGoalMath for these was the actual bug behind the
+  // "0 combined target" — costToday/inflationRate/returnRate are simply unset on them.
+  const holdingsIndexForGoals = useMemo(() => buildHoldingsIndex(accounts, holdingSnapshots), [accounts, holdingSnapshots]);
+  const averageMonthlyExpenseForGoals = useMemo(() => computeAverageMonthlyExpense(transactions), [transactions]);
+  const goalRows = goals.map((g) => {
+    const isNearTerm = GOAL_TYPE_DEFAULTS[g.type]?.isMonthsBased;
+    const target = isNearTerm
+      ? Math.round((g.emergencyMonths || 6) * averageMonthlyExpenseForGoals * 100) / 100
+      : computeGoalMath(g.costToday, g.inflationRate, g.returnRate, g.yearsToGoal).targetCorpus;
+    // Near-term: funded = accurately tracked value from its own assigned holdings.
+    // Long-term: funded = the goal's own stated manual allocation — a direct field on
+    // the goal, not the pool-sufficiency-checked "claimed" amount GoalsOverview computes,
+    // since that requires the full shared-pool logic this dashboard doesn't duplicate.
+    const funded = isNearTerm
+      ? computeNearTermGoalTracking(g, holdingsIndexForGoals, accounts, holdingSnapshots).trackedCurrentValue
+      : (g.manualLumpsumAllocation || 0);
+    const trackedPct = isNearTerm && target > 0 ? Math.min(100, (funded / target) * 100) : null;
+    return { id: g.id, name: g.name, target, funded, trackedPct, isNearTerm };
+  });
+  const totalGoalTarget = goalRows.reduce((s, g) => s + (g.target || 0), 0);
+  const totalGoalFunded = goalRows.reduce((s, g) => s + (g.funded || 0), 0);
+  const totalGoalPct = totalGoalTarget > 0 ? Math.min(100, (totalGoalFunded / totalGoalTarget) * 100) : 0;
+
+  if (accounts.length === 0) {
+    return <div className="bw-empty">Import a statement first — the dashboard fills in as soon as there's data.</div>;
+  }
+
+  return (
+    <div>
+      <ZoneHeader icon={LineChartIcon} title="Overview" subtitle="Every pillar, at a glance — click any card for the full picture" />
+      <div className="bw-insight-row">
+        <InsightCard
+          icon={Landmark} title="Net worth" value={inr(nwCurrent.netWorth)}
+          delta={`${nwDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(nwDelta))} \u00B7 vs last snapshot`}
+          deltaColor={nwDelta >= 0 ? "var(--teal)" : "var(--rust)"}
+          onClick={() => onGoToView("networth")}
+        >
+          <Sparkline values={[nwPrevious.netWorth, nwCurrent.netWorth]} color={nwDelta >= 0 ? "var(--teal)" : "var(--rust)"} />
+        </InsightCard>
+
+        <InsightCard
+          icon={Wallet} title="Savings" value={inr(savingsAmount)}
+          delta={prevSavingsRate !== null ? `${savingsRate.toFixed(0)}% rate \u00B7 ${savingsRate >= prevSavingsRate ? "\u25B2" : "\u25BC"} vs last month` : `${savingsRate.toFixed(0)}% rate`}
+          deltaColor={prevSavingsRate !== null ? (savingsRate >= prevSavingsRate ? "var(--teal)" : "var(--rust)") : "var(--ink-soft)"}
+          onClick={() => onGoToView("cashflow")}
+        >
+          <Sparkline values={savingsRatePoints} color="var(--teal)" />
+        </InsightCard>
+
+        <InsightCard
+          icon={TrendingUp} title="Investments" value={inr(totalInvestmentsCurrent)}
+          delta={`${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))} \u00B7 vs last snapshot`}
+          deltaColor={investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)"}
+          onClick={() => onGoToView("investments")}
+          footer={[
+            { label: "Invested", value: inr(totalInvested) },
+            { label: "Growth", value: `${investmentGrowthPct >= 0 ? "\u25B2" : "\u25BC"} ${Math.abs(investmentGrowthPct).toFixed(1)}%`, color: investmentGrowthPct >= 0 ? "var(--teal)" : "var(--rust)" },
+          ]}
+        >
+          <Sparkline values={[investmentsPreviousSnapshotValue, totalInvestmentsCurrent]} color={investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)"} />
+        </InsightCard>
+
+        {hasDebt && (
+          <InsightCard
+            icon={TrendingDown} title="Debt" value={inr(nwCurrent.totalDebt)}
+            delta={`${debtPaidDown >= 0 ? "\u25BC" : "\u25B2"} ${inr(Math.abs(debtPaidDown))} \u00B7 ${debtPaidDown >= 0 ? "paid down" : "increased"} in 30 days`}
+            deltaColor={debtPaidDown >= 0 ? "var(--teal)" : "var(--rust)"}
+            onClick={() => onGoToView("debt")}
+          >
+            <Sparkline values={[debtThirtyDaysAgo, nwCurrent.totalDebt]} color="var(--teal)" />
+          </InsightCard>
+        )}
+
+        <InsightCard
+          icon={FileText} title="Expenses" value={inr(curM?.expense || 0)}
+          delta={expenseDelta ? `${expenseDelta.text} vs last month` : null} deltaColor={expenseDelta?.color}
+          onClick={() => onGoToView("cashflow")}
+        >
+          <div style={{ marginTop: 2 }}>
+            <div className="bw-insight-line">
+              <span style={{ color: "var(--ink-soft)" }}>Household</span>
+              <span><strong style={{ color: "var(--ink)" }}>{inr(curHousehold)}</strong>{householdDelta && <span style={{ color: householdDelta.color, marginLeft: 6 }}>{householdDelta.text}</span>}</span>
+            </div>
+            <div className="bw-insight-line">
+              <span style={{ color: "var(--ink-soft)" }}>Personal</span>
+              <span><strong style={{ color: "var(--ink)" }}>{inr(curPersonal)}</strong>{personalDelta && <span style={{ color: personalDelta.color, marginLeft: 6 }}>{personalDelta.text}</span>}</span>
+            </div>
+          </div>
+        </InsightCard>
+
+        <InsightCard
+          icon={Flag} title="Goals" value={String(goals.length)}
+          delta={goals.length === 0 ? "No goals set yet" : `${inr(totalGoalTarget)} target \u00B7 ${totalGoalPct.toFixed(0)}% funded`}
+          deltaColor={totalGoalPct >= 75 ? "var(--teal)" : totalGoalPct >= 40 ? "var(--ochre)" : "var(--rust)"}
+          onClick={() => onGoToView("goals")}
+          footer={goals.length > 0 ? [
+            { label: "Amount funded", value: inr(totalGoalFunded) },
+            { label: "Portfolio chg.", value: `${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))}`, color: investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)" },
+          ] : undefined}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** The Cash Flow pillar screen - Income, Expense, Investment laid out as one waterfall
+ *  equation (Income - Expense = Savings; Investment tracked as its own use of income,
+ *  never folded into Savings), plus:
+ *   - Opening/Closing bank balance for the period, resolved via
+ *     resolveAccountBalanceForPeriod's 3-tier confidence (exact/derived/estimate),
+ *     aggregated across all bank accounts (waterfall) and shown per-account
+ *     (perAccountEquation) so a discrepancy is traceable to a specific account.
+ *   - Expense split two ways: Fixed/Variable-Household/Variable-Personal (the
+ *     existing composition), and separately Cash vs Credit Card (expenseByPaymentMethod)
+ *     - a card purchase and a debit-card purchase differ in when cash actually
+ *     leaves, so this is tracked as its own dimension, not folded into the first.
+ *   - Budget vs Actual, with a median-of-recent-months suggested budget per bucket.
+ *   - Top merchants, a click-to-drill-down bar chart, and the monthly/MoM trend.
+ *  Every number here is either summed directly from transactions, or - for
+ *  Opening/Closing - resolved through the shared balance resolver, never a separately
+ *  tracked or manually-entered figure. */
+function CashFlowOverview({ transactions, setTransactions, accounts, budgets, setBudgets, cashBuffer, setCashBuffer, merchantAliases, rules, onGoToUpload, onGoToReview }) {
   const months = useMemo(() => {
     const s = new Set(transactions.map((t) => monthKey(t.date)));
     return [...s].sort();
@@ -7804,6 +9233,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 
   const [selectedMonth, setSelectedMonth] = useState("all");
   const [drill, setDrill] = useState(null); // { label, txns }
+  const [subView, setSubView] = useState("overview"); // "overview" | "calendar"
 
   // "all" | "year" | "month" — a 4-char selection is a year, 7-char (YYYY-MM) is a month
   const periodType = selectedMonth === "all" ? "all" : (selectedMonth.length === 4 ? "year" : "month");
@@ -8040,11 +9470,15 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
     return { start: `${selectedMonth}-01`, end: `${selectedMonth}-${String(lastDay).padStart(2, "0")}` };
   }, [selectedMonth, periodType, scoped]);
 
-  const bankAccounts = useMemo(() => accounts.filter((a) => a.type !== "creditCard"), [accounts]);
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+
+  const TIER_RANK = { exact: 0, derived: 1, estimate: 2, unknown: 3 };
+  const worseTier = (a, b) => (TIER_RANK[a] >= TIER_RANK[b] ? a : b);
 
   const waterfall = useMemo(() => {
     let openingKnown = true, closingKnown = true;
     let openingAllExact = true, closingAllExact = true;
+    let openingWorstTier = "exact", closingWorstTier = "exact";
     let opening = 0, closing = 0;
     const perAccount = [];
     bankAccounts.forEach((a) => {
@@ -8059,19 +9493,21 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
         }
       }
       const openRes = acctStart
-        ? resolveAccountBalanceForPeriod(a, acctStart, acctEnd, "opening")
-        : { value: null, exact: false };
+        ? resolveAccountBalanceForPeriod(a, transactions, acctStart, acctEnd, "opening")
+        : { value: null, exact: false, tier: "unknown" };
       const closeRes = acctEnd
-        ? resolveAccountBalanceForPeriod(a, acctStart, acctEnd, "closing")
-        : { value: null, exact: false };
+        ? resolveAccountBalanceForPeriod(a, transactions, acctStart, acctEnd, "closing")
+        : { value: null, exact: false, tier: "unknown" };
       if (openRes.value === null) openingKnown = false; else opening += openRes.value;
       if (closeRes.value === null) closingKnown = false; else closing += closeRes.value;
       if (!openRes.exact) openingAllExact = false;
       if (!closeRes.exact) closingAllExact = false;
+      if (openRes.value !== null) openingWorstTier = worseTier(openingWorstTier, openRes.tier);
+      if (closeRes.value !== null) closingWorstTier = worseTier(closingWorstTier, closeRes.tier);
       perAccount.push({
         id: a.id, nickname: a.nickname,
-        opening: openRes.value, openingExact: openRes.exact,
-        closing: closeRes.value, closingExact: closeRes.exact,
+        opening: openRes.value, openingExact: openRes.exact, openingTier: openRes.tier,
+        closing: closeRes.value, closingExact: closeRes.exact, closingTier: closeRes.tier,
       });
     });
 
@@ -8121,6 +9557,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
     return {
       opening: resolvedOpening, closing: resolvedClosing,
       openingExact: openingKnown && openingAllExact, closingExact: closingKnown && closingAllExact,
+      openingTier: openingKnown ? openingWorstTier : "unknown", closingTier: closingKnown ? closingWorstTier : "unknown",
       netChangeInCash, netTransfers, transferBreakdown, totalChangeInCash,
       impliedClosing, closingMismatch,
       perAccount,
@@ -8135,7 +9572,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
   // has no Opening/Closing/Net-Change/Transfers (it holds no cash, those concepts
   // don't apply), but its own Expense/Savings are real and shown, same as any account.
   const perAccountEquation = useMemo(() => {
-    return accounts.map((a) => {
+    return accounts.filter((a) => isCashFlowAccountType(a.type)).map((a) => {
       const isCC = a.type === "creditCard";
       let income = 0, expense = 0, investedOut = 0, investedIn = 0, transferNet = 0;
       const acctTxns = [];
@@ -8149,7 +9586,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
       });
       const netInvestment = investedOut - investedIn;
       const savings = income - expense;
-      let opening = null, openingExact = false, closing = null, closingExact = false, netChangeInCash = null;
+      let opening = null, openingExact = false, openingTier = "unknown", closing = null, closingExact = false, closingTier = "unknown", netChangeInCash = null;
       if (!isCC) {
         let acctStart = periodBounds.start, acctEnd = periodBounds.end;
         if (periodType === "all") {
@@ -8160,13 +9597,13 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
             acctStart = null; acctEnd = null;
           }
         }
-        const openRes = acctStart ? resolveAccountBalanceForPeriod(a, acctStart, acctEnd, "opening") : { value: null, exact: false };
-        const closeRes = acctEnd ? resolveAccountBalanceForPeriod(a, acctStart, acctEnd, "closing") : { value: null, exact: false };
-        opening = openRes.value; openingExact = openRes.exact;
-        closing = closeRes.value; closingExact = closeRes.exact;
+        const openRes = acctStart ? resolveAccountBalanceForPeriod(a, transactions, acctStart, acctEnd, "opening") : { value: null, exact: false, tier: "unknown" };
+        const closeRes = acctEnd ? resolveAccountBalanceForPeriod(a, transactions, acctStart, acctEnd, "closing") : { value: null, exact: false, tier: "unknown" };
+        opening = openRes.value; openingExact = openRes.exact; openingTier = openRes.tier;
+        closing = closeRes.value; closingExact = closeRes.exact; closingTier = closeRes.tier;
         netChangeInCash = savings - netInvestment;
       }
-      return { id: a.id, nickname: a.nickname, isCC, opening, openingExact, income, expense, savings, netInvestment, netChangeInCash, transferNet: isCC ? null : transferNet, closing, closingExact };
+      return { id: a.id, nickname: a.nickname, isCC, opening, openingExact, openingTier, income, expense, savings, netInvestment, netChangeInCash, transferNet: isCC ? null : transferNet, closing, closingExact, closingTier };
     });
   }, [accounts, scoped, periodBounds, periodType]);
 
@@ -8301,8 +9738,25 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
     return <div className="bw-empty">Import a statement first — the dashboard fills in as soon as there's data.</div>;
   }
 
+  const subViewTabs = (
+    <div className="bw-tabs" style={{ marginBottom: 16 }}>
+      <button className={`bw-tab ${subView === "overview" ? "active" : ""}`} onClick={() => setSubView("overview")}>Overview</button>
+      <button className={`bw-tab ${subView === "calendar" ? "active" : ""}`} onClick={() => setSubView("calendar")}>Calendar</button>
+    </div>
+  );
+
+  if (subView === "calendar") {
+    return (
+      <div>
+        {subViewTabs}
+        <CashFlowCalendarView transactions={transactions} accounts={accounts} rules={rules} cashBuffer={cashBuffer} setCashBuffer={setCashBuffer} />
+      </div>
+    );
+  }
+
   return (
     <div>
+      {subViewTabs}
       {/* ---- Header + period selector ---- */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
         <h2 className="bw-h2">Cash Flow</h2>
@@ -8346,20 +9800,21 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
             <li><strong>Investments</strong> — the one box that breaks the usual color rule on purpose: an investment is normally an outflow, so if this ever shows positive (a redemption), it's flagged red specifically to catch your attention, not because redeeming is bad.</li>
             <li><strong>Transfers</strong> — real bank-side money movement only (Self, Credit card payment, External). The credit-card side of a payment doesn't appear here — see Review → Transfers for that.</li>
             <li>Every other box colors purely by its own sign: green if positive, red if negative.</li>
-            <li><strong>"estimated, not confirmed"</strong> under Opening/Closing means at least one account's balance for this exact period was never confirmed at import — it's carried forward from the nearest prior data instead. If that estimate disagrees sharply with what the equation itself computes, a warning appears explaining the gap.</li>
+            <li><strong>"calculated from your transactions"</strong> means no statement confirmed this exact date, but your real, dated transactions since the nearest confirmed balance were used to work it out — built from genuine activity, not a guess.</li>
+            <li><strong>"estimated, not confirmed"</strong> means neither a confirmed balance nor transaction data covers this exact period — it's carried forward from the nearest earlier confirmed point, with nothing to verify it against. If that estimate disagrees sharply with what the equation itself computes, a warning appears explaining the gap.</li>
           </ul>
         </div>
       )}
       <div className="bw-waterfall-card">
         <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(8, 1fr)" }}>
-          <WaterfallNode label="Opening" sublabel="bank cash" value={waterfall.opening} notExact={!waterfall.openingExact} />
+          <WaterfallNode label="Opening" sublabel="bank cash" value={waterfall.opening} tier={waterfall.openingTier} />
           <WaterfallOp label="Income" contribution={totals.income} />
           <WaterfallOp label="Expenses" contribution={-totals.expense} />
           <WaterfallNode label="Savings" value={totals.savings} rate={totals.income > 0 ? totals.savingsRate : null} />
           <WaterfallOp label="Investments" contribution={-totals.netInvestment} flagPositiveAsUnusual rate={totals.income > 0 ? totals.investmentRate : null} />
           <WaterfallNode label="Net change in cash" value={waterfall.netChangeInCash} />
           <WaterfallOp label="Transfers" contribution={waterfall.netTransfers} />
-          <WaterfallNode label="Closing" sublabel="bank cash" value={waterfall.closing} notExact={!waterfall.closingExact} />
+          <WaterfallNode label="Closing" sublabel="bank cash" value={waterfall.closing} tier={waterfall.closingTier} />
         </div>
       </div>
       {waterfall.closingMismatch && (
@@ -8417,7 +9872,8 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                   <td>{a.nickname}{a.isCC && <span style={{ fontSize: 9.5, color: "var(--ink-soft)", marginLeft: 5 }}>(card)</span>}</td>
                   <td style={{ textAlign: "right" }}>
                     {a.isCC ? "—" : (a.opening !== null ? inr(a.opening) : "—")}
-                    {!a.isCC && a.opening !== null && !a.openingExact && <div style={{ fontSize: 9, color: "var(--ochre)" }}>carried forward</div>}
+                    {!a.isCC && a.opening !== null && a.openingTier === "derived" && <div style={{ fontSize: 9, color: "var(--slate)" }}>calculated</div>}
+                    {!a.isCC && a.opening !== null && a.openingTier === "estimate" && <div style={{ fontSize: 9, color: "var(--ochre)" }}>carried forward</div>}
                   </td>
                   <td style={{ textAlign: "right" }}>{inr(a.income)}</td>
                   <td style={{ textAlign: "right" }}>{inr(a.expense)}</td>
@@ -8427,7 +9883,8 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                   <td style={{ textAlign: "right" }}>{a.isCC ? "—" : inr(a.transferNet)}</td>
                   <td style={{ textAlign: "right" }}>
                     {a.isCC ? "—" : (a.closing !== null ? inr(a.closing) : "—")}
-                    {!a.isCC && a.closing !== null && !a.closingExact && <div style={{ fontSize: 9, color: "var(--ochre)" }}>carried forward</div>}
+                    {!a.isCC && a.closing !== null && a.closingTier === "derived" && <div style={{ fontSize: 9, color: "var(--slate)" }}>calculated</div>}
+                    {!a.isCC && a.closing !== null && a.closingTier === "estimate" && <div style={{ fontSize: 9, color: "var(--ochre)" }}>carried forward</div>}
                   </td>
                 </tr>
               ))}
@@ -8773,11 +10230,362 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 /* ---------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------- */
+/* Cash Flow Calendar — a forward-looking cash view, distinct from the      */
+/* transaction-history-focused Overview above. Shows only financially      */
+/* significant, recurring-type events (isFrequencyEligible categories),    */
+/* not every transaction — a day-by-day feed of every grocery purchase     */
+/* would bury the events that actually matter to plan around. Historical   */
+/* (already-happened) events and projected (learned-pattern, not-yet-      */
+/* happened) events are always visually distinct — never rendered          */
+/* identically, the same honesty discipline applied to balance confidence  */
+/* tiers elsewhere in this app. Projection math (forward balance curve)    */
+/* and the minimum-buffer setting are deliberately not part of this first  */
+/* build — this covers the grid itself only.                               */
+/* ---------------------------------------------------------------------- */
+
+function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCashBuffer }) {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const [viewYear, setViewYear] = useState(now.getFullYear());
+  const [viewMonth, setViewMonth] = useState(now.getMonth() + 1); // 1-12
+  const [selectedDay, setSelectedDay] = useState(null);
+
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules), [transactions, accounts, rules]);
+
+  // One event per day this month: a real transaction if it already happened, a
+  // projected occurrence from a learned pattern if it hasn't. A commitment whose
+  // latest real transaction already falls in this month never also gets a
+  // projected entry — projectOccurrenceForMonth already refuses to project into a
+  // month that's <= the commitment's own last-seen month, so there's no risk of
+  // showing the same thing twice, once as fact and once as a guess.
+  const monthEvents = useMemo(() => {
+    const events = [];
+    transactions
+      .filter((t) => t.category && isFrequencyEligible(t.category, t.subCategory))
+      .forEach((t) => {
+        const [y, m] = t.date.split("-").map(Number);
+        if (y === viewYear && m === viewMonth) {
+          events.push({
+            id: t.id, date: t.date, kind: "actual",
+            name: t.merchant || t.description, amount: t.amount, direction: t.direction,
+            category: t.category, subCategory: t.subCategory,
+          });
+        }
+      });
+    commitments.forEach((c) => {
+      const projectedDate = projectOccurrenceForMonth(c, viewYear, viewMonth);
+      if (!projectedDate) return;
+      // A future date is a genuine forward projection. A past date with no matching
+      // real transaction is a MORE important signal, not one to drop silently - it
+      // means something expected by now hasn't shown up yet, either because it
+      // hasn't been imported or because it genuinely didn't happen. Both cases are
+      // worth surfacing, just with a different label - "overdue", not "expected".
+      const isInflow = c.category === "Income";
+      events.push({
+        id: `proj:${c.key}:${projectedDate}`, date: projectedDate,
+        kind: projectedDate > todayStr ? "projected" : "overdue",
+        name: c.name, amount: c.lastAmount, direction: isInflow ? "credit" : "debit",
+        category: c.category, subCategory: c.subCategory, confidence: c.pattern.confidence,
+      });
+    });
+    return events.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  }, [transactions, commitments, viewYear, viewMonth, todayStr]);
+
+  // Today's real, resolved bank balance - the starting point the projection walks
+  // forward from. Only meaningful when viewing the current month; a past or future
+  // month's projection wouldn't anchor to "today" in any useful way, so it's left
+  // null outside the current month rather than computing a number that doesn't mean
+  // what it looks like it means.
+  const isCurrentMonthView = viewYear === now.getFullYear() && viewMonth === now.getMonth() + 1;
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const todaysBalance = useMemo(() => {
+    if (!isCurrentMonthView) return null;
+    let known = true, total = 0;
+    bankAccounts.forEach((a) => {
+      const res = resolveAccountBalanceForPeriod(a, transactions, "2000-01-01", todayStr, "closing");
+      if (res.value === null) { known = false; return; }
+      total += res.value;
+    });
+    return known ? total : null;
+  }, [isCurrentMonthView, bankAccounts, transactions, todayStr]);
+
+  const monthEndStr = `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(new Date(viewYear, viewMonth, 0).getDate()).padStart(2, "0")}`;
+  const dailyDiscretionary = useMemo(() => {
+    const medianMonthly = computeMedianMonthlyDiscretionary(transactions, viewYear, viewMonth);
+    const daysInMonth = new Date(viewYear, viewMonth, 0).getDate();
+    const daysRemaining = Math.max(1, daysInMonth - Number(todayStr.slice(8, 10)));
+    return medianMonthly / daysRemaining;
+  }, [transactions, viewYear, viewMonth, todayStr]);
+
+  const projectedDaily = useMemo(() => {
+    if (todaysBalance === null) return [];
+    return computeProjectedDailyBalances(todaysBalance, todayStr, monthEndStr, monthEvents, dailyDiscretionary);
+  }, [todaysBalance, todayStr, monthEndStr, monthEvents, dailyDiscretionary]);
+
+  const projectedMonthEndBalance = projectedDaily.length > 0 ? projectedDaily[projectedDaily.length - 1].balance : null;
+  const projectedMinimumBalance = projectedDaily.length > 0 ? Math.min(...projectedDaily.map((p) => p.balance)) : null;
+
+  // The "See" breakdown - all real transactions in the month (not just the frequency-
+  // eligible ones the calendar grid plots), bucketed per the agreed structure. This
+  // deliberately becomes the source for the hero stats above too, so the summary
+  // numbers and the detailed breakdown below always agree with each other exactly.
+  // Self, External, Debt-Disbursement, and Debt-Lumpsum Payment are deliberately
+  // excluded for now - correct only once "all accounts combined" is the whole
+  // picture (Self nets to zero across every account); revisit when a per-account
+  // view is built, since Self/External stop being excludable at that point.
+  const seeBreakdown = useMemo(() => {
+    const monthKey = `${viewYear}-${String(viewMonth).padStart(2, "0")}`;
+    const buckets = {
+      income: 0, redemption: 0, investments: 0, loans: 0,
+      fixedExpenses: 0, ccPayments: 0, discretionaryHousehold: 0, discretionaryPersonal: 0,
+    };
+    transactions.filter((t) => t.date.slice(0, 7) === monthKey).forEach((t) => {
+      const amt = Math.abs(t.amount);
+      if (t.category === "Income" && t.direction === "credit") buckets.income += amt;
+      else if (t.category === "Investment" && t.subCategory === "Redemption") buckets.redemption += amt;
+      else if (t.category === "Investment" && (t.subCategory === "SIP" || t.subCategory === "Lumpsum")) buckets.investments += amt;
+      else if (t.category === "Transfer" && t.subCategory === "Debt-EMI") buckets.loans += amt;
+      else if (t.category === "Expense" && t.subCategory === "Fixed") buckets.fixedExpenses += amt;
+      else if (t.category === "Transfer" && t.subCategory === "Credit card payment") buckets.ccPayments += amt;
+      else if (t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Household") buckets.discretionaryHousehold += amt;
+      else if (t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Personal") buckets.discretionaryPersonal += amt;
+    });
+    const totalInflow = buckets.income + buckets.redemption;
+    const totalOutflow = buckets.investments + buckets.loans + buckets.fixedExpenses + buckets.ccPayments + buckets.discretionaryHousehold + buckets.discretionaryPersonal;
+    return { ...buckets, totalInflow, totalOutflow, net: totalInflow - totalOutflow };
+  }, [transactions, viewYear, viewMonth]);
+
+  const totalInflows = seeBreakdown.totalInflow;
+  const totalOutflows = seeBreakdown.totalOutflow;
+  const netCashFlow = seeBreakdown.net;
+  const seeMaxBar = Math.max(totalInflows, totalOutflows, 1);
+
+  // Calendar grid geometry: Monday-first week, leading/trailing blanks for days
+  // outside this month so the grid always fills complete rows.
+  const daysInMonth = new Date(viewYear, viewMonth, 0).getDate();
+  const firstWeekday = (new Date(viewYear, viewMonth - 1, 1).getDay() + 6) % 7; // 0=Mon..6=Sun
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  function eventsOnDay(day) {
+    if (!day) return [];
+    const dateStr = `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    return monthEvents.filter((e) => e.date === dateStr);
+  }
+
+  function changeMonth(delta) {
+    let m = viewMonth + delta, y = viewYear;
+    if (m > 12) { m = 1; y += 1; } else if (m < 1) { m = 12; y -= 1; }
+    setViewMonth(m); setViewYear(y); setSelectedDay(null);
+  }
+
+  const monthLabelStr = new Date(viewYear, viewMonth - 1, 1).toLocaleString("en-IN", { month: "long", year: "numeric" });
+  const selectedDayEvents = selectedDay ? eventsOnDay(selectedDay) : [];
+  const selectedDateStr = selectedDay ? `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(selectedDay).padStart(2, "0")}` : null;
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
+        <p className="bw-lead" style={{ margin: 0 }}>Know your cash before it happens.</p>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button className="bw-btn ghost small" onClick={() => changeMonth(-1)}>&lsaquo;</button>
+          <span style={{ fontWeight: 600, minWidth: 140, textAlign: "center" }}>{monthLabelStr}</span>
+          <button className="bw-btn ghost small" onClick={() => changeMonth(1)}>&rsaquo;</button>
+          <button className="bw-btn ghost small" onClick={() => { setViewYear(now.getFullYear()); setViewMonth(now.getMonth() + 1); setSelectedDay(null); }}>Today</button>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--ink-soft)", marginLeft: 8 }}>
+            Your buffer
+            <input
+              type="number" className="bw-select-inline" style={{ width: 90 }}
+              value={cashBuffer || ""} placeholder="0"
+              onChange={(e) => setCashBuffer(Number(e.target.value) || 0)}
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className="bw-summary-row" style={{ gridTemplateColumns: "repeat(5, 1fr)", marginBottom: 18 }}>
+        <Stat label="Total inflows" value={inr(totalInflows)} color="var(--teal)" />
+        <Stat label="Total outflows" value={inr(totalOutflows)} color="var(--rust)" />
+        <Stat label="Net cash flow" value={inr(netCashFlow)} color={netCashFlow >= 0 ? "var(--teal)" : "var(--rust)"} />
+        <Stat
+          label="Projected month-end balance"
+          value={projectedMonthEndBalance !== null ? inr(projectedMonthEndBalance) : "—"}
+          color={projectedMonthEndBalance !== null && projectedMonthEndBalance >= 0 ? "var(--teal)" : "var(--rust)"}
+          hint={todaysBalance !== null ? `Current balance ${inr(todaysBalance)}` : (isCurrentMonthView ? "Balance not yet confirmed" : "Only shown for the current month")}
+        />
+        <Stat
+          label="Minimum balance (in month)"
+          value={projectedMinimumBalance !== null ? inr(projectedMinimumBalance) : "—"}
+          color={projectedMinimumBalance !== null && cashBuffer > 0 ? (projectedMinimumBalance >= cashBuffer ? "var(--teal)" : "var(--rust)") : "var(--ink)"}
+          hint={
+            projectedMinimumBalance === null ? null
+            : cashBuffer > 0
+              ? (projectedMinimumBalance >= cashBuffer ? `Above your buffer of ${inr(cashBuffer)}` : `Below your buffer of ${inr(cashBuffer)}`)
+              : "Set a buffer above to compare"
+          }
+        />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 18, alignItems: "start" }}>
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 1, background: "var(--line)", border: "1px solid var(--line)", borderRadius: 6, overflow: "hidden" }}>
+            {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
+              <div key={d} style={{ background: "var(--paper)", padding: "6px 8px", fontSize: 10.5, fontWeight: 600, color: "var(--ink-soft)", textTransform: "uppercase" }}>{d}</div>
+            ))}
+            {cells.map((day, i) => {
+              const dayEvents = eventsOnDay(day);
+              const dateStr = day ? `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}` : null;
+              const isToday = dateStr === todayStr;
+              return (
+                <div key={i}
+                  onClick={() => day && setSelectedDay(day)}
+                  style={{
+                    background: "var(--card)", minHeight: 68, padding: 6, cursor: day ? "pointer" : "default",
+                    outline: selectedDay === day ? "2px solid var(--teal)" : isToday ? "1px solid var(--ochre)" : "none", outlineOffset: -2,
+                  }}>
+                  {day && <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 3 }}>{day}</div>}
+                  {dayEvents.slice(0, 2).map((e) => (
+                    <div key={e.id} style={{
+                      fontSize: 9.5, marginBottom: 2, padding: "1px 4px", borderRadius: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                      background: e.direction === "credit" ? "rgba(46,102,89,0.12)" : "rgba(156,74,52,0.12)",
+                      color: e.kind === "overdue" ? "var(--ochre)" : e.direction === "credit" ? "var(--teal)" : "var(--rust)",
+                      border: e.kind === "projected" ? "1px dashed currentColor" : e.kind === "overdue" ? "1px solid var(--ochre)" : "1px solid transparent",
+                      opacity: e.kind === "projected" ? 0.75 : 1,
+                    }}>
+                      {e.direction === "credit" ? "+" : "−"}{inr(e.amount)}{e.kind === "projected" ? " (exp.)" : e.kind === "overdue" ? " (?)" : ""}
+                    </div>
+                  ))}
+                  {dayEvents.length > 2 && <div style={{ fontSize: 9, color: "var(--ink-soft)" }}>+{dayEvents.length - 2} more</div>}
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 16, marginTop: 10, fontSize: 11, color: "var(--ink-soft)", flexWrap: "wrap" }}>
+            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(46,102,89,0.12)", border: "1px solid var(--teal)", verticalAlign: -1, marginRight: 4 }} />Confirmed</span>
+            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(156,74,52,0.12)", border: "1px dashed var(--rust)", verticalAlign: -1, marginRight: 4 }} />Projected (learned pattern, not yet happened)</span>
+            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(168,112,58,0.12)", border: "1px solid var(--ochre)", verticalAlign: -1, marginRight: 4 }} />Overdue (expected by now, not yet confirmed)</span>
+          </div>
+        </div>
+
+        <div>
+          {selectedDay ? (
+            <div style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 14, marginBottom: 16 }}>
+              <div style={{ fontWeight: 600, marginBottom: 10 }}>{new Date(viewYear, viewMonth - 1, selectedDay).toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</div>
+              {selectedDayEvents.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>Nothing on this day.</div>
+              ) : selectedDayEvents.map((e) => (
+                <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderTop: "1px solid var(--line)" }}>
+                  <div>
+                    <div style={{ fontSize: 13 }}>{e.name}</div>
+                    <div style={{ fontSize: 10.5, color: e.kind === "overdue" ? "var(--ochre)" : "var(--ink-soft)" }}>
+                      {e.kind === "projected" ? `Expected — ${Math.round(e.confidence * 100)}% confidence`
+                        : e.kind === "overdue" ? `Expected by now, not yet confirmed — ${Math.round(e.confidence * 100)}% confidence`
+                        : "Confirmed"}
+                    </div>
+                  </div>
+                  <div className={`bw-amt ${e.direction}`}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Upcoming this month</div>
+          {monthEvents.filter((e) => e.date >= todayStr).length === 0 ? (
+            <div className="bw-empty">Nothing more expected for the rest of this month.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
+              {monthEvents.filter((e) => e.date >= todayStr).map((e) => (
+                <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0" }}>
+                  <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                  <span style={{ flex: 1 }}>{e.name}{e.kind === "projected" ? <span style={{ color: "var(--ink-soft)", fontStyle: "italic" }}> (expected)</span> : ""}</span>
+                  <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Already happened this month</div>
+          {monthEvents.filter((e) => e.date < todayStr).length === 0 ? (
+            <div className="bw-empty">Nothing yet this month.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {monthEvents.filter((e) => e.date < todayStr).map((e) => (
+                <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", opacity: 0.75 }}>
+                  <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                  <span style={{ flex: 1 }}>{e.name}{e.kind === "overdue" ? <span style={{ color: "var(--ochre)", fontStyle: "italic" }}> (expected, not yet confirmed)</span> : ""}</span>
+                  <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 24, border: "1px solid var(--line)", borderRadius: 8, padding: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ background: "var(--teal)", color: "#fff", borderRadius: "50%", width: 22, height: 22, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>1</span>
+          <span style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>See</span>
+          <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>What's coming in and going out?</span>
+        </div>
+
+        <div style={{ margin: "14px 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+            <span>Inflow</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{inr(totalInflows)}</span>
+          </div>
+          <div style={{ height: 10, background: "var(--paper)", borderRadius: 3, overflow: "hidden", border: "1px solid var(--line)", marginBottom: 12 }}>
+            <div style={{ width: `${Math.max(2, (totalInflows / seeMaxBar) * 100)}%`, height: "100%", background: "var(--teal)" }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+            <span>Outflow</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{inr(totalOutflows)}</span>
+          </div>
+          <div style={{ height: 10, background: "var(--paper)", borderRadius: 3, overflow: "hidden", border: "1px solid var(--line)" }}>
+            <div style={{ width: `${Math.max(2, (totalOutflows / seeMaxBar) * 100)}%`, height: "100%", background: "var(--rust)" }} />
+          </div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {[
+            { label: "Income", value: seeBreakdown.income },
+            { label: "Investment redemptions", value: seeBreakdown.redemption },
+            { label: "Investments (SIP + Lumpsum)", value: seeBreakdown.investments },
+            { label: "Loans (EMI)", value: seeBreakdown.loans },
+            { label: "Fixed expenses", value: seeBreakdown.fixedExpenses },
+            { label: "Credit card payments", value: seeBreakdown.ccPayments },
+            { label: "Discretionary — Household", value: seeBreakdown.discretionaryHousehold },
+            { label: "Discretionary — Personal", value: seeBreakdown.discretionaryPersonal },
+          ].map((row) => (
+            <div key={row.label} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+              <span style={{ color: "var(--ink-soft)" }}>{row.label}</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{inr(row.value)}</span>
+            </div>
+          ))}
+        </div>
+        <p style={{ fontSize: 10.5, color: "var(--ink-soft)", margin: "12px 0 0" }}>
+          Self transfers, External transfers, and debt Disbursement/Lumpsum Payment are not yet included here —
+          correct for this all-accounts view (Self nets to zero across every account combined), but will need
+          revisiting once a per-account filter exists.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
 /* Net Worth overview — a pure aggregator screen. Owns no data of its own; */
 /* every figure comes straight from computeNetWorthSummary, which reads    */
 /* live from Cash Flow accounts, Investments, and Debt.                    */
 /* ---------------------------------------------------------------------- */
 
+/** The Net Worth pillar screen - Assets minus Liabilities, entirely derived from
+ *  computeNetWorthSummary; nothing here is its own separately-tracked figure, so this
+ *  screen can never drift out of sync with what Cash Flow, Investments, and Debt each
+ *  independently show. Also renders the historical trend: one point per month from
+ *  the earliest data across every source (balanceHistory, holdingSnapshots,
+ *  otherInvestments) through today, each resolved via computeNetWorthAsOfDate at that
+ *  month's end date (or today, for the still-in-progress current month). Clicking any
+ *  asset/liability row navigates to the pillar screen that owns that figure. */
 function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSchedules, onGoToView }) {
   const summary = useMemo(
     () => computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules),
@@ -8785,6 +10593,37 @@ function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSc
   );
 
   const hasAnyData = summary.totalAssets > 0 || summary.totalLiabilities > 0;
+
+  // Monthly trend — earliest data point across every source, then one point per month
+  // using the month's end date as the cutoff (or today, for the current month, since it
+  // hasn't ended yet). Debt uses computeDebtSummary's own point-in-time support directly.
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const trendMonths = useMemo(() => {
+    const allDates = [];
+    accounts.forEach((a) => { (a.balanceHistory || []).forEach((h) => allDates.push(h.asOfDate || h.date)); });
+    holdingSnapshots.forEach((s) => allDates.push(s.asOfDate));
+    otherInvestments.forEach((e) => allDates.push(e.asOfDate));
+    if (allDates.length === 0) return [];
+    const earliestDate = allDates.sort()[0];
+    let [y, m] = earliestDate.slice(0, 7).split("-").map(Number);
+    const [endY, endM] = todayStr.slice(0, 7).split("-").map(Number);
+    const months = [];
+    while (y < endY || (y === endY && m <= endM)) {
+      months.push(`${y}-${String(m).padStart(2, "0")}`);
+      m++;
+      if (m > 12) { m = 1; y++; }
+    }
+    return months;
+  }, [accounts, holdingSnapshots, otherInvestments, todayStr]);
+
+  const trendData = useMemo(() => trendMonths.map((mk) => {
+    const [y, m] = mk.split("-").map(Number);
+    const lastDay = new Date(y, m, 0).getDate();
+    const monthEnd = `${y}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+    const cutoff = monthEnd > todayStr ? todayStr : monthEnd;
+    const asOf = computeNetWorthAsOfDate(accounts, holdingSnapshots, otherInvestments, debtSchedules, cutoff);
+    return { month: monthLabel(mk), netWorth: asOf.netWorth };
+  }), [trendMonths, accounts, holdingSnapshots, otherInvestments, debtSchedules, todayStr]);
 
   if (!hasAnyData) {
     return (
@@ -8867,6 +10706,26 @@ function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSc
         </div>
       </div>
 
+      {trendData.length > 1 && (
+        <>
+          <div className="bw-section-label">Net worth over time</div>
+          <p style={{ fontSize: 11, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+            One point per month, using whatever was known as of that month's end. An account contributes nothing
+            to a month before its first import — so early months can understate net worth if an account existed
+            before it was ever added here.
+          </p>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={trendData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+              <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+              <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `${(v / 100000).toFixed(0)}L`} />
+              <Tooltip formatter={(v) => inr(v)} />
+              <Line type="monotone" dataKey="netWorth" name="Net Worth" stroke="var(--teal)" strokeWidth={2} dot={{ r: 3 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </>
+      )}
+
       <p style={{ fontSize: 11, color: "var(--ink-soft)", marginTop: 20 }}>
         Click any row to go to the screen that manages it — nothing on this page is editable directly, since
         Net Worth only ever reflects what your other screens already say.
@@ -8882,8 +10741,18 @@ function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSc
 /* read time" philosophy as Investments and Goals.                         */
 /* ---------------------------------------------------------------------- */
 
+/** The Debt pillar screen - both loans and credit cards, each resolved through a
+ *  deliberately different path: loans via computeDebtSummary (fully schedule-derived
+ *  - principal/interest split, next EMI, loan completion), credit cards via plain
+ *  lastKnownBalance (no amortization schedule exists for a card, so there's nothing
+ *  to derive from). Total outstanding combines both; Principal/Interest paid to date
+ *  stay honestly loan-only, since a card has no equivalent breakdown to fold in. Loan
+ *  cards show full schedule-derived detail (payoff progress bar, restructure history
+ *  via multiple schedules, continuity-gap warnings); a card gets a simpler card with
+ *  just its current outstanding. */
 function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
   const debtAccounts = useMemo(() => accounts.filter((a) => a.type === "debt"), [accounts]);
+  const ccAccounts = useMemo(() => accounts.filter((a) => a.type === "creditCard"), [accounts]);
   const todayStr = new Date().toISOString().slice(0, 10);
 
   const accountSummaries = useMemo(() => {
@@ -8898,16 +10767,27 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
     }).filter(Boolean);
   }, [debtAccounts, debtSchedules, todayStr]);
 
-  const totalOutstanding = accountSummaries.reduce((s, a) => s + a.summary.currentOutstanding, 0);
+  // Credit cards resolve outstanding from lastKnownBalance directly - no amortization
+  // schedule exists for a card, so this is deliberately a separate, lighter path
+  // rather than forcing CC through computeDebtSummary's schedule-derived fields.
+  const ccSummaries = useMemo(() => {
+    return ccAccounts
+      .filter((a) => a.lastKnownBalance !== null && a.lastKnownBalance !== undefined)
+      .map((a) => ({ account: a, outstanding: a.lastKnownBalance }));
+  }, [ccAccounts]);
+
+  const loanOutstanding = accountSummaries.reduce((s, a) => s + a.summary.currentOutstanding, 0);
+  const ccOutstanding = ccSummaries.reduce((s, a) => s + a.outstanding, 0);
+  const totalOutstanding = loanOutstanding + ccOutstanding;
   const totalPrincipalPaid = accountSummaries.reduce((s, a) => s + a.summary.cumulativePrincipalPaid, 0);
   const totalInterestPaid = accountSummaries.reduce((s, a) => s + a.summary.cumulativeInterestPaid, 0);
 
-  if (debtAccounts.length === 0 || accountSummaries.length === 0) {
+  if (accountSummaries.length === 0 && ccSummaries.length === 0) {
     return (
       <div className="bw-empty">
-        No loan schedules imported yet.{" "}
+        No debt imported yet.{" "}
         <button className="bw-btn small" style={{ marginLeft: 8 }} onClick={onGoToUpload}>
-          <Upload size={12} /> Import a loan schedule
+          <Upload size={12} /> Import a loan schedule or credit card statement
         </button>
       </div>
     );
@@ -8919,9 +10799,10 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
 
       <div className="bw-waterfall-card" style={{ marginBottom: 22 }}>
         <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
-          <HeroStat label="Total outstanding" value={totalOutstanding} color="var(--rust)" />
-          <HeroStat label="Principal paid to date" value={totalPrincipalPaid} color="var(--teal)" />
-          <HeroStat label="Interest paid to date" value={totalInterestPaid} color="var(--ink)" />
+          <HeroStat label="Total outstanding" value={totalOutstanding} color="var(--rust)"
+            hint={ccOutstanding > 0 ? `${inr(loanOutstanding)} loans + ${inr(ccOutstanding)} credit cards` : null} />
+          <HeroStat label="Principal paid to date" value={totalPrincipalPaid} color="var(--teal)" hint="Loans only" />
+          <HeroStat label="Interest paid to date" value={totalInterestPaid} color="var(--ink)" hint="Loans only" />
         </div>
       </div>
 
@@ -8972,12 +10853,602 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
             </div>
           );
         })}
+        {ccSummaries.map(({ account, outstanding }) => (
+          <div key={account.id} style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 16, background: "var(--card)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600 }}>{account.nickname}</div>
+                <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>Credit card · {account.institution}</div>
+              </div>
+              <span className="bw-pill" style={{ background: "var(--slate)" }}>Credit card</span>
+            </div>
+            <Stat label="Current outstanding" value={inr(outstanding)} color="var(--rust)" />
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInvestments, setOtherInvestments, onGoToUpload }) {
+/* ---------------------------------------------------------------------- */
+/* Debt Control — reconciliation, not display. Split into two tabs since  */
+/* loan and CC outstanding resolve via genuinely different paths          */
+/* (schedule-derived vs lastKnownBalance) - forcing one table to cover    */
+/* both would blur two different kinds of check into one misleading one.  */
+/* ---------------------------------------------------------------------- */
+
+/** Debt Control (not to be confused with the Debt pillar screen, DebtOverview, which
+ *  owns the actual outstanding-balance figures) - reconciliation only, split into two
+ *  tabs since loan and CC resolve through genuinely different paths:
+ *   - Classic Debt: EMI genuinely checks against the amortization schedule for the
+ *     selected period (schedule resolution uses most-recently-imported-wins for any
+ *     period more than one uploaded schedule covers - the rule for handling a
+ *     revised schedule after a prepayment). Disbursement and Lumpsum Payment have no
+ *     schedule-side counterpart, shown for visibility only, not as a two-sided match.
+ *   - Credit Card: bank-side payments vs. card-side statement totals, per card.
+ *  Both tabs share one merged table per account/card with an explicit Diff column
+ *  and a Total row (rather than separate hero-stat cards plus a separate breakdown
+ *  table), and an account filter that narrows both the table and the transaction
+ *  list below it. */
+function DebtControlView({ transactions, accounts, debtSchedules }) {
+  const [subTab, setSubTab] = useState("classic"); // classic | creditCard
+  const [period, setPeriod] = useState("all");
+  const [accountFilter, setAccountFilter] = useState("all");
+
+  const debtAccounts = useMemo(() => accounts.filter((a) => a.type === "debt"), [accounts]);
+  const ccAccounts = useMemo(() => accounts.filter((a) => a.type === "creditCard"), [accounts]);
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const bankAccountIds = useMemo(() => new Set(bankAccounts.map((a) => a.id)), [bankAccounts]);
+
+  const months = useMemo(() => {
+    const s = new Set(transactions.filter((t) => t.category === "Transfer").map((t) => t.date.slice(0, 7)));
+    return [...s].sort().reverse();
+  }, [transactions]);
+
+  // Reset the account filter when switching tabs, since Classic Debt and Credit Card
+  // filter against entirely different account sets.
+  function switchTab(tab) { setSubTab(tab); setAccountFilter("all"); }
+
+  /* ---- Classic Debt tab: bank-side Debt-EMI/Disbursement/Lumpsum vs. schedule-side ---- */
+  const classicRows = useMemo(() => {
+    return transactions
+      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId)
+        && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(t.subCategory))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
+      .map((t) => ({
+        id: t.id, date: t.date, description: t.description, type: t.subCategory,
+        accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
+        amount: t.direction === "credit" ? t.amount : -t.amount,
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  }, [transactions, bankAccountIds, period, accountFilter]);
+
+  // Resolve each loan's schedule entries by period, with the most-recently-imported
+  // schedule winning for any period more than one uploaded schedule covers - the
+  // resolution rule confirmed for handling a revised schedule after a prepayment.
+  const scheduleByAccountPeriod = useMemo(() => {
+    const byAccount = {};
+    debtAccounts.forEach((acct) => {
+      const schedules = debtSchedules.filter((s) => s.accountId === acct.id);
+      const periodMap = {};
+      schedules.forEach((s) => {
+        (s.entries || []).forEach((e) => {
+          const existing = periodMap[e.period];
+          if (!existing || (s.importedAt || 0) > existing.importedAt) {
+            periodMap[e.period] = { emi: e.emi, importedAt: s.importedAt || 0 };
+          }
+        });
+      });
+      byAccount[acct.id] = periodMap;
+    });
+    return byAccount;
+  }, [debtAccounts, debtSchedules]);
+
+  function scheduleEmiFor(accountId) {
+    const periodMap = scheduleByAccountPeriod[accountId] || {};
+    return Object.entries(periodMap).reduce((s, [p, entry]) => (period === "all" || p === period ? s + entry.emi : s), 0);
+  }
+
+  /* ---- One merged table: per-loan bank EMI/schedule EMI/diff, plus Disbursement and
+     Lumpsum shown informationally (no schedule-side counterpart), plus a Total row. ---- */
+  const classicByAccount = useMemo(() => {
+    const bankGroups = {};
+    transactions
+      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId) && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(t.subCategory))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .forEach((t) => {
+        const key = t.linkedAccountId || "unlinked";
+        if (!bankGroups[key]) bankGroups[key] = { emiBank: 0, disbursement: 0, lumpsum: 0 };
+        const amount = t.direction === "credit" ? t.amount : -t.amount;
+        if (t.subCategory === "Debt-EMI") bankGroups[key].emiBank += Math.abs(amount);
+        if (t.subCategory === "Debt-Disbursement") bankGroups[key].disbursement += amount;
+        if (t.subCategory === "Debt-Lumpsum Payment") bankGroups[key].lumpsum += Math.abs(amount);
+      });
+    const allKeys = new Set([...Object.keys(bankGroups), ...debtAccounts.map((a) => a.id)]);
+    return [...allKeys]
+      .filter((key) => accountFilter === "all" || key === accountFilter)
+      .map((key) => {
+        const emiBank = bankGroups[key]?.emiBank || 0;
+        const emiSchedule = key === "unlinked" ? 0 : scheduleEmiFor(key);
+        return {
+          accountId: key,
+          accountName: key === "unlinked" ? "Not yet linked to an account" : (debtAccounts.find((a) => a.id === key)?.nickname || "—"),
+          emiBank, emiSchedule, emiDiff: emiBank - emiSchedule,
+          disbursement: bankGroups[key]?.disbursement || 0,
+          lumpsum: bankGroups[key]?.lumpsum || 0,
+        };
+      }).filter((r) => r.emiBank > 0 || r.emiSchedule > 0 || r.disbursement !== 0 || r.lumpsum > 0);
+  }, [transactions, bankAccountIds, period, accountFilter, debtAccounts, scheduleByAccountPeriod]);
+
+  const classicTotals = classicByAccount.reduce((s, r) => ({
+    emiBank: s.emiBank + r.emiBank, emiSchedule: s.emiSchedule + r.emiSchedule, emiDiff: s.emiDiff + r.emiDiff,
+    disbursement: s.disbursement + r.disbursement, lumpsum: s.lumpsum + r.lumpsum,
+  }), { emiBank: 0, emiSchedule: 0, emiDiff: 0, disbursement: 0, lumpsum: 0 });
+
+  const classicAccountFilterOptions = [...debtAccounts.map((a) => ({ id: a.id, name: a.nickname })), { id: "unlinked", name: "Not yet linked" }];
+
+  /* ---- Credit Card tab: bank payments vs. card statements — the same grid that used
+     to live in Transfers Control, moved here with a per-card merged table added ---- */
+  const ccCombinedRows = useMemo(() => {
+    const bankRows = transactions
+      .filter((t) => t.category === "Transfer" && t.subCategory === "Credit card payment" && bankAccountIds.has(t.accountId))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
+      .map((t) => ({
+        kind: "bankPayment", id: t.id, date: t.date, description: t.description,
+        accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
+        amount: t.direction === "credit" ? t.amount : -t.amount,
+      }));
+
+    const statementRows = [];
+    ccAccounts.forEach((a) => {
+      if (accountFilter !== "all" && a.id !== accountFilter) return;
+      (a.uploadHistory || []).forEach((h) => {
+        const rowDate = h.statementDate || h.periodEnd;
+        if (!rowDate) return;
+        if (period !== "all" && rowDate.slice(0, 7) !== period) return;
+        const totalExpense = transactions
+          .filter((t) => t.importBatchId === h.batchId && t.category === "Expense")
+          .reduce((s, t) => s + (t.direction === "credit" ? -t.amount : t.amount), 0);
+        statementRows.push({
+          kind: "cardStatement", id: h.batchId, date: rowDate,
+          description: `${h.periodStart} – ${h.periodEnd}`,
+          accountId: a.id, amount: totalExpense,
+        });
+      });
+    });
+
+    return [...bankRows, ...statementRows].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  }, [transactions, bankAccountIds, ccAccounts, period, accountFilter]);
+
+  /* ---- One merged table: per-card payments/statements/diff, plus a Total row.
+     Payments are grouped by linkedAccountId (bank side, may include "unlinked");
+     statements are inherently tied to their own card account directly. ---- */
+  const ccByAccount = useMemo(() => {
+    const paymentGroups = {};
+    transactions
+      .filter((t) => t.category === "Transfer" && t.subCategory === "Credit card payment" && bankAccountIds.has(t.accountId))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .forEach((t) => {
+        const key = t.linkedAccountId || "unlinked";
+        paymentGroups[key] = (paymentGroups[key] || 0) + Math.abs(t.direction === "credit" ? t.amount : -t.amount);
+      });
+    const statementGroups = {};
+    ccAccounts.forEach((a) => {
+      (a.uploadHistory || []).forEach((h) => {
+        const rowDate = h.statementDate || h.periodEnd;
+        if (!rowDate) return;
+        if (period !== "all" && rowDate.slice(0, 7) !== period) return;
+        const totalExpense = transactions
+          .filter((t) => t.importBatchId === h.batchId && t.category === "Expense")
+          .reduce((s, t) => s + Math.abs(t.direction === "credit" ? -t.amount : t.amount), 0);
+        statementGroups[a.id] = (statementGroups[a.id] || 0) + totalExpense;
+      });
+    });
+    const allKeys = new Set([...Object.keys(paymentGroups), ...Object.keys(statementGroups), ...ccAccounts.map((a) => a.id)]);
+    return [...allKeys]
+      .filter((key) => accountFilter === "all" || key === accountFilter)
+      .map((key) => {
+        const payment = paymentGroups[key] || 0;
+        const statement = statementGroups[key] || 0;
+        return {
+          accountId: key,
+          accountName: key === "unlinked" ? "Not yet linked to a card" : (ccAccounts.find((a) => a.id === key)?.nickname || "—"),
+          payment, statement, diff: payment - statement,
+        };
+      }).filter((r) => r.payment > 0 || r.statement > 0);
+  }, [transactions, bankAccountIds, ccAccounts, period, accountFilter]);
+
+  const ccTotals = ccByAccount.reduce((s, r) => ({ payment: s.payment + r.payment, statement: s.statement + r.statement, diff: s.diff + r.diff }), { payment: 0, statement: 0, diff: 0 });
+  const ccAccountFilterOptions = [...ccAccounts.map((a) => ({ id: a.id, name: a.nickname })), { id: "unlinked", name: "Not yet linked" }];
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+        <div className="bw-tabs" style={{ marginBottom: 0 }}>
+          <button className={`bw-tab ${subTab === "classic" ? "active" : ""}`} onClick={() => switchTab("classic")}>Classic Debt</button>
+          <button className={`bw-tab ${subTab === "creditCard" ? "active" : ""}`} onClick={() => switchTab("creditCard")}>Credit Card</button>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <select className="bw-select-inline" value={period} onChange={(e) => setPeriod(e.target.value)}>
+            <option value="all">All time</option>
+            {months.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+          </select>
+          <select className="bw-select-inline" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+            <option value="all">{subTab === "classic" ? "All accounts" : "All cards"}</option>
+            {(subTab === "classic" ? classicAccountFilterOptions : ccAccountFilterOptions).map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {subTab === "classic" ? (
+        <div>
+          <p className="bw-lead">
+            EMI genuinely checks against the amortization schedule for this period. Disbursement and Lumpsum
+            Payment have no schedule-side counterpart to reconcile against — shown here for visibility, not
+            as a two-sided match, since a prepayment is expected to trigger a fresh schedule upload instead.
+          </p>
+
+          {classicByAccount.length === 0 ? (
+            <div className="bw-empty">No Debt-EMI, Debt-Disbursement, or Debt-Lumpsum Payment transactions yet for this period.</div>
+          ) : (
+            <div style={{ overflowX: "auto", marginBottom: 22 }}>
+              <table className="bw-table">
+                <thead>
+                  <tr>
+                    <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Account</th>
+                    <th colSpan={3} style={{ textAlign: "center" }}>EMI</th>
+                    <th rowSpan={2} style={{ textAlign: "right", verticalAlign: "bottom" }}>Disbursement</th>
+                    <th rowSpan={2} style={{ textAlign: "right", verticalAlign: "bottom" }}>Lumpsum</th>
+                  </tr>
+                  <tr>
+                    <th style={{ textAlign: "right" }}>Bank</th><th style={{ textAlign: "right" }}>Schedule</th><th style={{ textAlign: "right" }}>Diff</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {classicByAccount.map((r) => (
+                    <tr key={r.accountId}>
+                      <td>{r.accountName}</td>
+                      <td style={{ textAlign: "right" }}>{inr(r.emiBank)}</td>
+                      <td style={{ textAlign: "right" }}>{inr(r.emiSchedule)}</td>
+                      <td style={{ textAlign: "right", color: Math.abs(r.emiDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(r.emiDiff)}</td>
+                      <td style={{ textAlign: "right" }}>{inr(r.disbursement)}</td>
+                      <td style={{ textAlign: "right" }}>{inr(r.lumpsum)}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ borderTop: "2px solid var(--ink)" }}>
+                    <td style={{ fontWeight: 600 }}>Total</td>
+                    <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(classicTotals.emiBank)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(classicTotals.emiSchedule)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700, color: Math.abs(classicTotals.emiDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(classicTotals.emiDiff)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(classicTotals.disbursement)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(classicTotals.lumpsum)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Transactions</div>
+          {classicRows.length === 0 ? (
+            <div className="bw-empty">Nothing to show for this period.</div>
+          ) : (
+            <table className="bw-table">
+              <thead><tr><th>Date</th><th>Description</th><th>Type</th><th style={{ textAlign: "right" }}>Amount</th></tr></thead>
+              <tbody>
+                {classicRows.map((r) => (
+                  <tr key={r.id}>
+                    <td style={{ whiteSpace: "nowrap", fontSize: 11.5, color: "var(--ink-soft)" }}>{r.date}</td>
+                    <td>{r.description}</td>
+                    <td><span className="bw-pill" style={{ background: "var(--slate)", fontSize: 10 }}>{r.type}</span></td>
+                    <td className={`bw-amt ${r.amount >= 0 ? "credit" : "debit"}`}>{r.amount >= 0 ? "+" : "−"}{inr(Math.abs(r.amount))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ) : (
+        <div>
+          <p className="bw-lead">
+            A payment leaving a bank account and the card statement it settles will land near each other by date. A
+            payment with nothing nearby is your cue to upload that card's statement — no need to be told. Won't
+            always exactly match — timing between payment and statement dates can span a period boundary.
+          </p>
+
+          {ccByAccount.length === 0 ? (
+            <div className="bw-empty">No credit card payments or statements yet for this period.</div>
+          ) : (
+            <table className="bw-table" style={{ marginBottom: 22 }}>
+              <thead><tr><th>Card</th><th style={{ textAlign: "right" }}>Payments (bank)</th><th style={{ textAlign: "right" }}>Statements (card)</th><th style={{ textAlign: "right" }}>Diff</th></tr></thead>
+              <tbody>
+                {ccByAccount.map((r) => (
+                  <tr key={r.accountId}>
+                    <td>{r.accountName}</td>
+                    <td style={{ textAlign: "right" }}>{inr(r.payment)}</td>
+                    <td style={{ textAlign: "right" }}>{inr(r.statement)}</td>
+                    <td style={{ textAlign: "right", color: Math.abs(r.diff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(r.diff)}</td>
+                  </tr>
+                ))}
+                <tr style={{ borderTop: "2px solid var(--ink)" }}>
+                  <td style={{ fontWeight: 600 }}>Total</td>
+                  <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(ccTotals.payment)}</td>
+                  <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(ccTotals.statement)}</td>
+                  <td style={{ textAlign: "right", fontWeight: 700, color: Math.abs(ccTotals.diff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(ccTotals.diff)}</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Payments &amp; statements</div>
+          {(bankAccounts.length === 0 && ccAccounts.length === 0) || ccCombinedRows.length === 0 ? (
+            <div className="bw-empty">No credit card payments or statements yet for this period.</div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table className="bw-table">
+                <thead>
+                  <tr>
+                    <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Date</th>
+                    <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Description</th>
+                    <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Type</th>
+                    {bankAccounts.length > 0 && <th colSpan={bankAccounts.length} style={{ textAlign: "center" }}>Bank Payment</th>}
+                    {ccAccounts.length > 0 && <th colSpan={ccAccounts.length} style={{ textAlign: "center" }}>Expense Statement</th>}
+                  </tr>
+                  <tr>
+                    {bankAccounts.map((a) => <th key={a.id} style={{ textAlign: "right" }}>{a.nickname}</th>)}
+                    {ccAccounts.map((a) => <th key={a.id} style={{ textAlign: "right" }}>{a.nickname}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {ccCombinedRows.map((r) => (
+                    <tr key={r.id}>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 11.5, color: "var(--ink-soft)" }}>{r.date}</td>
+                      <td>{r.description}</td>
+                      <td>
+                        <span className="bw-pill" style={{ background: r.kind === "bankPayment" ? "var(--slate)" : "var(--ochre)", fontSize: 10 }}>
+                          {r.kind === "bankPayment" ? "Payment" : "Statement"}
+                        </span>
+                      </td>
+                      {bankAccounts.map((a) => (
+                        <td key={a.id} className={r.kind === "bankPayment" && a.id === r.accountId ? "bw-amt debit" : undefined} style={{ textAlign: "right" }}>
+                          {r.kind === "bankPayment" && a.id === r.accountId ? `−${inr(Math.abs(r.amount))}` : ""}
+                        </td>
+                      ))}
+                      {ccAccounts.map((a) => (
+                        <td key={a.id} className={r.kind === "cardStatement" && a.id === r.accountId ? "bw-amt debit" : undefined} style={{ textAlign: "right" }}>
+                          {r.kind === "cardStatement" && a.id === r.accountId ? inr(Math.abs(r.amount)) : ""}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Investments Control — bank-side SIP/Lumpsum/Redemption vs. holding-     */
+/* snapshot-derived Added/Redeemed. Two independent zero-checks, not one   */
+/* netted figure — additions and redemptions could otherwise offset each   */
+/* other and look reconciled when they aren't.                             */
+/* NOTE: derived side currently covers demat/mutualFund accounts only,     */
+/* since those are the ones tracked via holdingSnapshots + snapshot        */
+/* diffing. otherInvestment accounts don't use this same snapshot          */
+/* structure, so they're not yet part of the derived-side comparison here  */
+/* — an honest, explicit gap rather than a forced, incorrect fit.          */
+/* ---------------------------------------------------------------------- */
+
+/** Investments Control - reconciliation only (the actual holding values live on the
+ *  Investments pillar screen, InvestmentsOverview). Bank-side SIP/Lumpsum/Redemption
+ *  transactions checked against two independently-derived figures from holding
+ *  snapshots - Added and Redeemed, never netted into one number, since a large
+ *  addition and a large redemption in the same period could otherwise offset and
+ *  look falsely reconciled. Snapshot diffing (derivedByAccount) deliberately starts
+ *  from the SECOND snapshot for each account, not the first - the very first
+ *  snapshot has no prior to compare against, so treating its whole opening balance
+ *  as a fresh "addition" would count years of pre-app investment history as current-
+ *  period activity (the exact bug this was built to fix). Derived side currently
+ *  covers demat/mutualFund accounts only; otherInvestment isn't included, since it
+ *  doesn't share this same snapshot structure. One merged table per account with
+ *  Addition/Redemption Diff columns and a Total row, plus an account filter. */
+function InvestmentsControlView({ transactions, accounts, holdingSnapshots }) {
+  const [period, setPeriod] = useState("all");
+  const [accountFilter, setAccountFilter] = useState("all");
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const bankAccountIds = useMemo(() => new Set(bankAccounts.map((a) => a.id)), [bankAccounts]);
+  const investmentAccounts = useMemo(() => accounts.filter((a) => a.type === "demat" || a.type === "mutualFund"), [accounts]);
+
+  const months = useMemo(() => {
+    const s = new Set(transactions.filter((t) => t.category === "Investment").map((t) => t.date.slice(0, 7)));
+    return [...s].sort().reverse();
+  }, [transactions]);
+
+  /* ---- Bank side: individual SIP/Lumpsum/Redemption transactions ---- */
+  const bankRows = useMemo(() => {
+    return transactions
+      .filter((t) => t.category === "Investment" && bankAccountIds.has(t.accountId)
+        && ["SIP", "Lumpsum", "Redemption"].includes(t.subCategory))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
+      .map((t) => ({
+        id: t.id, date: t.date, description: t.description, type: t.subCategory,
+        accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
+        amount: t.direction === "credit" ? t.amount : -t.amount,
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  }, [transactions, bankAccountIds, period, accountFilter]);
+
+  /* ---- Derived side: per-account snapshot transitions, one per consecutive pair.
+     Deliberately starts from the SECOND snapshot (i=1), not the first - the very first
+     snapshot has no prior to compare against, so computeSnapshotTransition(null, first)
+     treats its entire opening balance as a fresh "addition." That's correct for other
+     uses of this function, but wrong here: an opening balance built up over years before
+     this app ever existed isn't a real, bank-comparable addition event, and counting it
+     as one is exactly what inflated Additions to crores against a few lakh on the bank
+     side. Only a transition between two confirmed snapshots represents something a real
+     bank transaction could actually be checked against.
+     A transition "belongs" to the month of its ending (curr) snapshot - that's when
+     the change it represents became confirmed. Summed per account, then filtered to
+     the selected period (or all transitions, for "all time"). ---- */
+  const derivedByAccount = useMemo(() => {
+    const result = {};
+    investmentAccounts.forEach((acct) => {
+      const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id).sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+      let added = 0, redeemed = 0;
+      for (let i = 1; i < snaps.length; i++) {
+        const curr = snaps[i];
+        if (period !== "all" && curr.asOfDate.slice(0, 7) !== period) continue;
+        const prev = snaps[i - 1];
+        const transition = computeSnapshotTransition(prev, curr);
+        added += transition.added;
+        redeemed += Math.abs(transition.redeemed);
+      }
+      result[acct.id] = { added, redeemed };
+    });
+    return result;
+  }, [investmentAccounts, holdingSnapshots, period]);
+
+  /* ---- One merged table: per-account bank/holdings/difference, plus a Total row.
+     Replaces separate hero cards and a separate by-account table - the difference is
+     visible exactly where it lives (per account), not just as one overall figure. ---- */
+  const byAccount = useMemo(() => {
+    const bankGroups = {};
+    transactions
+      .filter((t) => t.category === "Investment" && bankAccountIds.has(t.accountId) && ["SIP", "Lumpsum", "Redemption"].includes(t.subCategory))
+      .filter((t) => period === "all" || t.date.slice(0, 7) === period)
+      .forEach((t) => {
+        const key = t.linkedAccountId || "unlinked";
+        if (!bankGroups[key]) bankGroups[key] = { added: 0, redeemed: 0 };
+        const amount = Math.abs(t.direction === "credit" ? t.amount : -t.amount);
+        if (t.subCategory === "SIP" || t.subCategory === "Lumpsum") bankGroups[key].added += amount;
+        if (t.subCategory === "Redemption") bankGroups[key].redeemed += amount;
+      });
+    const allKeys = new Set([...Object.keys(bankGroups), ...investmentAccounts.map((a) => a.id)]);
+    return [...allKeys]
+      .filter((key) => accountFilter === "all" || key === accountFilter)
+      .map((key) => {
+        const account = investmentAccounts.find((a) => a.id === key);
+        const bankAdded = bankGroups[key]?.added || 0;
+        const bankRedeemed = bankGroups[key]?.redeemed || 0;
+        const derivedAdded = derivedByAccount[key]?.added || 0;
+        const derivedRedeemed = derivedByAccount[key]?.redeemed || 0;
+        return {
+          accountId: key,
+          accountName: key === "unlinked" ? "Not yet linked to an account" : (account?.nickname || "—"),
+          bankAdded, derivedAdded, additionDiff: bankAdded - derivedAdded,
+          bankRedeemed, derivedRedeemed, redemptionDiff: bankRedeemed - derivedRedeemed,
+        };
+      }).filter((r) => r.bankAdded > 0 || r.bankRedeemed > 0 || r.derivedAdded > 0 || r.derivedRedeemed > 0);
+  }, [transactions, bankAccountIds, period, accountFilter, investmentAccounts, derivedByAccount]);
+
+  const totals = byAccount.reduce((s, r) => ({
+    bankAdded: s.bankAdded + r.bankAdded, derivedAdded: s.derivedAdded + r.derivedAdded, additionDiff: s.additionDiff + r.additionDiff,
+    bankRedeemed: s.bankRedeemed + r.bankRedeemed, derivedRedeemed: s.derivedRedeemed + r.derivedRedeemed, redemptionDiff: s.redemptionDiff + r.redemptionDiff,
+  }), { bankAdded: 0, derivedAdded: 0, additionDiff: 0, bankRedeemed: 0, derivedRedeemed: 0, redemptionDiff: 0 });
+
+  const accountFilterOptions = [...investmentAccounts.map((a) => ({ id: a.id, name: a.nickname })), { id: "unlinked", name: "Not yet linked" }];
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+        <p className="bw-lead" style={{ margin: 0, flex: 1, minWidth: 240 }}>
+          Additions and redemptions are checked separately, not netted — one large addition and one large
+          redemption in the same period could otherwise offset and look reconciled when they aren't.
+        </p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <select className="bw-select-inline" value={period} onChange={(e) => setPeriod(e.target.value)}>
+            <option value="all">All time</option>
+            {months.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+          </select>
+          <select className="bw-select-inline" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+            <option value="all">All accounts</option>
+            {accountFilterOptions.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {byAccount.length === 0 ? (
+        <div className="bw-empty">Nothing to show for this period.</div>
+      ) : (
+        <div style={{ overflowX: "auto", marginBottom: 22 }}>
+          <table className="bw-table">
+            <thead>
+              <tr>
+                <th rowSpan={2} style={{ verticalAlign: "bottom" }}>Account</th>
+                <th colSpan={3} style={{ textAlign: "center" }}>Additions</th>
+                <th colSpan={3} style={{ textAlign: "center" }}>Redemptions</th>
+              </tr>
+              <tr>
+                <th style={{ textAlign: "right" }}>Bank</th><th style={{ textAlign: "right" }}>Holdings</th><th style={{ textAlign: "right" }}>Diff</th>
+                <th style={{ textAlign: "right" }}>Bank</th><th style={{ textAlign: "right" }}>Holdings</th><th style={{ textAlign: "right" }}>Diff</th>
+              </tr>
+            </thead>
+            <tbody>
+              {byAccount.map((r) => (
+                <tr key={r.accountId}>
+                  <td>{r.accountName}</td>
+                  <td style={{ textAlign: "right" }}>{inr(r.bankAdded)}</td>
+                  <td style={{ textAlign: "right" }}>{inr(r.derivedAdded)}</td>
+                  <td style={{ textAlign: "right", color: Math.abs(r.additionDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(r.additionDiff)}</td>
+                  <td style={{ textAlign: "right" }}>{inr(r.bankRedeemed)}</td>
+                  <td style={{ textAlign: "right" }}>{inr(r.derivedRedeemed)}</td>
+                  <td style={{ textAlign: "right", color: Math.abs(r.redemptionDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(r.redemptionDiff)}</td>
+                </tr>
+              ))}
+              <tr style={{ borderTop: "2px solid var(--ink)" }}>
+                <td style={{ fontWeight: 600 }}>Total</td>
+                <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(totals.bankAdded)}</td>
+                <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(totals.derivedAdded)}</td>
+                <td style={{ textAlign: "right", fontWeight: 700, color: Math.abs(totals.additionDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(totals.additionDiff)}</td>
+                <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(totals.bankRedeemed)}</td>
+                <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(totals.derivedRedeemed)}</td>
+                <td style={{ textAlign: "right", fontWeight: 700, color: Math.abs(totals.redemptionDiff) < 1 ? "var(--teal)" : "var(--rust)" }}>{inr(totals.redemptionDiff)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Bank-side transactions</div>
+      {bankRows.length === 0 ? (
+        <div className="bw-empty">No SIP, Lumpsum, or Redemption transactions yet for this period.</div>
+      ) : (
+        <table className="bw-table">
+          <thead><tr><th>Date</th><th>Description</th><th>Type</th><th style={{ textAlign: "right" }}>Amount</th></tr></thead>
+          <tbody>
+            {bankRows.map((r) => (
+              <tr key={r.id}>
+                <td style={{ whiteSpace: "nowrap", fontSize: 11.5, color: "var(--ink-soft)" }}>{r.date}</td>
+                <td>{r.description}</td>
+                <td><span className="bw-pill" style={{ background: "var(--slate)", fontSize: 10 }}>{r.type}</span></td>
+                <td className={`bw-amt ${r.amount >= 0 ? "credit" : "debit"}`}>{r.amount >= 0 ? "+" : "−"}{inr(Math.abs(r.amount))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/** The Investments pillar screen, two sub-sections:
+ *   - Market-tracked (equity/demat and mutual fund accounts): an Opening → Added →
+ *     Redeemed → Closing → Growth waterfall, summed across every account's own
+ *     latest snapshot transition (computeSnapshotTransition against each account's
+ *     own previous snapshot - never fabricating a comparison point for an account
+ *     with only one snapshot so far). "vs last snapshot" and "Last updated" reuse
+ *     these same already-computed transitions rather than a separate calculation.
+ *   - Other Investments (OtherInvestmentsPanel): PF, Gold, Property, and similar
+ *     holdings that don't come from a holdings-statement-style import. */
+function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInvestments, setOtherInvestments, onGoToUpload, effectiveTier, showToast }) {
   const [activeSection, setActiveSection] = useState("market"); // market | statement | manual
   const [apiKey, setApiKeyLocal] = useState("");
   useEffect(() => { (async () => { setApiKeyLocal(await loadState("geminiApiKey", "")); })(); }, []);
@@ -8989,7 +11460,15 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
       if (snaps.length === 0) return null;
       const curr = snaps[snaps.length - 1];
       const prev = snaps.length > 1 ? snaps[snaps.length - 2] : null;
-      return { account: acct, snapshotCount: snaps.length, latest: curr, previous: prev, transition: computeSnapshotTransition(prev, curr) };
+      const rawTransition = computeSnapshotTransition(prev, curr);
+      // When there's no prior snapshot at all, computeSnapshotTransition has nothing to
+      // compare against and treats the entire opening balance as a fresh "addition" -
+      // correct in isolation, but wrong here: a balance built up before this app ever
+      // tracked the account isn't a real, current-period addition. null (not 0) for
+      // added/redeemed in this case - the same way Opening already shows "-" rather
+      // than 0 when there's no prior point - "no data" is not "no change."
+      const transition = prev ? rawTransition : { ...rawTransition, added: null, redeemed: null };
+      return { account: acct, snapshotCount: snaps.length, latest: curr, previous: prev, transition };
     }).filter(Boolean);
   }, [investmentAccounts, holdingSnapshots]);
 
@@ -8999,8 +11478,8 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
   function sumTransitions(list) {
     const sums = list.reduce((acc, t) => ({
       openingInvested: acc.openingInvested + (t.transition.openingInvested || 0),
-      added: acc.added + t.transition.added,
-      redeemed: acc.redeemed + t.transition.redeemed,
+      added: acc.added + (t.transition.added || 0),
+      redeemed: acc.redeemed + (t.transition.redeemed || 0),
       closingInvested: acc.closingInvested + (t.transition.closingInvested || 0),
       closingCurrentValue: acc.closingCurrentValue + (t.transition.closingCurrentValue || 0),
     }), { openingInvested: 0, added: 0, redeemed: 0, closingInvested: 0, closingCurrentValue: 0 });
@@ -9010,6 +11489,17 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
 
   const combined = sumTransitions(accountTransitions);
   const simpleReturnPct = combined.closingInvested > 0 ? (combined.growth / combined.closingInvested) * 100 : null;
+
+  // "vs last snapshot" — reuses each account's own previous transition (already computed
+  // above), never fabricating a comparison point for an account with only one snapshot.
+  const previousTotalCurrentValue = accountTransitions.reduce(
+    (s, t) => s + (t.previous ? (t.previous.totalCurrentValue || 0) : (t.latest.totalCurrentValue || 0)),
+    0
+  );
+  const vsLastSnapshotDelta = combined.closingCurrentValue - previousTotalCurrentValue;
+  const lastUpdatedDate = accountTransitions.length > 0
+    ? accountTransitions.reduce((latest, t) => (t.latest.asOfDate > latest ? t.latest.asOfDate : latest), accountTransitions[0].latest.asOfDate)
+    : null;
 
   const allClosedPositions = accountTransitions.flatMap((t) =>
     t.transition.closedPositions.map((cp) => ({ ...cp, accountNickname: t.account.nickname }))
@@ -9037,25 +11527,19 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
         ) : (
     <div>
       <ZoneHeader icon={TrendingUp} title="Overview" subtitle="How much you've added to your investments, and how much it's grown" />
-      <div className="bw-waterfall-card">
-        <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
-          <WaterfallNode label="Opening" sublabel="invested" value={combined.openingInvested} />
-          <WaterfallOp label="Added" contribution={combined.added} />
-          <WaterfallOp label="Redeemed" contribution={combined.redeemed} />
-          <WaterfallNode label="Closing" sublabel="invested" value={combined.closingInvested} />
-          <WaterfallOp label="Growth" contribution={combined.growth} />
-          <WaterfallNode label="Current value" value={combined.closingCurrentValue} />
+      {lastUpdatedDate && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--ink-soft)", margin: "-8px 0 14px" }}>
+          <span>Last updated: {lastUpdatedDate}</span>
+          <span style={{ color: vsLastSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)" }}>
+            {vsLastSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} {inr(Math.abs(vsLastSnapshotDelta))} vs last snapshot
+          </span>
         </div>
-      </div>
-      <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "8px 0 20px" }}>
-        Added/Redeemed reflects net new money since each account's previous import — not gross contributions minus
-        withdrawals separately, since a snapshot alone can't tell those apart. Growth is cumulative unrealized
-        P&L as of the latest import, not a period figure — compare two dated snapshots to see growth over a
-        specific stretch of time.
-      </p>
+      )}
 
-      <div className="bw-summary-row" style={{ marginBottom: 24 }}>
+      <div className="bw-summary-row" style={{ gridTemplateColumns: "repeat(6, 1fr)", marginBottom: 10 }}>
         <Stat label="Total invested" value={inr(combined.closingInvested)} color="var(--ink)" />
+        <Stat label="Added" value={inr(combined.added)} color="var(--teal)" />
+        <Stat label="Redeemed" value={combined.redeemed !== 0 ? `−${inr(Math.abs(combined.redeemed))}` : "—"} color="var(--rust)" />
         <Stat label="Current value" value={inr(combined.closingCurrentValue)} color="var(--teal)" />
         <Stat
           label="Unrealized gain"
@@ -9065,6 +11549,12 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
         />
         <Stat label="Accounts tracked" value={String(investmentAccounts.length)} color="var(--ink)" />
       </div>
+      <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "0 0 24px" }}>
+        Added/Redeemed reflects net new money since each account's previous import — not gross contributions minus
+        withdrawals separately, since a snapshot alone can't tell those apart. Growth is cumulative unrealized
+        P&L as of the latest import, not a period figure — compare two dated snapshots to see growth over a
+        specific stretch of time.
+      </p>
 
       {equityTransitions.length > 0 && (
         <InvestmentSection title="Equity / Demat" icon={Landmark} transitions={equityTransitions} />
@@ -9100,17 +11590,21 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
       )}
 
       {activeSection === "other" && (
-        <OtherInvestmentsPanel accounts={accounts} setAccounts={setAccounts} otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments} apiKey={apiKey} />
+        <OtherInvestmentsPanel accounts={accounts} setAccounts={setAccounts} otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments} apiKey={apiKey} effectiveTier={effectiveTier} showToast={showToast} />
       )}
     </div>
   );
 }
 
+/** A per-account-type table (equity or mutual fund, decided by the caller's
+ *  "transitions" list) - each account's own opening/added/redeemed/closing/growth,
+ *  plus a Total row summing all of them. An account with only one snapshot so far
+ *  shows "—" for Opening rather than a misleading zero or a fabricated figure. */
 function InvestmentSection({ title, icon, transitions }) {
   const totals = transitions.reduce((acc, t) => ({
     openingInvested: acc.openingInvested + (t.transition.openingInvested || 0),
-    added: acc.added + t.transition.added,
-    redeemed: acc.redeemed + t.transition.redeemed,
+    added: acc.added + (t.transition.added || 0),
+    redeemed: acc.redeemed + (t.transition.redeemed || 0),
     closingInvested: acc.closingInvested + (t.transition.closingInvested || 0),
     closingCurrentValue: acc.closingCurrentValue + (t.transition.closingCurrentValue || 0),
   }), { openingInvested: 0, added: 0, redeemed: 0, closingInvested: 0, closingCurrentValue: 0 });
@@ -9145,8 +11639,8 @@ function InvestmentSection({ title, icon, transitions }) {
               <tr key={t.account.id}>
                 <td>{t.account.nickname}</td>
                 <td style={{ textAlign: "right" }}>{t.previous ? inr(t.transition.openingInvested) : <span style={{ color: "var(--ink-soft)" }}>—</span>}</td>
-                <td className="bw-amt credit">{inr(t.transition.added)}</td>
-                <td className="bw-amt debit">{t.transition.redeemed !== 0 ? `−${inr(Math.abs(t.transition.redeemed))}` : "—"}</td>
+                <td className="bw-amt credit">{t.previous ? inr(t.transition.added) : <span style={{ color: "var(--ink-soft)" }}>—</span>}</td>
+                <td className="bw-amt debit">{!t.previous ? <span style={{ color: "var(--ink-soft)" }}>—</span> : t.transition.redeemed !== 0 ? `−${inr(Math.abs(t.transition.redeemed))}` : "—"}</td>
                 <td style={{ textAlign: "right" }}>{inr(t.transition.closingInvested)}</td>
                 <td style={{ textAlign: "right" }}>{inr(t.transition.closingCurrentValue)}</td>
                 <td style={{ textAlign: "right", color: t.transition.growth >= 0 ? "var(--teal)" : "var(--rust)" }}>{inr(t.transition.growth)}</td>
@@ -9262,6 +11756,13 @@ async function callOtherInvestmentExtract(images, apiKey) {
   return JSON.parse(textPart.text.replace(/```json|```/g, "").trim());
 }
 
+/** Optional PDF-upload shortcut for adding a PF, Gold, or Property entry - reads a
+ *  statement's page images via callOtherInvestmentExtract, then fills in whichever of
+ *  units/cost/value fields weren't directly printed using deriveOtherInvestmentFields
+ *  (e.g. investedValue from units × costPerUnit, if only those two were extracted).
+ *  Hands the combined result up to the parent form via onExtracted, which pre-fills
+ *  the manual entry fields rather than committing anything on its own - the person
+ *  still confirms or edits before the entry is actually saved. */
 function OtherInvestmentUploadFlow({ apiKey, onExtracted }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -9343,7 +11844,15 @@ function OtherInvestmentUploadFlow({ apiKey, onExtracted }) {
   );
 }
 
-function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOtherInvestments, apiKey }) {
+/** Manual/PDF-assisted entry for investments that don't come from a market-tracked
+ *  holdings statement - PF, Gold, and Property, each a distinct assetSubtype under
+ *  the shared "otherInvestment" account type. deriveOtherInvestmentFields fills in
+ *  whatever wasn't directly entered (e.g. investedValue from units × costPerUnit),
+ *  so the person only has to supply enough fields to make the rest computable, not
+ *  every field every time. Property specifically also carries a location. Respects
+ *  the same Free-tier one-investment-account limit and read-only enforcement as the
+ *  market-tracked import flows. */
+function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOtherInvestments, apiKey, effectiveTier, showToast }) {
   const otherAccounts = useMemo(() => accounts.filter((a) => a.type === "otherInvestment"), [accounts]);
   const [selectedAccountId, setSelectedAccountId] = useState("__new__");
   const [assetSubtype, setAssetSubtype] = useState("PF");
@@ -9366,13 +11875,7 @@ function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOth
   }
 
   function addEntry() {
-    let account = selectedExistingAccount;
-    if (!account) {
-      if (!nickname.trim()) return;
-      account = { id: uid("acc"), type: "otherInvestment", assetSubtype, nickname: nickname.trim(), location: assetSubtype === "Property" ? (location.trim() || null) : null };
-      setAccounts((prev) => [...prev, account]);
-    }
-    if (!asOfDate) return;
+    if (!asOfDate) { showToast("Enter the as-of date before adding this entry."); return; }
     const result = deriveOtherInvestmentFields(
       units ? parseAmountStr(units) : null,
       costPerUnit ? parseAmountStr(costPerUnit) : null,
@@ -9380,7 +11883,24 @@ function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOth
       investedValue ? parseAmountStr(investedValue) : null,
       currentValue ? parseAmountStr(currentValue) : null,
     );
-    if (result.currentValue === null) return; // need at least a current value, directly or derivable
+    if (result.currentValue === null) { showToast("Enter a current value (or enough to derive one) before adding this entry."); return; }
+    let account = selectedExistingAccount;
+    if (!account && !canCreateAccount(accounts, effectiveTier, "otherInvestment")) {
+      showToast(
+        `Free plan limit reached (${FREE_TIER_LIMITS.investmentAccounts} Investment account) — go to Accounts to switch ` +
+        `which one stays active, or upgrade for unlimited accounts.`
+      );
+      return;
+    }
+    if (account && !canImportIntoAccount(accounts, effectiveTier, account.id)) {
+      showToast(`"${account.nickname}" is read-only on the Free plan — go to Accounts to switch which account stays active, or upgrade.`);
+      return;
+    }
+    if (!account) {
+      if (!nickname.trim()) return;
+      account = { id: uid("acc"), type: "otherInvestment", assetSubtype, nickname: nickname.trim(), location: assetSubtype === "Property" ? (location.trim() || null) : null };
+      setAccounts((prev) => [...prev, account]);
+    }
     setOtherInvestments((prev) => [...prev, {
       id: uid("oi"), accountId: account.id, asOfDate,
       units: result.units, unitOfMeasure: unitOfMeasure.trim() || null,
@@ -9544,7 +12064,19 @@ function OtherInvestmentsPanel({ accounts, setAccounts, otherInvestments, setOth
 /* settings plus the portfolio's current invested value.                  */
 /* ---------------------------------------------------------------------- */
 
-function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactions }) {
+/** The Goals pillar screen - two fundamentally different funding models depending on
+ *  time horizon:
+ *   - Near-term (due in under a year, any goal type): funded by assigning specific
+ *     named holdings (computeNearTermGoalTracking), since money needed soon has to be
+ *     genuinely liquid and available, not resting on a long-horizon growth assumption.
+ *   - Long-term (a year or more away): funded as a share of one pooled portfolio
+ *     value (computeGoalsTracking) - not tied to specific holdings.
+ *  Whatever's assigned to a near-term goal comes OUT of the pool long-term goals can
+ *  draw from first (poolForLongTermGoals), the same way money already spent isn't
+ *  available to allocate a second time - a holding claimed by one goal can't also
+ *  silently fund another. GoalWizard hosts creation; GoalCard and NearTermGoalCard
+ *  render the two goal types' very different progress views. */
+function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactions, effectiveTier }) {
   const [apiKey, setApiKeyLocal] = useState("");
   const [creating, setCreating] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(null);
@@ -9624,9 +12156,26 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
           <p className="bw-lead" style={{ margin: 0 }}>What you're saving for, what it'll really cost, and whether you're on pace.</p>
         </div>
         {goals.length > 0 && (
-          <button className="bw-btn" onClick={() => setCreating(true)}><Plus size={14} /> New goal</button>
+          canCreateGoal(goals, effectiveTier) ? (
+            <button className="bw-btn" onClick={() => setCreating(true)}><Plus size={14} /> New goal</button>
+          ) : (
+            <div style={{ fontSize: 12, color: "var(--ink-soft)", textAlign: "right" }}>
+              Free plan limit reached ({FREE_TIER_LIMITS.goals} goals) — <strong style={{ color: "var(--ink)" }}>Licensed</strong> unlocks unlimited.
+            </div>
+          )
         )}
       </div>
+
+      {(() => {
+        const goalsLastUpdated = holdingSnapshots.length > 0
+          ? holdingSnapshots.reduce((latest, s) => (s.asOfDate > latest ? s.asOfDate : latest), holdingSnapshots[0].asOfDate)
+          : null;
+        return goalsLastUpdated ? (
+          <div style={{ fontSize: 12, color: "var(--ink-soft)", margin: "12px 0 -8px" }}>
+            Investment figures below as of: {goalsLastUpdated}
+          </div>
+        ) : null;
+      })()}
 
       <div className="bw-waterfall-card" style={{ margin: "18px 0 22px" }}>
         <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
@@ -9683,6 +12232,12 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
 
 const SUGGESTED_CATEGORY_PATTERN = /arbitrage|liquid|debt|money\s*market|overnight/i;
 
+/** A single near-term goal's card - progress against a target computed one of two
+ *  ways: emergency-fund goals target months × average monthly expense; every other
+ *  near-term goal targets its own entered cost. Funding comes from whichever
+ *  specific holdings are checked on below (toggleHolding), not a portfolio-wide
+ *  share - the whole point of near-term funding being tied to real, named,
+ *  currently-liquid holdings rather than a growth projection. */
 function NearTermGoalCard({ goal, result, averageMonthlyExpense, holdingsIndex, assignedElsewhere, accentColor, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
   const isEmergency = goal.type === "emergency";
   const target = isEmergency
@@ -9809,6 +12364,14 @@ function HoldingsAssignmentPicker({ holdingsIndex, assignedKeys, assignedElsewhe
   );
 }
 
+/** A single long-term goal's card - target corpus computed via computeGoalMath
+ *  (inflating today's cost forward, then applying an assumed return rate over the
+ *  years remaining), funded by its own share of the shared, pooled portfolio value
+ *  (result, from computeGoalsTracking), not specific holdings the way a near-term
+ *  goal is. Required lumpsum/SIP is always computed against the FULL target, then
+ *  scaled down by whatever fraction is still unfunded - so a goal that's 60% funded
+ *  correctly shows 40% of the original required contribution, not the full amount
+ *  recalculated as if nothing had been saved yet. */
 function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, confirmingDelete, onAskDelete, onCancelDelete, onDelete }) {
   const math = computeGoalMath(goal.costToday, goal.inflationRate, goal.returnRate, goal.yearsToGoal);
   const pctFunded = math.targetCorpus > 0 ? Math.min(100, (result.trackedCurrentValue / math.targetCorpus) * 100) : 0;
@@ -9843,7 +12406,25 @@ function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, conf
         <Stat label="Target corpus" value={inr(math.targetCorpus)} color="var(--ink)" />
         <Stat label="Tracked (real)" value={inr(result.trackedInvested)} color="var(--ink)" hint={`grown to ${inr(result.trackedCurrentValue)}`} />
         <Stat label="Growth so far" value={inr(result.growth)} color={result.growth >= 0 ? "var(--teal)" : "var(--rust)"} />
-        <Stat label="Lumpsum / SIP needed" value={inr(math.lumpsumRequired)} color="var(--ink)" hint={`or ${inr(math.sipRequired)}/mo`} />
+        {(() => {
+          // Lumpsum/SIP required was always computed from the FULL target, never
+          // accounting for what's already tracked — a 100%-funded goal would still show
+          // the full original requirement, which is misleading. Both figures scale
+          // linearly with the target (see computeGoalMath), so scaling by the remaining
+          // unfunded fraction gives the correct "what's still needed" figure without
+          // re-deriving the formula. Note: this still uses the goal's own ASSUMED return
+          // rate set at creation, not actual realized growth — it does not automatically
+          // adjust if real performance differs from that assumption.
+          const remainingGap = Math.max(0, math.targetCorpus - result.trackedCurrentValue);
+          const remainingRatio = math.targetCorpus > 0 ? remainingGap / math.targetCorpus : 0;
+          const remainingLumpsum = Math.round(math.lumpsumRequired * remainingRatio * 100) / 100;
+          const remainingSip = Math.round(math.sipRequired * remainingRatio * 100) / 100;
+          return remainingGap <= 0 ? (
+            <Stat label="Lumpsum / SIP needed" value="Goal met" color="var(--teal)" hint="No further funding needed" />
+          ) : (
+            <Stat label="Lumpsum / SIP needed" value={inr(remainingLumpsum)} color="var(--ink)" hint={`or ${inr(remainingSip)}/mo \u00B7 remaining gap`} />
+          );
+        })()}
       </div>
 
       {result.sipShortfall > 0 && (
@@ -9884,6 +12465,16 @@ function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, conf
   );
 }
 
+/** Multi-step goal creation wizard. Each goal type (education, home, emergency,
+ *  etc.) carries its own sensible defaults (GOAL_TYPE_DEFAULTS) - inflation rate,
+ *  whether it's asked in months rather than years (isMonthsBased, for Emergency Fund
+ *  and Short-term goals), and whether it's inherently fund-specific rather than
+ *  portfolio-pooled (fundSpecific, or automatically true for anything under a year
+ *  away regardless of type - matching the near-term/long-term split GoalsOverview
+ *  enforces). handleEstimate is an optional AI-assisted cost estimate (Gemini) for
+ *  when the person doesn't already know a reasonable today's-cost figure - always
+ *  described as a rough starting point to review and adjust, with its exact scope
+ *  (what's included) always stated, never left ambiguous. */
 function GoalWizard({ apiKey, portfolioInvested, tracking, holdingsIndex, assignedElsewhere, averageMonthlyExpense, onCancel, onCreate }) {
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
@@ -10215,6 +12806,10 @@ function GoalWizard({ apiKey, portfolioInvested, tracking, holdingsIndex, assign
   );
 }
 
+/** Month-over-month comparison callout, specifically for expense-style figures where
+ *  more is worse - an increase renders in the warning color (rust), a decrease in the
+ *  positive one (teal). A change under 2% reads as "about the same" rather than
+ *  reporting a misleadingly precise but practically meaningless percentage. */
 function MoMCallout({ label, cur, prev }) {
   const delta = prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
   const flat = Math.abs(delta) < 2;
@@ -10236,7 +12831,7 @@ function MoMCallout({ label, cur, prev }) {
    Net change in cash -> Closing, rendered as a row of connected node cards with small
    "+/-" operation labels between them. Simple flex row rather than an SVG diagram —
    reads clearly at any width, wraps gracefully on mobile. ---- */
-function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, notExact, rate }) {
+function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, tier, rate }) {
   const known = value !== null && value !== undefined;
   const negative = known && value < 0;
   return (
@@ -10254,7 +12849,8 @@ function WaterfallNode({ label, sublabel, value, clickable, expanded, onClick, n
       {known && rate !== null && rate !== undefined && (
         <div style={{ fontSize: 10.5, color: rate < 0 ? "var(--rust)" : "var(--ink-soft)", marginTop: 2 }}>{rate.toFixed(0)}% of income</div>
       )}
-      {known && notExact && <div style={{ fontSize: 9, color: "var(--ochre)", marginTop: 2 }}>estimated, not confirmed</div>}
+      {known && tier === "derived" && <div style={{ fontSize: 9, color: "var(--slate)", marginTop: 2 }}>calculated from your transactions</div>}
+      {known && tier === "estimate" && <div style={{ fontSize: 9, color: "var(--ochre)", marginTop: 2 }}>estimated, not confirmed</div>}
     </div>
   );
 }
@@ -10299,6 +12895,57 @@ function HeroStat({ label, value, color, hint, clickable, onClick }) {
   );
 }
 
+/** Shared card shell for the Dashboard screen — icon+title+badge header, hero value,
+ *  optional delta line, a flexible body (sparkline SVG or custom breakdown via children),
+ *  and an optional footer. Cash Flow and every other screen are untouched — this is
+ *  used only by DashboardOverview. */
+function InsightCard({ icon: Icon, title, badge, value, delta, deltaColor, footer, onClick, children }) {
+  return (
+    <div className={`bw-insight-card ${onClick ? "clickable" : ""}`} onClick={onClick}>
+      <div className="bw-insight-head">
+        <div className="bw-insight-title">{Icon && <Icon size={14} color="var(--teal)" />} {title}</div>
+        {badge && <span className="bw-insight-badge" style={{ background: badge.bg, color: badge.color }}>{badge.text}</span>}
+      </div>
+      {value !== undefined && <div className="bw-insight-value">{value}</div>}
+      {delta && <div className="bw-insight-delta" style={{ color: deltaColor || "var(--ink-soft)" }}>{delta}</div>}
+      {children}
+      {footer && (
+        <div className="bw-insight-footer">
+          {footer.map((f, i) => (
+            <div className="bw-insight-footer-item" key={i}>
+              <div className="bw-insight-footer-label">{f.label}</div>
+              <div className="bw-insight-footer-value" style={{ color: f.color || "var(--ink)" }}>{f.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Tiny inline sparkline — takes raw values, normalizes to the SVG viewbox itself so
+ *  callers never need to pre-scale. Two-point (or fewer) series render as a flat/short
+ *  line rather than a fabricated curve — an honest "not enough history yet" rather than
+ *  a misleadingly smooth trend from sparse data. */
+function Sparkline({ values, color }) {
+  if (!values || values.length < 2) return null;
+  const w = 120, h = 28, pad = 2;
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = max - min || 1;
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * (w - pad * 2) + pad;
+    const y = h - pad - ((v - min) / range) * (h - pad * 2);
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <svg className="bw-insight-sparkline" width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" />
+    </svg>
+  );
+}
+
+/** A section header used across several pillar screens - an icon, a title, and an
+ *  optional one-line subtitle explaining what that section shows. */
 function ZoneHeader({ icon: Icon, title, subtitle }) {
   return (
     <div className="bw-zone-header">
@@ -10364,6 +13011,9 @@ function TransactionsZone({ scoped, accounts, accountName }) {
   );
 }
 
+/** The most-reused small building block in the app - a labeled figure with an
+ *  optional colored value and a small explanatory hint line underneath. Used across
+ *  nearly every screen's summary rows. */
 function Stat({ label, value, color, hint }) {
   return (
     <div className="bw-stat">
@@ -10388,7 +13038,19 @@ const CATEGORY_LABELS = {
   "Expense-Variable-Personal": "Variable — Personal",
 };
 
-function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, goals, merchantAliases, chatThreads, setChatThreads, savedPrompts, setSavedPrompts }) {
+/** The Analyst / Personal CFO chat screen, shared by both personas (distinguished
+ *  purely by the persona prop and its own thread/prompt filtering). Every question
+ *  comes from a template in PROMPT_LIBRARY or a saved custom prompt, with any
+ *  placeholder tokens ([category], [account], [goal], [amount]) resolved through
+ *  TokenResolutionModal before the question is actually asked - runResolvedPrompt
+ *  then builds a data bundle (buildCategoryBundle, buildAccountBundle, etc., or a
+ *  question-specific bundle for the handful of prompts with no placeholders) from the
+ *  real app data the question needs, and sends that alongside the resolved question
+ *  text via callPersonaAnalysis - so every answer is grounded in the person's actual
+ *  numbers, never invented. The user's message and a "thinking" placeholder both
+ *  appear in the thread immediately, before the API call resolves, so it reads as a
+ *  live chat rather than a form-then-wait interaction. */
+function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, goals, merchantAliases, chatThreads, setChatThreads, savedPrompts, setSavedPrompts, effectiveTier, showToast }) {
   const [apiKey, setApiKeyLocal] = useState("");
   const [activeThreadId, setActiveThreadId] = useState(null);
   const [showLibrary, setShowLibrary] = useState(false);
@@ -10555,7 +13217,13 @@ function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, 
           persona={persona} builtIn={personaPrompts} saved={personaSavedPrompts} searchText={searchText}
           onSelect={openPromptForResolution}
           onClose={() => setShowLibrary(false)}
-          onOpenSaveDialog={() => { setShowLibrary(false); setShowSaveDialog(true); }}
+          onOpenSaveDialog={() => {
+            if (effectiveTier !== "licensed") {
+              showToast("Saving your own prompts is a Licensed feature — the built-in prompt library stays fully available on Free.");
+              return;
+            }
+            setShowLibrary(false); setShowSaveDialog(true);
+          }}
           onDeleteSaved={(id) => setSavedPrompts((prev) => prev.filter((p) => p.id !== id))}
         />
       )}
@@ -10583,6 +13251,10 @@ function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, 
   );
 }
 
+/** Renders one chat message, in whichever of four states it's in: the user's own
+ *  question, a "Thinking…" placeholder while the API call is in flight, an error, or
+ *  the real structured answer - which itself renders differently per persona (CFO
+ *  gets a recommendation/why/impact/options shape; Analyst gets its own structure). */
 function ChatMessageView({ message, persona }) {
   if (message.role === "user") {
     return (
@@ -10651,6 +13323,9 @@ function ChatMessageView({ message, persona }) {
   );
 }
 
+/** Browsable/searchable picker for both the built-in PROMPT_LIBRARY (grouped by
+ *  category) and the person's own saved custom prompts - selecting either hands the
+ *  prompt off for token resolution, not straight to the API. */
 function PromptLibraryModal({ persona, builtIn, saved, searchText, onSelect, onClose, onOpenSaveDialog, onDeleteSaved }) {
   const [query, setQuery] = useState(searchText || "");
   const grouped = {};
@@ -10703,6 +13378,9 @@ function PromptLibraryModal({ persona, builtIn, saved, searchText, onSelect, onC
   );
 }
 
+/** Form for saving a new custom prompt template - insertPlaceholder drops a token
+ *  ([category], [account], etc.) at the current cursor position rather than always
+ *  appending it, so a placeholder can be inserted mid-sentence naturally. */
 function SavePromptDialog({ persona, onCancel, onSave }) {
   const [name, setName] = useState("");
   const [template, setTemplate] = useState("");
@@ -10755,6 +13433,10 @@ function SavePromptDialog({ persona, onCancel, onSave }) {
   );
 }
 
+/** Before a templated prompt (built-in or saved) actually runs, resolves whichever
+ *  placeholder tokens it contains - only the ones actually present, via
+ *  extractPlaceholderTokens - to a real category, account, goal, or amount, each
+ *  offered from the live options list for that token type. */
 function TokenResolutionModal({ promptDef, categoryOptions, accountOptions, goalOptions, onCancel, onRun }) {
   const tokens = extractPlaceholderTokens(promptDef.template);
   const [values, setValues] = useState({});
