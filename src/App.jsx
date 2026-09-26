@@ -9,14 +9,15 @@ import * as XLSX from "xlsx";
 import JSZip from "jszip";
 import {
   PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer,
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line, ReferenceLine, ReferenceDot,
+  AreaChart, Area,
 } from "recharts";
 import {
   Upload, FileText, ListChecks, PieChart as PieIcon, Trash2, Plus,
   Check, ChevronDown, Wallet, AlertCircle, RefreshCw, X, Sparkles, ClipboardPaste,
   TrendingUp, TrendingDown, Minus, Target, Merge, Sun, Moon, ArrowRight, ArrowDown,
   Repeat, Lightbulb, Landmark, LineChart as LineChartIcon, Flag, ChevronRight, ChevronUp,
-  Download, LayoutDashboard, Bell,
+  Download, LayoutDashboard, Bell, Circle,
 } from "lucide-react";
 import { storage } from "./storage.js";
 import { renderPdfPagesAsImages, PAGE_BREAK_MARKER } from "./pdfExtract.js";
@@ -206,38 +207,129 @@ function canCreateGoal(goals, effectiveTier) {
 /* ---------------------------------------------------------------------- */
 
 const CATEGORIES = ["Income", "Expense", "Investment", "Transfer"];
-const EXPENSE_SUB_CATEGORIES = ["Fixed", "Variable"];
-const TRANSFER_SUB_CATEGORIES = ["Self", "Credit card payment", "External", "Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"];
-const INCOME_SUB_CATEGORIES = ["Salary", "Dividend", "Rent", "Others"];
-const INVESTMENT_SUB_CATEGORIES = ["SIP", "Lumpsum", "Redemption"];
+// Expense's "What/COA" level (the same slot every other category uses for its own
+// specificity - Investment's Add/Redemption, Transfer's Self/Debt Payment) is
+// Household/Personal - a real subCategory now, not a separate `tag` field. `tag`
+// is fully retired everywhere in this app.
 const TAGS = ["Household", "Personal"];
+const TRANSFER_SUB_CATEGORIES = ["Self", "External", "Debt Payment", "Debt Add"];
+const INCOME_SUB_CATEGORIES = ["Salary", "Dividend", "Rent", "Interest", "Others"];
+const INVESTMENT_SUB_CATEGORIES = ["Add", "Redemption"];
 const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"]; // Fixed expenses, SIPs, and EMIs
 const PURPOSES = ["Personal", "Business"];
+// New COA fields, both user-entered and required going forward (existing data is
+// migrated once via a deterministic mapping from the old category/subCategory -
+// see migrateToNewTaxonomy - rather than this mapping living on as permanent logic).
+const FREQUENCY_CLASSES = ["Recurring", "Irregular", "One-Time"];
+const CONTROLS = ["Committed", "Flexible"];
 
 /** The valid subcategory options for a given top-level category, used to populate
  *  every subcategory dropdown in the app (Review tab, Rules tab, bulk actions) from
- *  one shared source rather than each UI surface hardcoding its own list. Categories
- *  with no subcategory concept (none currently) fall through to an empty array. */
+ *  one shared source rather than each UI surface hardcoding its own list. */
 function subCategoryOptionsFor(category) {
-  if (category === "Expense") return EXPENSE_SUB_CATEGORIES;
+  if (category === "Expense") return TAGS;
   if (category === "Transfer") return TRANSFER_SUB_CATEGORIES;
   if (category === "Income") return INCOME_SUB_CATEGORIES;
   if (category === "Investment") return INVESTMENT_SUB_CATEGORIES;
   return [];
 }
 
-/** Whether a category/subCategory combination represents a recurring commitment that
- *  should carry a frequency - Fixed expenses, SIPs, Debt-EMIs, and the recurring Income
- *  subcategories (Salary, Dividend, Rent). Deliberately excludes one-off counterparts
- *  (Variable, Lumpsum, Debt-Disbursement, Debt-Lumpsum Payment, Redemption, and Income's
- *  "Others") which by nature don't recur on a predictable schedule. */
-function isFrequencyEligible(category, subCategory) {
-  return (
-    (category === "Expense" && subCategory === "Fixed") ||
-    (category === "Investment" && subCategory === "SIP") ||
-    (category === "Transfer" && subCategory === "Debt-EMI") ||
-    (category === "Income" && ["Salary", "Dividend", "Rent"].includes(subCategory))
-  );
+/** Whether a transaction's frequencyClass represents a recurring commitment that
+ *  should carry a frequency (Monthly/Quarterly/Semi-Annual/Annual) and feed the
+ *  day-of-month/day-of-week pattern learner. A single, direct check on the
+ *  person's own explicit choice - not a hardcoded lookup table of category/
+ *  subCategory combinations the way this used to work. One-Time items (a
+ *  Redemption, a Lumpsum investment, a Debt-Add/disbursement) and Irregular ones
+ *  (discretionary spend, Income's Others) both correctly return false - neither
+ *  has a predictable schedule to learn. */
+function isFrequencyEligible(frequencyClass) {
+  return frequencyClass === "Recurring";
+}
+
+/** One-time migration from the old taxonomy (category/subCategory/tag) to the new one
+ *  (category/subCategory/frequencyClass/control) - runs on every load, but only ever
+ *  touches data still in the old shape; already-migrated data (or anything newly
+ *  created under the new system) passes through completely untouched. This mapping
+ *  does not live on as permanent logic anywhere else in the app - once migrated,
+ *  isFrequencyEligible and everything downstream reads frequencyClass directly, with
+ *  no awareness this old mapping ever existed. Works identically for both
+ *  transactions and rules, since it only ever touches category/subCategory/tag/
+ *  frequencyClass/control - nothing transaction-specific like amount or date. */
+function migrateOne(t) {
+  // Nothing to migrate: uncategorized, or anything that already has a frequencyClass -
+  // since that field didn't exist before this taxonomy change, its presence
+  // unambiguously means "already migrated, or created fresh under the new system".
+  // Never re-touch it, in case it was deliberately changed since.
+  if (!t.category || t.frequencyClass) return t;
+
+  let { category, subCategory, tag, frequencyClass, frequency, control } = t;
+  control = control || null;
+
+  if (category === "Expense") {
+    // Fixed/Variable's old meaning moves to frequencyClass; Household/Personal (old
+    // tag) moves into subCategory, the same slot every other category uses.
+    frequencyClass = subCategory === "Fixed" ? "Recurring" : "Irregular";
+    subCategory = tag || null;
+  } else if (category === "Investment") {
+    if (subCategory === "SIP") { subCategory = "Add"; frequencyClass = "Recurring"; }
+    else if (subCategory === "Lumpsum") { subCategory = "Add"; frequencyClass = "One-Time"; }
+    else if (subCategory === "Redemption") { frequencyClass = "One-Time"; }
+    else { frequencyClass = "Irregular"; } // unexpected/missing subCategory - safest non-committal default
+  } else if (category === "Transfer") {
+    if (subCategory === "Debt-EMI") { subCategory = "Debt Payment"; frequencyClass = "Recurring"; }
+    else if (subCategory === "Debt-Lumpsum Payment") { subCategory = "Debt Payment"; frequencyClass = "One-Time"; }
+    else if (subCategory === "Debt-Disbursement") { subCategory = "Debt Add"; frequencyClass = "One-Time"; }
+    else if (subCategory === "Credit card payment") {
+      subCategory = "Debt Payment"; frequencyClass = "Recurring";
+      // Credit card payment was never frequency-eligible under the old taxonomy, so old
+      // data never had a cadence stored for it - unlike Fixed/SIP/Debt-EMI/recurring
+      // Income, which all already tracked one. Backfill Monthly here so the stored
+      // value matches what the Cadence dropdown's own fallback was already displaying,
+      // rather than leaving a silent gap behind a field that LOOKED filled in.
+      frequency = frequency || "Monthly";
+    }
+    else { frequencyClass = "Irregular"; } // Self, External, or anything unexpected
+  } else if (category === "Income") {
+    frequencyClass = ["Salary", "Dividend", "Rent", "Interest"].includes(subCategory) ? "Recurring" : "Irregular";
+  }
+
+  const migrated = { ...t, category, subCategory, frequencyClass, frequency, control };
+  delete migrated.tag;
+  return migrated;
+}
+
+/** Recomputes a transaction's .merchant key fresh from its description, using
+ *  whatever normalizeMerchant's current logic is - unlike migrateOne, this has no
+ *  "already done" guard and is meant to be safe to re-run unconditionally on every
+ *  load, since .merchant is never user-edited anywhere in the app (always derived,
+ *  never a person's own input) and normalizeMerchant is pure and deterministic. This
+ *  exists specifically so a fix to normalizeMerchant itself (e.g. adding a missed
+ *  noise word to MERCHANT_STOPWORDS) retroactively corrects already-imported
+ *  transactions' stored keys too, not just future imports. */
+function refreshMerchantKey(t) {
+  if (!t.description) return t;
+  const fresh = normalizeMerchant(t.description);
+  return fresh === t.merchant ? t : { ...t, merchant: fresh };
+}
+
+/** Repairs a narrow but real data-integrity gap: a transaction whose frequencyClass
+ *  is Recurring but has no frequency (cadence) value at all - which the Cadence
+ *  dropdown's own `|| "Monthly"` display fallback quietly masks, making the gap
+ *  invisible in the UI even though the stored data is genuinely incomplete (and so
+ *  correctly still flagged by isFullyCategorized). Most commonly hits transactions
+ *  migrated from a category/subCategory that was never frequency-eligible under the
+ *  old taxonomy (e.g. Credit card payment), so never had a cadence stored to begin
+ *  with. Deliberately separate from migrateOne and safe to re-run unconditionally on
+ *  every load - migrateOne's own "already migrated" guard means it will never
+ *  re-touch a transaction that already has frequencyClass set, even if frequency is
+ *  still missing, so a fix to migrateOne's logic alone can't reach data that was
+ *  already migrated in a prior session. This only ever fills a gap, never overwrites
+ *  an existing value. */
+function backfillMissingFrequency(t) {
+  if (t.frequencyClass === "Recurring" && !t.frequency) {
+    return { ...t, frequency: "Monthly" };
+  }
+  return t;
 }
 
 /** Which account TYPES are valid targets for the optional "which account does this
@@ -247,19 +339,63 @@ function isFrequencyEligible(category, subCategory) {
  *  exist (e.g. two SIPs, two loans) - returns [] for anything else, meaning "no link
  *  makes sense here at all". Optional everywhere it applies, never required. */
 function linkableAccountTypesFor(category, subCategory) {
-  if (category === "Investment" && ["SIP", "Lumpsum", "Redemption"].includes(subCategory)) {
+  if (category === "Investment" && ["Add", "Redemption"].includes(subCategory)) {
     return ["demat", "mutualFund", "otherInvestment"];
   }
-  if (category === "Transfer" && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(subCategory)) {
-    return ["debt"];
+  // "Debt Payment" covers both a loan EMI/lumpsum payment and a credit card
+  // payment - architecturally the same thing, settling a debt, just against a
+  // different kind of account. Which one it actually is comes from which account
+  // the person links here (debt vs creditCard), not from a separate subCategory
+  // the way "Credit card payment" used to be its own value.
+  if (category === "Transfer" && subCategory === "Debt Payment") {
+    return ["debt", "creditCard"];
   }
-  if (category === "Transfer" && subCategory === "Credit card payment") {
-    return ["creditCard"];
+  if (category === "Transfer" && subCategory === "Debt Add") {
+    return ["debt"];
   }
   if (category === "Transfer" && subCategory === "Self") {
     return ["bank"];
   }
   return [];
+}
+
+/** Whether a transaction has every RELEVANT field filled in - not just category, but
+ *  subCategory, frequencyClass, frequency (when frequencyClass is Recurring), control
+ *  (Expense only, and not when One-Time), purpose, and linkedAccountId (when a linkable
+ *  account type exists for this category/subCategory). Deliberately includes fields
+ *  that are individually "optional" to fill (like linkedAccountId) - optional means the
+ *  person isn't blocked from moving on without it, not that a gap there should be
+ *  invisible to review. "Relevant" is what does the actual work here: a field this
+ *  transaction's category/subCategory/frequencyClass combination doesn't apply to
+ *  (e.g. Control for Income, or Cadence for an Irregular expense) is never flagged for
+ *  its absence - only fields that genuinely apply and are still empty count. */
+function isFullyCategorized(t) {
+  if (!t.category) return false;
+  if (subCategoryOptionsFor(t.category).length > 0 && !t.subCategory) return false;
+  if (!t.frequencyClass) return false;
+  if (isFrequencyEligible(t.frequencyClass) && !t.frequency) return false;
+  if (t.category === "Expense" && t.frequencyClass !== "One-Time" && !t.control) return false;
+  if (!t.purpose) return false;
+  if (linkableAccountTypesFor(t.category, t.subCategory).length > 0 && !t.linkedAccountId) return false;
+  return true;
+}
+
+/** Concatenates every field worth searching on a transaction into one lowercase
+ *  string - description, merchant, the account it's on and the account it's linked
+ *  to (resolved to their nicknames, not raw IDs), category, Sub Category 1
+ *  (subCategory), Sub Category 2 (the merchant-grouping-driven field, including its
+ *  "Other" fallback), class, control, cadence, purpose, and the amount itself. Lets a
+ *  search box match "Scapia" against a linked account name, "Recurring" against
+ *  Class, "Other" against an ungrouped merchant's Sub Category 2, or "295859" against
+ *  an amount - not just substrings of the description the way search used to work. */
+function transactionSearchText(t, accounts, merchantAliases) {
+  const accountName = accounts.find((a) => a.id === t.accountId)?.nickname || "";
+  const linkedName = t.linkedAccountId ? (accounts.find((a) => a.id === t.linkedAccountId)?.nickname || "") : "";
+  return [
+    t.description, t.merchant, accountName, linkedName,
+    t.category, t.subCategory, merchantSubcategory(t, merchantAliases), t.frequencyClass, t.frequency, t.control, t.purpose,
+    t.amount != null ? String(t.amount) : "",
+  ].filter(Boolean).join(" ").toLowerCase();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -290,21 +426,35 @@ function weekdayInfo(dateStr) {
   return { dow, ordinalFromStart, isLast };
 }
 
-/** Learns whether a set of dated occurrences (all already known to be the same
- *  recurring thing - see computeRecurringCommitments for how they're grouped)
- *  follows a fixed day-of-month pattern (e.g. "the 1st") or a floating day-of-week
- *  pattern (e.g. "the last Friday") - whichever actually clusters tightly in the
- *  real data, never assumed. Requires at least 3 occurrences; fewer can't
- *  distinguish a real pattern from coincidence, and is reported as such rather than
- *  guessed. Tolerates a small amount of drift (a payment landing a day or two late
- *  because the expected day fell on a weekend or holiday) - and a single outlier
- *  among an otherwise clean pattern doesn't prevent the real pattern from being
- *  recognized, since a missed or unusually-timed month happens without meaning the
- *  underlying commitment stopped being regular. */
-function learnRecurringDay(dates, { minOccurrences = 3, domTolerance = 2, confidenceThreshold = 0.7 } = {}) {
+/** Learns as much as the available history actually supports - never less than what
+ *  a single observed date already tells us, never more than the clustering genuinely
+ *  shows. Two separable facts, not one:
+ *   - "recurs" is true the moment there's at least one occurrence under a stated
+ *     frequency - the person's own declaration that this repeats is real,
+ *     verified information on its own, independent of knowing which day it lands on.
+ *   - "hasPattern" (a specific day) requires real clustering evidence. A single
+ *     occurrence gives its own date back as a same-day estimate (tier "estimate" -
+ *     the weakest tier, a genuine guess that refines itself the moment a second
+ *     occurrence arrives). Two or more that actually cluster earn "expected" (2)
+ *     or the fullest confidence, "confirmed" (3+). Two or more that DON'T cluster
+ *     (a real, scattered history) still "recurs" - the month-level fact from
+ *     frequency survives even when the day genuinely can't be pinned down;
+ *     hasPattern stays false rather than inventing a day with no basis for it.
+ *  Tolerates a small amount of drift (a payment landing a day or two late because
+ *  the expected day fell on a weekend or holiday) - and a single outlier among an
+ *  otherwise clean pattern doesn't prevent the real pattern from being recognized,
+ *  since a missed or unusually-timed month happens without meaning the underlying
+ *  commitment stopped being regular. */
+function learnRecurringDay(dates, { domTolerance = 2, confidenceThreshold = 0.7 } = {}) {
   const sorted = [...dates].sort();
-  if (sorted.length < minOccurrences) {
-    return { hasPattern: false, reason: "insufficient_data", occurrenceCount: sorted.length };
+  const occurrenceCount = sorted.length;
+  if (occurrenceCount === 0) return { recurs: false, hasPattern: false, occurrenceCount: 0 };
+
+  if (occurrenceCount === 1) {
+    return {
+      recurs: true, hasPattern: true, patternType: "dayOfMonth",
+      expectedDay: dayOfMonth(sorted[0]), confidenceTier: "estimate", confidence: 1, occurrenceCount: 1,
+    };
   }
 
   const doms = sorted.map(dayOfMonth);
@@ -321,40 +471,120 @@ function learnRecurringDay(dates, { minOccurrences = 3, domTolerance = 2, confid
   const dowConfidence = bestKey[1] / dowKeys.length;
 
   if (domConfidence < confidenceThreshold && dowConfidence < confidenceThreshold) {
-    return { hasPattern: false, reason: "no_clear_pattern", occurrenceCount: sorted.length, domConfidence, dowConfidence };
+    // Genuinely scattered - still recurs (frequency plus 2+ real occurrences confirm
+    // that much), just no learnable day. Not a total refusal the way zero occurrences is.
+    return { recurs: true, hasPattern: false, occurrenceCount, domConfidence, dowConfidence };
   }
 
+  const confidenceTier = occurrenceCount >= 3 ? "confirmed" : "expected";
   // Day-of-month preferred on a tie - simpler, and easier for a person to recognize
   // and confirm at a glance than a floating weekday pattern.
   if (domConfidence >= dowConfidence) {
-    return { hasPattern: true, patternType: "dayOfMonth", expectedDay: medianDom, confidence: domConfidence, occurrenceCount: sorted.length };
+    return { recurs: true, hasPattern: true, patternType: "dayOfMonth", expectedDay: medianDom, confidence: domConfidence, confidenceTier, occurrenceCount };
   }
   const [dow, ordinalPart] = bestKey[0].split("-");
   return {
-    hasPattern: true, patternType: "dayOfWeek",
+    recurs: true, hasPattern: true, patternType: "dayOfWeek",
     expectedWeekday: parseInt(dow, 10), expectedOrdinal: ordinalPart, // "last" or "1".."4"
-    confidence: dowConfidence, occurrenceCount: sorted.length,
+    confidence: dowConfidence, confidenceTier, occurrenceCount,
   };
 }
 
 /** Groups every frequency-eligible transaction into "the same recurring thing" and
- *  learns each group's day pattern. Grouping key priority: linkedAccountId first
- *  (the most precise identity available - which specific loan or investment this
- *  is), falling back to matchedRuleId (the closest available identity for Fixed
- *  expenses and Income, which don't carry a linkedAccountId), falling back to the
- *  merchant text itself only as a last resort (least reliable, but better than
- *  dropping a transaction from consideration entirely). One-off subcategories
- *  (Variable, Lumpsum, Redemption, Disbursement, Income's Others) are never
- *  included - isFrequencyEligible already establishes that a pattern isn't
- *  meaningful to look for on these. */
-function computeRecurringCommitments(transactions, accounts, rules) {
+ *  learns each group's timing pattern. Grouping priority: linkedAccountId (most
+ *  precise - a specific loan or investment account) > matchedRuleId (a learned or
+ *  user rule already ties these together) > raw merchant text. Deliberately the
+ *  RAW merchant string, not the resolved alias - an alias like "Subscriptions" can
+ *  legitimately span genuinely different merchants (Netflix, Amazon, Spotify) with
+ *  no real shared timing pattern at all; grouping by alias would blend their
+ *  unrelated dates into one fabricated, meaningless "pattern". Occurrence-counting
+ *  and day-learning must happen at true transaction-level identity, irrespective
+ *  of whatever alias a merchant has been given - a subscription bundle can and
+ *  should occur on different dates for each of its members. The alias is still
+ *  resolved and returned (rawMerchant + alias fields) purely for display, so a
+ *  commitment list can show what it's grouped under without that grouping ever
+ *  leaking into the underlying computation. One-off subcategories (Variable,
+ *  Lumpsum, Redemption, Disbursement, Income's Others) are never included -
+ *  isFrequencyEligible already establishes that a pattern isn't meaningful to
+ *  look for on these. */
+/** The grouping key a transaction belongs to for both recurring-pattern learning and
+ *  Amount Behaviour. Priority: linkedAccountId (most specific - "this exact SIP")
+ *  > a "sameCommitment" type Merchant Group (an explicit person assertion that
+ *  several raw merchant strings are really one recurring bill - e.g. Electricity's
+ *  inconsistent bank/UPI text, which would otherwise look like several different
+ *  one-off things and never accumulate enough occurrences to be trusted)
+ *  > the matched rule (categorization logic, no account or group link) > raw
+ *  merchant text as the final fallback. A "category" type Merchant Group (the
+ *  default, and the only type that existed before this) never affects grouping at
+ *  all - Netflix and Audible keep learning separate patterns even when both are
+ *  displayed together under a "Subscriptions" group; combining genuinely different
+ *  things would fabricate a meaningless pattern from their unrelated dates. Shared
+ *  by computeRecurringCommitments and computeAmountBehaviors so the two can never
+ *  silently disagree about what counts as "the same commitment". */
+function commitmentGroupKey(t, merchantAliases = []) {
+  if (t.linkedAccountId) return `acct:${t.linkedAccountId}`;
+  const raw = t.merchant || t.description;
+  const sameCommitmentGroup = merchantAliases.find((g) => g.type === "sameCommitment" && g.variants.includes(raw));
+  if (sameCommitmentGroup) return `group:${sameCommitmentGroup.id}`;
+  if (t.matchedRuleId) return `rule:${t.matchedRuleId}`;
+  return `merchant:${raw}`;
+}
+
+/** The Forecasting Engine's grouping key - deliberately coarser than
+ *  commitmentGroupKey above, and used for a genuinely different purpose.
+ *  commitmentGroupKey is per-merchant/account, for generating specific dated events
+ *  (a distinct Netflix row, a distinct Spotify row). This groups by Sub Category 2
+ *  (merchant-grouping-driven) - the lowest economically meaningful spending stream -
+ *  falling back to Sub Category 1 only when Sub2 is "Other" (an ungrouped merchant).
+ *  Deliberately does NOT include Sub1 when Sub2 is meaningful, nor frequencyClass nor
+ *  frequency: everything entering this aggregation (computeForecastStreams) is, by
+ *  construction, meant for allowance-style treatment regardless of how it was
+ *  originally tagged, so those dimensions must never fragment what should be one
+ *  stream into several - the same real-world "Eating Out" spend must aggregate into
+ *  one stream even if individual transactions carry different Sub1 values over time.
+ *  Forecasting granularity improves automatically as the person groups more
+ *  merchants in Merchant Groups - everything ungrouped still falls under the shared
+ *  "Other" stream per category/Sub1 combination until then. */
+function forecastStreamKey(t, merchantAliases) {
+  const sub2 = merchantSubcategory(t, merchantAliases);
+  const label = sub2 && sub2 !== "Other" ? sub2 : (t.subCategory || "Other");
+  return `${t.category}|${label}`;
+}
+
+/** The occurrence-rate-adjusted monthly run rate for a spending stream: total spend
+ *  across every month from its first to its last observed activity (inclusive),
+ *  divided by that full span - not the median of only the active months. A month
+ *  with zero activity is a real, meaningful zero for a genuinely sporadic stream, and
+ *  silently excluding it from the denominator (as computeAmountBehavior does,
+ *  correctly, for a Recurring commitment expected every period) inflates the monthly
+ *  rate for anything that doesn't happen close to every month - exactly the
+ *  "irregular expense treated as recurring" failure this fixes. Mirrors
+ *  computeOneTimeAllowance's already-correct span-based pattern for One-Time
+ *  expenses, applied here to Irregular (and rerouted single-occurrence) streams.
+ *  typicalOccurrenceAmount (median of the active months only) is kept separately,
+ *  purely for display context ("~Rs5K when it happens, about 4x/year") - never used
+ *  as the actual monthly forecast, which is what forecastAmount is for. */
+function computeStreamRunRate(monthTotals) {
+  const activeMonthKeys = Object.keys(monthTotals).sort();
+  if (activeMonthKeys.length === 0) {
+    return { forecastAmount: null, typicalOccurrenceAmount: null, occurrencesPerMonth: 0, spanMonths: 0, observationCount: 0, confidence: null };
+  }
+  const totalAmount = activeMonthKeys.reduce((s, mk) => s + monthTotals[mk], 0);
+  const spanMonths = monthsBetweenKeys(activeMonthKeys[0], activeMonthKeys[activeMonthKeys.length - 1]) + 1;
+  const forecastAmount = totalAmount / spanMonths;
+  const observationCount = activeMonthKeys.length;
+  const typicalOccurrenceAmount = median(activeMonthKeys.map((mk) => monthTotals[mk]));
+  const occurrencesPerMonth = observationCount / spanMonths;
+  const confidence = observationCount >= 6 ? "High" : observationCount >= 3 ? "Medium" : "Low";
+  return { forecastAmount, typicalOccurrenceAmount, occurrencesPerMonth, spanMonths, observationCount, confidence };
+}
+
+function computeRecurringCommitments(transactions, accounts, rules, merchantAliases) {
   const groups = {};
   transactions
-    .filter((t) => t.category && isFrequencyEligible(t.category, t.subCategory))
+    .filter((t) => t.frequencyClass && isFrequencyEligible(t.frequencyClass))
     .forEach((t) => {
-      const key = t.linkedAccountId ? `acct:${t.linkedAccountId}`
-        : t.matchedRuleId ? `rule:${t.matchedRuleId}`
-        : `merchant:${t.merchant || t.description}`;
+      const key = commitmentGroupKey(t, merchantAliases);
       if (!groups[key]) groups[key] = [];
       groups[key].push(t);
     });
@@ -362,14 +592,21 @@ function computeRecurringCommitments(transactions, accounts, rules) {
   return Object.entries(groups).map(([key, txns]) => {
     const sorted = [...txns].sort((a, b) => a.date.localeCompare(b.date));
     const dates = sorted.map((t) => t.date);
-    const pattern = learnRecurringDay(dates);
     const latest = sorted[sorted.length - 1];
+    const pattern = learnRecurringDay(dates);
     const linkedAccount = latest.linkedAccountId ? accounts.find((a) => a.id === latest.linkedAccountId) : null;
     const rule = latest.matchedRuleId ? rules.find((r) => r.id === latest.matchedRuleId) : null;
+    const rawMerchant = latest.merchant || latest.description;
+    const alias = resolveMerchant(rawMerchant, merchantAliases);
+    // Display name still prefers the resolved alias over the raw merchant text -
+    // "Subscriptions" or "Netflix" reads better than a truncated, cryptic bank
+    // description - but this is display only, never fed back into grouping.
     return {
       key,
-      category: latest.category, subCategory: latest.subCategory, frequency: latest.frequency,
-      name: linkedAccount?.nickname || rule?.pattern || latest.merchant || latest.description,
+      category: latest.category, subCategory: latest.subCategory, subCategory2: merchantSubcategory(latest, merchantAliases), frequency: latest.frequency,
+      name: linkedAccount?.nickname || rule?.pattern || alias || rawMerchant,
+      rawMerchant, alias: alias && alias !== rawMerchant ? alias : null,
+      accountId: latest.accountId,
       linkedAccountId: latest.linkedAccountId || null,
       lastAmount: Math.abs(latest.amount),
       lastSeenDate: latest.date,
@@ -380,28 +617,777 @@ function computeRecurringCommitments(transactions, accounts, rules) {
   });
 }
 
+/** Linear-interpolation percentile of an already-sorted array - the standard method,
+ *  fine for an illustrative forecast range (forecastRange below), not meant to match
+ *  a statistical package's precision. */
+function percentile(sortedArr, p) {
+  if (!sortedArr || sortedArr.length === 0) return 0;
+  const idx = (p / 100) * (sortedArr.length - 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return sortedArr[lo];
+  return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo);
+}
+
+/** Classifies whether a recurring or irregular commitment's amount is Fixed or
+ *  Variable, using the same statistical discipline as the day-of-month learner -
+ *  median (not mean, so one outlier doesn't skew the reference point), a tolerance
+ *  band, a minimum observation count, and a confidence signal - rather than an
+ *  arbitrary rule. Deliberately never called for One-Time items - a single
+ *  occurrence has no history to establish consistency against in the first place.
+ *  Returns the full underlying metrics (median, consistency ratio, observation
+ *  count), not just the label, so later reasoning (e.g. by the CFO) can work from
+ *  the real distribution rather than trusting a flattened Fixed/Variable verdict
+ *  alone. Confidence is driven by observation count alone, independent of how
+ *  decisively the ratio lands on either side of the threshold - it answers "how
+ *  much history backs this reading", not "how clearly Fixed vs Variable".
+ *  Also computes the Forecasting Engine's additional statistics: MAD (median
+ *  absolute deviation) and relative MAD as variability measures distinct from the
+ *  Fixed/Variable consistency ratio, and forecastAmount/forecastRange - a recent
+ *  rolling median (last 6 observations, or fewer if unavailable), deliberately
+ *  separate from medianAmount above, which uses the FULL history for classification
+ *  stability. This matters when a level-shift has occurred (e.g. a rent increase 6
+ *  months ago) - forecastAmount should reflect the new rate, not blend with the old
+ *  one, while medianAmount (used for the Fixed/Variable determination itself) stays
+ *  stable across the whole observed history. `amounts` should be chronologically
+ *  ordered oldest-first for forecastAmount's "recent" slice to be meaningful; the
+ *  classification statistics themselves are order-independent. */
+function computeAmountBehavior(amounts, { deviationThreshold = 0.15, consistencyThreshold = 0.70, forecastWindow = 6 } = {}) {
+  const observationCount = amounts.length;
+  if (observationCount < 2) {
+    return {
+      amountBehavior: "Not Yet Determined", medianAmount: observationCount === 1 ? amounts[0] : null,
+      mad: null, relativeMad: null, deviationThreshold, consistencyRatio: null, observationCount, confidence: null,
+      forecastAmount: observationCount === 1 ? amounts[0] : null, forecastRange: null,
+    };
+  }
+  const medianAmount = median(amounts);
+  const withinBand = amounts.filter((a) => Math.abs(a - medianAmount) / medianAmount <= deviationThreshold).length;
+  const consistencyRatio = withinBand / observationCount;
+  const amountBehavior = consistencyRatio >= consistencyThreshold ? "Fixed" : "Variable";
+  const confidence = observationCount >= 6 ? "High" : observationCount >= 3 ? "Medium" : "Low";
+
+  const mad = median(amounts.map((a) => Math.abs(a - medianAmount)));
+  const relativeMad = medianAmount !== 0 ? mad / medianAmount : null;
+
+  const recentWindow = amounts.slice(-forecastWindow);
+  const forecastAmount = median(recentWindow);
+  const sortedRecent = [...recentWindow].sort((a, b) => a - b);
+  const forecastRange = { p25: percentile(sortedRecent, 25), median: forecastAmount, p75: percentile(sortedRecent, 75) };
+
+  return { amountBehavior, medianAmount, mad, relativeMad, deviationThreshold, consistencyRatio, observationCount, confidence, forecastAmount, forecastRange };
+}
+
+/** Amount Behaviour's home is the categorization screen, computed once here and read
+ *  from everywhere else that wants to show it (Recurring Commitments included) - never
+ *  recomputed independently, so no two screens can disagree about the same group's
+ *  reading. Same grouping key as computeRecurringCommitments (commitmentGroupKey), but
+ *  wider eligibility - Recurring AND Irregular, excluding only One-Time, since amount
+ *  consistency is a meaningful question for irregular discretionary spend too (is this
+ *  Swiggy total actually consistent, or genuinely all over the place?), just not for a
+ *  single, genuinely one-off event. Returns a lookup keyed by the same group key, so a
+ *  transaction's own reading is found by recomputing its key and indexing in - the
+ *  transaction itself never stores this value directly. */
+function computeAmountBehaviors(transactions, merchantAliases = []) {
+  const groups = {};
+  transactions
+    .filter((t) => t.frequencyClass === "Recurring" || t.frequencyClass === "Irregular")
+    .forEach((t) => {
+      const key = commitmentGroupKey(t, merchantAliases);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(Math.abs(t.amount));
+    });
+  const result = {};
+  Object.entries(groups).forEach(([key, amounts]) => { result[key] = computeAmountBehavior(amounts); });
+  return result;
+}
+
+/** Forecasting Engine: aggregates every transaction meant for allowance-style
+ *  treatment into monthly-per-stream totals (forecastStreamKey - Sub2, or Sub1 when
+ *  Sub2 is "Other"), then runs each stream's monthly totals through
+ *  computeStreamRunRate for an occurrence-rate-adjusted forecast. Two kinds of
+ *  transaction enter here: genuinely Irregular ones, and Recurring-tagged ones whose
+ *  own commitment group has only a single historical occurrence ("estimate"
+ *  confidenceTier - one observation can never establish a reliable recurring
+ *  pattern, so these are folded into stream-level treatment rather than generating
+ *  an isolated dated event forever; as soon as a second occurrence happens, the
+ *  commitment's tier advances and it naturally graduates OUT of this aggregation and
+ *  onto the dated-event path instead). Multi-occurrence Recurring commitments never
+ *  enter here at all - they stay entirely on the commitments/dated-event path.
+ *  Genuinely new and parallel to computeAmountBehaviors above, not a replacement -
+ *  that one (commitmentGroupKey-based, per-merchant) continues to serve Review tab
+ *  and Recurring Commitments exactly as before. Scoped to Income/Expense only -
+ *  Investment and Transfer amounts are typically already deterministic (a SIP or EMI
+ *  is configured, not inferred from noisy history). excludeMonthKey (normally
+ *  today's real calendar month) is dropped before aggregation entirely - a
+ *  still-in-progress month is never a fair complete observation. Each stream also
+ *  carries a paymentSplit - bankAmount plus byCardAccountId (per-card, not just an
+ *  aggregate card total) - over a recent 6-month window (a stream's payment-method
+ *  split should reflect current habits, not be diluted by years of history; this
+ *  stays a fixed recent window, distinct from the run rate's own full-span
+ *  calculation, since "how is it paid" and "how often does it happen" are different
+ *  questions with different natural time horizons). */
+
+/** The single set of commitments eligible for stream-level reroute: single
+ *  occurrence ("estimate" confidenceTier) AND Monthly-or-unset frequency. Only
+ *  Monthly-or-unset is genuinely ambiguous enough to fold into stream-level
+ *  treatment - a single occurrence there is suspicious (a real Monthly commitment
+ *  should have shown a 2nd occurrence by now in any realistic import history). An
+ *  explicit non-Monthly cadence (Quarterly, Semi-Annual, Annual) is a deliberate
+ *  signal from the person about a real, longer-spaced commitment - one observed
+ *  occurrence there is entirely expected given a shorter import history, not
+ *  suspicious, and must stay on the dated-event path so its cadence is actually
+ *  respected rather than smoothed into a monthly average (school fees paid twice a
+ *  year showing as if paid every month). Shared by computeForecastStreams (which
+ *  transactions enter the aggregate stream) and computeCashProjection (which
+ *  commitments must NOT also generate their own direct event) so a rerouted
+ *  commitment can never be counted in both places at once. */
+function computeRerouteEligibleKeys(commitments) {
+  return new Set(
+    commitments
+      .filter((c) => c.pattern.confidenceTier === "estimate" && (!c.frequency || c.frequency === "Monthly"))
+      .map((c) => c.key)
+  );
+}
+
+function computeForecastStreams(transactions, accounts, commitments, merchantAliases, excludeMonthKey) {
+  const accountType = {};
+  accounts.forEach((a) => { accountType[a.id] = a.type; });
+  const estimateTierKeys = computeRerouteEligibleKeys(commitments);
+
+  const groups = {};
+  transactions
+    .filter((t) => {
+      if (t.category !== "Income" && t.category !== "Expense") return false;
+      if (t.frequencyClass === "Irregular") return true;
+      if (t.frequencyClass === "Recurring" && estimateTierKeys.has(commitmentGroupKey(t, merchantAliases))) return true;
+      return false;
+    })
+    .forEach((t) => {
+      const mk = t.date.slice(0, 7);
+      if (excludeMonthKey && mk === excludeMonthKey) return;
+      const key = forecastStreamKey(t, merchantAliases);
+      if (!groups[key]) {
+        groups[key] = { monthTotals: {}, monthBankTotals: {}, monthCardTotalsByAccount: {}, category: t.category, transactionIds: [] };
+      }
+      const g = groups[key];
+      const amt = Math.abs(t.amount);
+      g.monthTotals[mk] = (g.monthTotals[mk] || 0) + amt;
+      g.transactionIds.push(t.id);
+      if (accountType[t.accountId] === "creditCard") {
+        if (!g.monthCardTotalsByAccount[t.accountId]) g.monthCardTotalsByAccount[t.accountId] = {};
+        g.monthCardTotalsByAccount[t.accountId][mk] = (g.monthCardTotalsByAccount[t.accountId][mk] || 0) + amt;
+      } else {
+        g.monthBankTotals[mk] = (g.monthBankTotals[mk] || 0) + amt;
+      }
+    });
+
+  const result = {};
+  Object.entries(groups).forEach(([key, { monthTotals, monthBankTotals, monthCardTotalsByAccount, category, transactionIds }]) => {
+    const sortedMonthKeys = Object.keys(monthTotals).sort();
+    // Payment-method split over a recent 6-month window - deliberately independent
+    // of the run rate's own full-span calculation (see doc comment above).
+    const recentMonthKeys = sortedMonthKeys.slice(-6);
+    const recentBank = recentMonthKeys.reduce((s, mk) => s + (monthBankTotals[mk] || 0), 0);
+    const byCardAccountId = {};
+    Object.entries(monthCardTotalsByAccount).forEach(([acctId, monthMap]) => {
+      const sum = recentMonthKeys.reduce((s, mk) => s + (monthMap[mk] || 0), 0);
+      if (sum > 0) byCardAccountId[acctId] = sum;
+    });
+    const cardTotal = Object.values(byCardAccountId).reduce((s, v) => s + v, 0);
+    const recentTotal = recentBank + cardTotal;
+    const paymentSplit = {
+      bankAmount: recentBank, cardAmount: cardTotal, byCardAccountId,
+      bankRatio: recentTotal > 0 ? recentBank / recentTotal : 1,
+      cardRatio: recentTotal > 0 ? cardTotal / recentTotal : 0,
+    };
+    result[key] = { ...computeStreamRunRate(monthTotals), category, subCategory2: key.split("|")[1], monthsObserved: sortedMonthKeys, paymentSplit, transactionIds };
+  });
+  return result;
+}
+
+/** Whole months between two "YYYY-MM" keys - simple integer arithmetic on the
+ *  year/month components, distinct from the existing monthsBetween (which takes full
+ *  date strings and goes through Date parsing) since this only ever needs to compare
+ *  month-keys already sliced from transaction dates. */
+function monthsBetweenKeys(startKey, endKey) {
+  const [sy, sm] = startKey.split("-").map(Number);
+  const [ey, em] = endKey.split("-").map(Number);
+  return (ey - sy) * 12 + (em - sm);
+}
+
+/** The One-Time/Emergency allowance - a monthly RATE at which unplanned, One-Time
+ *  expenses have historically consumed cash, derived from the total One-Time expense
+ *  observed divided by the SPAN of months it was observed over (earliest to latest
+ *  One-Time transaction, inclusive) - not a monthly median, which would be misleading
+ *  here: One-Time events are inherently sparse (a few per year, not one a month), so
+ *  most months have zero and a median of mostly-zero-with-occasional-spikes would
+ *  understate the real rate. This is NOT a specific predicted future event (the spec
+ *  explicitly forbids that for unplanned One-Time items, and Control's Emergency
+ *  value was deliberately retired in favor of exactly this) - it's an aggregate
+ *  reserve rate, meant for the CFO/Insights layer to compare against things like the
+ *  Emergency Fund goal's target ("your fund covers roughly N months of your typical
+ *  one-time-expense rate"), never injected into the cash projection as a dated line
+ *  item. Confidence is driven by the number of distinct One-Time events observed, not
+ *  the span length - a handful of events over a long span is still a thin sample. */
+function computeOneTimeAllowance(transactions, excludeMonthKey) {
+  const oneTimeTxns = transactions
+    .filter((t) => t.category === "Expense" && t.frequencyClass === "One-Time")
+    .filter((t) => !(excludeMonthKey && t.date.slice(0, 7) === excludeMonthKey));
+
+  if (oneTimeTxns.length === 0) {
+    return { totalAmount: 0, spanMonths: 0, monthlyRate: 0, observationCount: 0, confidence: null };
+  }
+
+  const totalAmount = oneTimeTxns.reduce((s, t) => s + Math.abs(t.amount), 0);
+  const sortedDates = oneTimeTxns.map((t) => t.date).sort();
+  const spanMonths = monthsBetweenKeys(sortedDates[0].slice(0, 7), sortedDates[sortedDates.length - 1].slice(0, 7)) + 1;
+  const monthlyRate = totalAmount / spanMonths;
+  const observationCount = oneTimeTxns.length;
+  const confidence = observationCount >= 6 ? "High" : observationCount >= 3 ? "Medium" : "Low";
+
+  return { totalAmount, spanMonths, monthlyRate, observationCount, confidence };
+}
+
+/** A fund-specific goal's target amount - Emergency Fund's is recomputed live from
+ *  current average monthly expense (never stored on the goal, since it should track
+ *  spending as it changes, same as the goal card's own display already does);
+ *  Short-term's is the goal's own stored costToday directly. Shared by
+ *  computeRequiredMonthlyRate (the funding-gap rate) and Cash Flow Summary's PLANNED
+ *  bucket (the goal's eventual realization amount), so the two can never disagree
+ *  about what a goal is actually targeting. */
+function computeGoalTargetAmount(goal, transactions) {
+  return goal.type === "emergency"
+    ? (goal.emergencyMonths || 6) * computeAverageMonthlyExpense(transactions)
+    : (goal.costToday || 0);
+}
+
+/** A goal's target date - createdAt + yearsToGoal. yearsToGoal is a static value set
+ *  once at creation ("X years away" is what the goal card literally displays, never
+ *  dynamically recomputed against today as time passes), so the target date must be
+ *  anchored to when the goal was created, not to today. */
+function computeGoalTargetDate(goal) {
+  const created = new Date(goal.createdAt);
+  const totalMonths = Math.round((goal.yearsToGoal || 0) * 12);
+  const target = new Date(Date.UTC(created.getUTCFullYear(), created.getUTCMonth() + totalMonths, created.getUTCDate()));
+  return target.toISOString().slice(0, 10);
+}
+
+/** A fund-specific goal's required linear monthly funding rate - target divided
+ *  evenly across the months to goal. Deliberately NOT computeGoalMath's compound-
+ *  interest SIP formula, since fund-specific goals (Emergency Fund, Short-term) skip
+ *  the inflation/return-rate assumptions step entirely in the goal wizard - under a
+ *  year, compounding is negligible and the app never asks for those assumptions on
+ *  these goal types. */
+function computeRequiredMonthlyRate(goal, transactions) {
+  const months = (goal.yearsToGoal || 0) * 12;
+  if (months <= 0) return 0;
+  return computeGoalTargetAmount(goal, transactions) / months;
+}
+
+/** Goal funding-gap detection - scoped to fund-specific goals only (Emergency Fund,
+ *  Short-term - the two types with assignedInstrumentKeys, a real link to specific
+ *  holdings), per the deliberate V1 scoping decision (every other goal type parked in
+ *  BACKLOG.md, since they're funded from a pooled portfolio value with no per-goal
+ *  instrument to check). Checks whether the assigned instrument(s)' investedValue -
+ *  cost basis, so it only moves on real contributions/redemptions, never market price
+ *  swings - has grown between the earliest and latest available holdingSnapshots at
+ *  roughly the goal's required rate. If the user has set aside real, tracked
+ *  investment for the goal, it's genuinely on track and needs no separate cash event
+ *  in the projection (the SIP outflows already are the cash event); if not, this is
+ *  exactly the gap the CFO should surface as an insight, not paper over by inventing
+ *  a catch-up transaction. Reports the raw actual/required numbers and gap, not just
+ *  a verdict the caller can't inspect - the "On Track" tolerance (90% of required,
+ *  allowing for normal snapshot-to-snapshot timing noise) is a V1 starting
+ *  parameter, not a fixed production constant, same posture as the Amount
+ *  Behaviour thresholds. */
+/** A fund-specific goal's actual funding progress - the latest observed accumulated
+ *  value (summed across its assigned instruments' most recent snapshot) and the
+ *  actual monthly rate it's been growing at (from the earliest to the latest
+ *  snapshot). Shared by computeGoalFundingGaps (the funding-gap check) and Cash Flow
+ *  Summary's PLANNED bucket (which projects this rate forward to the goal's target
+ *  date), so the two can never disagree about how a goal is actually progressing.
+ *  Returns null when there's fewer than two snapshot dates - not enough history to
+ *  derive a rate from, distinct from a rate of zero (no growth) which IS meaningful. */
+function computeGoalFundingSnapshot(goal, holdingSnapshots, accounts) {
+  const investmentAccounts = accounts.filter((a) => a.type === "demat" || a.type === "mutualFund");
+  const byDate = {};
+  investmentAccounts.forEach((acct) => {
+    const snaps = holdingSnapshots.filter((s) => s.accountId === acct.id);
+    snaps.forEach((s) => {
+      (goal.assignedInstrumentKeys || []).forEach((key) => {
+        const h = (s.holdings || []).find((x) => x.instrumentKey === key);
+        if (h && h.investedValue != null) {
+          byDate[s.asOfDate] = (byDate[s.asOfDate] || 0) + h.investedValue;
+        }
+      });
+    });
+  });
+  const dates = Object.keys(byDate).sort();
+  if (dates.length < 2) return null;
+  const first = dates[0], last = dates[dates.length - 1];
+  const growth = byDate[last] - byDate[first];
+  const spanMonths = monthsBetweenKeys(first.slice(0, 7), last.slice(0, 7)) || 1;
+  return { latestAccumulated: byDate[last], latestSnapshotDate: last, actualMonthlyRate: growth / spanMonths, observedFrom: first, observedTo: last };
+}
+
+function computeGoalFundingGaps(goals, holdingSnapshots, accounts, transactions) {
+  const fundSpecificGoals = goals.filter((g) => (g.assignedInstrumentKeys || []).length > 0);
+
+  return fundSpecificGoals.map((goal) => {
+    const requiredMonthlyRate = computeRequiredMonthlyRate(goal, transactions);
+    const snapshot = computeGoalFundingSnapshot(goal, holdingSnapshots, accounts);
+    if (!snapshot) {
+      return { goalId: goal.id, goalName: goal.name, requiredMonthlyRate, actualMonthlyRate: null, gap: null, status: "Insufficient Data" };
+    }
+    const { actualMonthlyRate, observedFrom, observedTo } = snapshot;
+    const gap = requiredMonthlyRate - actualMonthlyRate;
+    const status = actualMonthlyRate >= requiredMonthlyRate * 0.9 ? "On Track" : "Underfunded";
+    return { goalId: goal.id, goalName: goal.name, requiredMonthlyRate, actualMonthlyRate, gap, status, observedFrom, observedTo };
+  });
+}
+
+/** For a fund-specific, spend-triggering goal (Short-term - explicitly NOT Emergency
+ *  Fund, which has no spend event at all, ever - reaching its target date is a
+ *  savings milestone, not a purchase) with a target date in the horizon: projects
+ *  the accumulated value forward to the target date using the goal's own actual
+ *  funding rate (computeGoalFundingSnapshot - the same rate computeGoalFundingGaps
+ *  uses), then computes the two real legs - a redemption (capped at the target
+ *  amount, never showing a fabricated "profit" from overfunding) and the full
+ *  expense (the goal genuinely costs what it costs, regardless of funding status).
+ *  PLANNED's net = redemption - expense: exactly zero if fully funded (the SIP
+ *  already represents the whole cash impact, nothing left to project), or exactly
+ *  the real shortfall if not - never a separately invented "shortfall formula".
+ *  Both legs are returned individually (for Cash Flow Events' own explanation of
+ *  what a PLANNED total is made of), plus the net for Summary. latestAccumulated/
+ *  latestSnapshotDate/actualMonthlyRate default to 0 (no funding at all observed
+ *  yet) when the goal has no usable snapshot history - correctly producing a full,
+ *  unfunded outflow rather than crashing on missing data. */
+function computeGoalPlannedNet(goal, snapshot, requiredTargetAmount, targetDateStr) {
+  const latestAccumulated = snapshot ? snapshot.latestAccumulated : 0;
+  const latestSnapshotDate = snapshot ? snapshot.latestSnapshotDate : targetDateStr;
+  const actualMonthlyRate = snapshot ? snapshot.actualMonthlyRate : 0;
+  const monthsToTarget = Math.max(0, monthsBetweenKeys(latestSnapshotDate.slice(0, 7), targetDateStr.slice(0, 7)));
+  const projectedAccumulated = latestAccumulated + (actualMonthlyRate * monthsToTarget);
+  const redemption = Math.max(0, Math.min(projectedAccumulated, requiredTargetAmount));
+  const expense = requiredTargetAmount;
+  return { redemption, expense, net: redemption - expense, projectedAccumulated };
+}
+
+/** Cash Flow Summary's confidence-bucketed event totals - inflow and outflow shown
+ *  separately (never netted) within each of four buckets:
+ *   SCHEDULED - Recurring commitments with a confirmed (high-confidence) day pattern
+ *   EXPECTED  - Recurring commitments with a lower-confidence pattern (estimate/
+ *               expected tier) - the timing is still being learned
+ *   PLANNED   - near-term/fund-specific goals (Emergency Fund, Short-term - the same
+ *               scope as computeGoalFundingGaps) whose target date falls within the
+ *               period, shown at their target amount via the shared
+ *               computeGoalTargetAmount/computeGoalTargetDate helpers, so this can
+ *               never disagree with the funding-gap check about what a goal targets
+ *   PROJECTED - Irregular categories' statistical behavioural allowance
+ *               (computeForecastStreams), prorated across the period's months - not
+ *               a dated event, an aggregate estimate
+ *  Deliberately never nets inflow against outflow within a bucket - most buckets are
+ *  overwhelmingly one-directional in practice (SCHEDULED is where the one clean
+ *  recurring inflow, salary, usually lives), but forcing a net would silently hide
+ *  the side that does exist on the rare occasion it's there. */
+/** The single, unified Cash Flow Events list - every ACTUAL, SCHEDULED, EXPECTED,
+ *  PLANNED and PROJECTED event in one consistent shape, built from data already
+ *  computed elsewhere (the projection's own events, goal funding snapshots, forecast
+ *  streams) rather than re-deriving anything independently. This is deliberately the
+ *  SOURCE both the List/Calendar views AND (via computeCashFlowEventSummary, next)
+ *  Cash Flow Summary's bucket totals read from, so the two screens can never
+ *  disagree about what's happening.
+ *   ACTUAL    - real transactions, date <= today, within the period. Card-charged
+ *               Expense transactions still appear (a real, distinct economic event)
+ *               but are flagged cashDeferred - their cash impact belongs to a later
+ *               card settlement, not this moment, matching the same reasoning
+ *               computeCardPaymentRefinement already applies to the projection.
+ *   SCHEDULED/EXPECTED - sourced directly from projection.events (never re-derived),
+ *               split by the originating commitment's pattern confidence tier -
+ *               exactly the same split Summary's bucket cards use.
+ *   PLANNED   - each Short-term goal with a target date in the period produces TWO
+ *               events (redemption + expense) via computeGoalPlannedNet, never a
+ *               single netted figure here - only Summary nets them. Emergency Fund
+ *               goals never appear here at all - no spend event exists for them.
+ *   PROJECTED - one aggregate event per Irregular stream per month it falls in the
+ *               period, monthOnly (an aggregate behavioural allowance is not a dated
+ *               transaction, and this must never fabricate one). */
+function computeCashFlowEvents({ transactions = [], accounts = [], merchantAliases = [], projection, commitments = [], amountBehaviors = {}, goals = [], holdingSnapshots = [], forecastStreams = {}, startDateStr, endDateStr, todayStr }) {
+  const accountType = {};
+  accounts.forEach((a) => { accountType[a.id] = a.type; });
+  const transactionById = {};
+  transactions.forEach((t) => { transactionById[t.id] = t; });
+  const events = [];
+
+  // ACTUAL
+  transactions
+    .filter((t) => t.date <= todayStr && t.date >= startDateStr && t.date <= endDateStr)
+    .forEach((t) => {
+      const isCardCharged = t.category === "Expense" && accountType[t.accountId] === "creditCard";
+      events.push({
+        id: `actual-${t.id}`, date: t.date, monthOnly: false, status: "ACTUAL",
+        direction: t.direction === "credit" ? "inflow" : "outflow",
+        amount: Math.abs(t.amount), name: t.description,
+        category: t.category, subCategory: t.subCategory || null, subCategory2: merchantSubcategory(t, merchantAliases),
+        accountId: t.accountId, source: "actual", confidence: null,
+        cashDeferred: isCardCharged, transactionId: t.id,
+      });
+    });
+
+  // SCHEDULED / EXPECTED - sourced from the projection's own events, not re-derived.
+  // Always >= todayStr already (the projection never walks backward), so only an
+  // upper bound is needed here - but that bound matters now: unlike Summary (whose
+  // own endDateStr always equals the projection's own horizon end exactly), this
+  // screen's caller may ask for a period narrower than the projection it was handed.
+  const commitmentByKey = {};
+  commitments.forEach((c) => { commitmentByKey[c.key] = c; });
+  (projection?.events || []).forEach((e) => {
+    const effectiveDate = e.date || `${e.year}-${String(e.month).padStart(2, "0")}-01`;
+    if (effectiveDate > endDateStr) return;
+    const c = commitmentByKey[e.key];
+    // SCHEDULED requires certainty on BOTH axes - a confirmed timing pattern AND a
+    // Fixed amount at High confidence. Either alone isn't enough: a well-timed but
+    // variable-amount commitment (electricity) or a fixed-but-newly-forming pattern
+    // isn't genuinely "scheduled" the way rent, known day and known amount, is.
+    // Everything else recurring falls to EXPECTED.
+    const ab = c ? amountBehaviors[c.key] : null;
+    const timingConfirmed = c && c.pattern.confidenceTier === "confirmed";
+    const amountCertain = ab && ab.amountBehavior === "Fixed" && ab.confidence === "High";
+    const status = (timingConfirmed && amountCertain) ? "SCHEDULED" : "EXPECTED";
+    const historicalTransactions = c ? c.transactionIds.map((id) => transactionById[id]).filter(Boolean) : [];
+    const cardSpendBreakdown = (projection?.cardSpendBreakdowns || {})[e.key] || null;
+    events.push({
+      id: `${e.source}-${e.key}-${e.date || `${e.year}-${e.month}`}`, date: e.date, monthOnly: e.monthOnly, year: e.year, month: e.month,
+      status, direction: e.amount >= 0 ? "inflow" : "outflow", amount: Math.abs(e.amount),
+      name: e.name, category: c ? c.category : null, subCategory: c ? c.subCategory : null, subCategory2: c ? c.subCategory2 : null,
+      accountId: c ? c.accountId : null, linkedAccountId: c ? c.linkedAccountId : null,
+      frequency: c ? c.frequency : null, occurrenceCount: c ? c.occurrenceCount : null,
+      amountBehavior: ab ? ab.amountBehavior : null, amountConfidence: ab ? ab.confidence : null,
+      source: "recurring", confidence: e.confidence, commitmentKey: e.key,
+      historicalTransactions, cardSpendBreakdown,
+    });
+  });
+
+  // PLANNED - two legs per qualifying goal, never a single netted figure here
+  goals.filter((g) => g.type === "shortterm").forEach((g) => {
+    const targetDate = computeGoalTargetDate(g);
+    if (targetDate < startDateStr || targetDate > endDateStr) return;
+    const snapshot = computeGoalFundingSnapshot(g, holdingSnapshots, accounts);
+    const requiredTargetAmount = computeGoalTargetAmount(g, transactions);
+    const { redemption, expense } = computeGoalPlannedNet(g, snapshot, requiredTargetAmount, targetDate);
+    events.push({ id: `planned-${g.id}-redemption`, date: targetDate, monthOnly: false, status: "PLANNED", direction: "inflow", amount: redemption, name: `${g.name} - redemption`, category: "Investment", source: "planned-goal", confidence: null, goalId: g.id });
+    events.push({ id: `planned-${g.id}-expense`, date: targetDate, monthOnly: false, status: "PLANNED", direction: "outflow", amount: expense, name: `${g.name} - expense`, category: "Expense", source: "planned-goal", confidence: null, goalId: g.id });
+  });
+
+  // PROJECTED - one aggregate monthOnly event per Irregular stream per month in
+  // range, never starting before today's own month - an entirely-past month's spend
+  // is already represented by real ACTUAL transactions, so a full-month PROJECTED
+  // allowance for it would double-represent the same spend. The current, in-progress
+  // month still gets one (a V1 simplification: shown at its full typical monthly
+  // amount rather than precisely prorated for the remaining days, unlike
+  // computeCashProjection's own daily walk, which does prorate).
+  const projectedLoopStartKey = startDateStr.slice(0, 7) > todayStr.slice(0, 7) ? startDateStr.slice(0, 7) : todayStr.slice(0, 7);
+  const [sy, sm] = projectedLoopStartKey.split("-").map(Number);
+  const [ey, em] = endDateStr.slice(0, 7).split("-").map(Number);
+  const monthSpan = (ey - sy) * 12 + (em - sm);
+  Object.entries(forecastStreams).forEach(([key, s]) => {
+    if (s.forecastAmount == null) return;
+    // Only the bank-paid portion is shown as THIS category's projected cash outflow -
+    // the card-charged portion's cash impact is already represented once, via the
+    // settling Debt Payment's own refined amount (see computeCardPaymentRefinement);
+    // showing the full amount here too would double-count it, the exact bug this
+    // fixes. Income is unaffected - there's no "charged to a card" concept for it,
+    // so bankRatio is always 1.
+    const bankRatio = s.category === "Expense" && s.paymentSplit ? s.paymentSplit.bankRatio : 1;
+    const displayAmount = s.forecastAmount * bankRatio;
+    const cardChargedAmount = s.forecastAmount - displayAmount;
+    // Entirely card-charged (bank portion is exactly zero) - nothing to show under
+    // this category directly; the full amount already appears via the card payment.
+    if (displayAmount <= 0) return;
+    const historicalTransactions = (s.transactionIds || []).map((id) => transactionById[id]).filter(Boolean);
+    let y = sy, m = sm;
+    for (let i = 0; i <= monthSpan; i++) {
+      events.push({
+        id: `projected-${key}-${y}-${m}`, date: null, monthOnly: true, year: y, month: m,
+        status: "PROJECTED", direction: s.category === "Income" ? "inflow" : "outflow",
+        amount: displayAmount, name: s.subCategory2 || key, category: s.category,
+        source: "projected-stream", confidence: s.confidence, streamKey: key,
+        observationMonths: (s.monthsObserved || []).length, typicalOccurrenceAmount: s.typicalOccurrenceAmount,
+        occurrencesPerMonth: s.occurrencesPerMonth, cardChargedAmount: cardChargedAmount > 0 ? cardChargedAmount : null,
+        historicalTransactions,
+      });
+      m++; if (m > 12) { m = 1; y++; }
+    }
+  });
+
+  return events;
+}
+
+/** Restructures the unified event list for List view display: ACTUAL rows
+ *  (previously one per real transaction) are aggregated into one row per
+ *  (month, category, Sub2-or-Sub1-fallback) with a total, matching PROJECTED's own
+ *  existing granularity exactly (both by Sub2, both monthly) so the two are directly
+ *  comparable. Each aggregate carries its underlying individual transaction events
+ *  for the detail drawer's drill-back. SCHEDULED/EXPECTED/PLANNED pass through
+ *  unchanged - each represents one specific named thing, not a diffuse category, so
+ *  aggregating them would lose the specificity that makes them useful. PROJECTED
+ *  already arrives one-per-stream-per-month from computeCashFlowEvents itself, so it
+ *  passes through unchanged too - only its display treatment differs (in EventRow). */
+function aggregateActualForDisplay(events) {
+  const passthrough = events.filter((e) => e.status !== "ACTUAL");
+  const actualEvents = events.filter((e) => e.status === "ACTUAL");
+
+  const groups = {};
+  actualEvents.forEach((e) => {
+    const mk = e.date.slice(0, 7);
+    const label = (e.subCategory2 && e.subCategory2 !== "Other") ? e.subCategory2 : (e.subCategory || "Other");
+    const key = `${mk}|${e.category}|${label}|${e.direction}`;
+    if (!groups[key]) {
+      const [y, m] = mk.split("-").map(Number);
+      groups[key] = {
+        id: `actual-agg-${key}`, date: null, monthOnly: true, year: y, month: m,
+        status: "ACTUAL", category: e.category, direction: e.direction, name: label,
+        amount: 0, source: "actual-aggregate", confidence: null, underlyingEvents: [],
+      };
+    }
+    groups[key].amount += e.amount;
+    groups[key].underlyingEvents.push(e);
+  });
+
+  return [...passthrough, ...Object.values(groups)];
+}
+
+/** Given one event and the full unified list, finds its related events along the
+ *  credit-card chain (Card Expense -> Card Liability -> Card Settlement), for Event
+ *  Detail's "why is this here" / "related events" section. Never duplicates or
+ *  invents events - a pure lookup/filter over the already-built list, using each
+ *  event's own accountId/linkedAccountId to trace the relationship, matching the
+ *  spec's explicit instruction to use the existing model as the source of truth. For
+ *  a card-charged Expense, finds the settling Debt Payment(s) on or after its date.
+ *  For a card's Debt Payment, finds the underlying card-charged expenses within the
+ *  window since the PREVIOUS payment for that same card (if any) up to this one -
+ *  a precise "what does this settlement cover" answer rather than a rough guess. */
+function findRelatedCardEvents(event, allEvents, accounts) {
+  const accountType = {};
+  accounts.forEach((a) => { accountType[a.id] = a.type; });
+
+  const isCardChargedExpense = event.status === "ACTUAL" && event.category === "Expense" && event.cashDeferred === true;
+  const isCardDebtPayment = event.category === "Transfer" && event.subCategory === "Debt Payment" && accountType[event.linkedAccountId] === "creditCard";
+
+  if (isCardChargedExpense) {
+    return allEvents
+      .filter((e) => e.category === "Transfer" && e.subCategory === "Debt Payment" && e.linkedAccountId === event.accountId)
+      .filter((e) => e.date && e.date >= event.date)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  if (isCardDebtPayment) {
+    const priorPayments = allEvents
+      .filter((e) => e.category === "Transfer" && e.subCategory === "Debt Payment" && e.linkedAccountId === event.linkedAccountId && e.date && event.date && e.date < event.date)
+      .sort((a, b) => b.date.localeCompare(a.date));
+    const windowStart = priorPayments.length > 0 ? priorPayments[0].date : null;
+    return allEvents
+      .filter((e) => e.status === "ACTUAL" && e.category === "Expense" && e.cashDeferred === true && e.accountId === event.linkedAccountId)
+      .filter((e) => e.date <= event.date && (!windowStart || e.date > windowStart));
+  }
+
+  return [];
+}
+
+/** Resolves a Sub2-equivalent label per event type, since the unified event shape
+ *  isn't uniform across statuses: ACTUAL/SCHEDULED/EXPECTED carry subCategory2
+ *  directly; PROJECTED encodes its already-resolved Sub2/Sub1 label in `name` (per
+ *  its own construction in computeCashFlowEvents); PLANNED has no natural
+ *  spending-stream concept at all (it's per-goal, not per-category), so each goal
+ *  leg becomes its own line item by name. Used by rollupEventsByLevel below, for
+ *  Cash Flow Performance's category/Sub2 breakdown. */
+function resolveEventStreamLabel(event) {
+  if (event.status === "PROJECTED") return event.name;
+  if (event.subCategory2 && event.subCategory2 !== "Other") return event.subCategory2;
+  if (event.subCategory) return event.subCategory;
+  return event.name || "Other";
+}
+
+/** Rolls a unified event list up into total -> byCategory -> bySub2, each level
+ *  carrying both a signed total (inflow positive, outflow negative, so a variance is
+ *  one meaningful number rather than two separate ones to reconcile) and the
+ *  underlying events themselves, for Cash Flow Performance's Audit Drawer to drill
+ *  down to the lowest level. Works identically whether fed real ACTUAL events or
+ *  forecast (SCHEDULED/EXPECTED/PLANNED/PROJECTED) events - the same rollup shape on
+ *  both sides is what makes them directly comparable at every level. */
+function rollupEventsByLevel(events) {
+  const result = { total: 0, byCategory: {} };
+  events.forEach((e) => {
+    const signed = e.direction === "inflow" ? e.amount : -e.amount;
+    const cat = e.category || "Other";
+    result.total += signed;
+    if (!result.byCategory[cat]) result.byCategory[cat] = { total: 0, bySub2: {} };
+    result.byCategory[cat].total += signed;
+    const label = resolveEventStreamLabel(e);
+    if (!result.byCategory[cat].bySub2[label]) result.byCategory[cat].bySub2[label] = { total: 0, events: [] };
+    result.byCategory[cat].bySub2[label].total += signed;
+    result.byCategory[cat].bySub2[label].events.push(e);
+  });
+  return result;
+}
+
+/** Cash Flow Performance: a genuine backtest, not today's current forecast reapplied
+ *  retroactively. For each calendar month, Actual is the real transactions that
+ *  happened in it; Projected is what the SAME forecasting pipeline would have said,
+ *  using only transactions (and holding snapshots, for the PLANNED/goal legs) dated
+ *  strictly before that month began - so an early, thin commitment history is
+ *  exactly as uncertain here as it genuinely was at the time, not silently improved
+ *  by hindsight. No persistence at all: computed fresh each time from the existing
+ *  functions, just fed a truncated transaction window and an earlier vantage-point
+ *  date. One deliberate exception to the training-data-before-M rule: goals
+ *  themselves have no historical versioning anywhere in the app, so PLANNED legs
+ *  reflect today's current goals, not necessarily what existed as of that month -
+ *  a known, flagged limitation rather than a silently wrong one. */
+function computeCashFlowPerformance(transactions, accounts, rules, merchantAliases, goals, holdingSnapshots, monthKeys) {
+  const results = {};
+  monthKeys.forEach((mk) => {
+    const [y, m] = mk.split("-").map(Number);
+    const firstDay = `${mk}-01`;
+    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const lastDay = `${mk}-${String(daysInMonth).padStart(2, "0")}`;
+
+    const trainingTxns = transactions.filter((t) => t.date < firstDay);
+    const trainingSnapshots = holdingSnapshots.filter((s) => s.asOfDate < firstDay);
+    const commitments = computeRecurringCommitments(trainingTxns, accounts, rules, merchantAliases);
+    const amountBehaviors = computeAmountBehaviors(trainingTxns, merchantAliases);
+    const forecastStreams = computeForecastStreams(trainingTxns, accounts, commitments, merchantAliases, null);
+    // horizonMonths: 1, NOT 0 - computeCashProjection's endDateStr formula (day =
+    // sd-1) breaks for horizonMonths=0 when startDateStr is the 1st of a month:
+    // day 0 rolls back to the LAST DAY OF THE PREVIOUS MONTH, producing an
+    // endDateStr before startDateStr, which silently drops every commitment event
+    // (their date-range filter can never pass when endDateStr < startDateStr).
+    // horizonMonths=1 correctly lands on the last day of THIS month instead; the
+    // resulting extra month of internally-walked events is still correctly trimmed
+    // by computeCashFlowEvents' own, separately-passed endDateStr bound below.
+    // startBalance: 0 - irrelevant here, only projection.events is used, never the
+    // daily balance walk.
+    const projection = computeCashProjection(0, firstDay, 1, { commitments, amountBehaviors, forecastStreams, accounts, cashBuffer: 0 });
+
+    // transactions here is the FULL, real set (not training-truncated) - the ACTUAL
+    // segment picks up this month's genuine actuals directly from it, while the
+    // forecast segments (SCHEDULED/EXPECTED/PLANNED/PROJECTED) are driven entirely
+    // by the training-only commitments/forecastStreams/projection/holdingSnapshots
+    // passed in above. One call correctly produces both sides of the comparison.
+    const events = computeCashFlowEvents({
+      transactions, accounts, merchantAliases, projection, commitments, amountBehaviors,
+      goals, holdingSnapshots: trainingSnapshots, forecastStreams,
+      startDateStr: firstDay, endDateStr: lastDay, todayStr: lastDay,
+    });
+
+    const actualEvents = events.filter((e) => e.status === "ACTUAL");
+    const projectedEvents = events.filter((e) => e.status !== "ACTUAL");
+
+    results[mk] = {
+      monthKey: mk, label: monthLabel(mk),
+      actual: rollupEventsByLevel(actualEvents), projected: rollupEventsByLevel(projectedEvents),
+      trainingTransactionCount: trainingTxns.length,
+    };
+  });
+  return results;
+}
+
+/** Cash Flow Summary's confidence-bucketed event totals - now purely a rollup over
+ *  computeCashFlowEvents' own unified list, guaranteeing Summary's totals can never
+ *  disagree with what Cash Flow Events shows, since both read from the exact same
+ *  source. PLANNED is netted (all qualifying goals' redemptions offsetting all their
+ *  expenses, combined) rather than shown as separate inflow/outflow like the other
+ *  buckets - matching the confirmed design where Summary shows only the net cash
+ *  impact and Events shows both legs separately for explanation. Summing every
+ *  goal's redemption and expense separately, then taking the difference, is
+ *  mathematically identical to summing each goal's own net individually (since
+ *  subtraction distributes over sums), so this stays correct with any number of
+ *  goals without needing to track them per-goal here. ACTUAL events are correctly
+ *  ignored - Summary's event section is entirely forward-looking. */
+function computeCashFlowEventSummary(events) {
+  const buckets = {
+    SCHEDULED: { inflow: 0, outflow: 0 },
+    EXPECTED: { inflow: 0, outflow: 0 },
+    PLANNED: { inflow: 0, outflow: 0 },
+    PROJECTED: { inflow: 0, outflow: 0 },
+  };
+  let plannedRedemption = 0, plannedExpense = 0;
+  events.forEach((e) => {
+    if (e.status === "PLANNED") {
+      if (e.direction === "inflow") plannedRedemption += e.amount;
+      else plannedExpense += e.amount;
+      return;
+    }
+    if (!buckets[e.status]) return;
+    buckets[e.status][e.direction] += e.amount;
+  });
+  const plannedNet = plannedExpense - plannedRedemption;
+  if (plannedNet > 0) buckets.PLANNED.outflow = plannedNet;
+  return buckets;
+}
+
+/** Projected Savings Rate - derived directly from computeCashFlowEventSummary's own
+ *  output (summed across all four buckets) rather than an independent computation,
+ *  so this can never disagree with what the event summary itself shows. Distinct
+ *  from CashFlowOverview's existing Actual savings rate, which is computed purely
+ *  from real, historical transactions - this one is entirely forward-looking. */
+function computeProjectedSavingsRate(eventSummary) {
+  const totalInflow = Object.values(eventSummary).reduce((s, b) => s + b.inflow, 0);
+  const totalOutflow = Object.values(eventSummary).reduce((s, b) => s + b.outflow, 0);
+  const savings = totalInflow - totalOutflow;
+  return { rate: totalInflow > 0 ? (savings / totalInflow) * 100 : null, income: totalInflow, expense: totalOutflow, savings };
+}
+
+/** Actual Savings Rate - purely historical, from real transactions only, over a
+ *  trailing window (default 6 months, matching computeAverageMonthlyExpense's
+ *  already-established trailing-window convention elsewhere in the app, rather than
+ *  inventing a different one). Distinct from computeProjectedSavingsRate, which is
+ *  entirely forward-looking. excludeMonthKey (normally today's real calendar month)
+ *  drops the still-in-progress month, same reasoning as computeForecastStreams. */
+function computeActualSavingsRate(transactions, trailingMonths, excludeMonthKey) {
+  const byMonth = {};
+  transactions.forEach((t) => {
+    if (t.category !== "Income" && t.category !== "Expense") return;
+    const mk = t.date.slice(0, 7);
+    if (excludeMonthKey && mk === excludeMonthKey) return;
+    if (!byMonth[mk]) byMonth[mk] = { income: 0, expense: 0 };
+    if (t.category === "Income" && t.direction === "credit") byMonth[mk].income += t.amount;
+    if (t.category === "Expense") byMonth[mk].expense += Math.abs(t.amount);
+  });
+  const months = Object.keys(byMonth).sort().slice(-trailingMonths);
+  const income = months.reduce((s, mk) => s + byMonth[mk].income, 0);
+  const expense = months.reduce((s, mk) => s + byMonth[mk].expense, 0);
+  return { rate: income > 0 ? ((income - expense) / income) * 100 : null, income, expense, monthsUsed: months.length };
+}
+
+
 const FREQUENCY_STEP_MONTHS = { Monthly: 1, Quarterly: 3, "Semi-Annual": 6, Annual: 12 };
 
-/** Given a learned commitment and a target year/month, decides whether it's expected
- *  to land in that month at all, and if so, on which specific date. A Quarterly
- *  commitment shouldn't appear in every month's calendar just because its day is
- *  known - it only recurs every 3rd month, counted forward from when it actually
- *  last happened, not from some fixed calendar anchor. Returns null when the
- *  commitment has no learned pattern at all, or when this specific month isn't one
- *  of its recurring months. */
+/** Given a learned commitment and a target year/month, decides whether it recurs in
+ *  that month at all, and separately, whether a specific day is also known. A
+ *  Quarterly commitment shouldn't appear in every month's calendar just because its
+ *  day is known - it only recurs every 3rd month, counted forward from when it
+ *  actually last happened, not from some fixed calendar anchor. These are two
+ *  separable facts, not one: a commitment whose day couldn't be learned (a
+ *  genuinely scattered history) can still honestly say "yes, expected this month,
+ *  exact day unknown" - {recurs: true, date: null} - rather than being silently
+ *  dropped. The caller decides what a month-only answer is useful for: the Calendar
+ *  grid is fundamentally day-based and can't place a dot with no day, but List and
+ *  Recurring Commitments can state the month-level fact honestly on its own. */
 function projectOccurrenceForMonth(commitment, targetYear, targetMonth /* 1-12 */) {
-  if (!commitment.pattern.hasPattern) return null;
+  if (!commitment.pattern.recurs) return { recurs: false, date: null };
   const step = FREQUENCY_STEP_MONTHS[commitment.frequency] || 1;
 
   const [lastYear, lastMonth] = commitment.lastSeenDate.split("-").map(Number);
   const monthsSince = (targetYear - lastYear) * 12 + (targetMonth - lastMonth);
-  if (monthsSince <= 0 || monthsSince % step !== 0) return null;
+  if (monthsSince <= 0 || monthsSince % step !== 0) return { recurs: false, date: null };
+
+  if (!commitment.pattern.hasPattern) return { recurs: true, date: null }; // month known, day genuinely isn't
 
   const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
 
   if (commitment.pattern.patternType === "dayOfMonth") {
     const day = Math.min(commitment.pattern.expectedDay, daysInTargetMonth); // clamp e.g. 31st in a 30-day month
-    return `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    return { recurs: true, date: `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}` };
   }
 
   // dayOfWeek pattern: walk the target month's days to find the matching weekday occurrence
@@ -412,8 +1398,232 @@ function projectOccurrenceForMonth(commitment, targetYear, targetMonth /* 1-12 *
     if (dow === expectedWeekday) matches.push(d);
   }
   const day = expectedOrdinal === "last" ? matches[matches.length - 1] : matches[parseInt(expectedOrdinal, 10) - 1];
-  if (!day) return null;
-  return `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!day) return { recurs: true, date: null };
+  return { recurs: true, date: `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}` };
+}
+
+/** Forecasting Engine: the master multi-month cash projection, the calculation
+ *  layer's central output. Walks day by day from startDate across horizonMonths
+ *  (architected for arbitrary N even though V1 only ever selects 1/3/6/12),
+ *  applying:
+ *   (1) Every Recurring commitment's projected occurrences within the horizon, on
+ *       their learned expected dates, using the commitment's own median-based
+ *       forecastAmount (via amountBehaviors[c.key] - the EXISTING commitmentGroupKey-
+ *       based lookup, reused as-is) rather than just its last-seen amount. Covers
+ *       Income, Expense, Investment, and Transfer/Debt commitments alike - all of
+ *       them genuinely move cash, so none are excluded from the walk itself (only
+ *       the separate statistical Amount Behaviour LEARNING layer is Income/Expense-
+ *       scoped, not the cash projection).
+ *   (2) Irregular categories' monthly behavioural allowance (forecastStreams,
+ *       Income/Expense scoped), spread evenly across the days of each stream's own
+ *       month - never a specific dated event, per the spec's explicit prohibition
+ *       on inventing specific transactions for unpredictable spending.
+ *  Deliberately excludes: One-Time events entirely (neither the aggregate One-Time
+ *  allowance nor any specific unplanned event - the allowance is a separate reserve
+ *  rate for CFO/Insights, never a cash-projection line item), and a fully-SIP-funded
+ *  goal's eventual realization (its SIP outflows, already Recurring commitments, ARE
+ *  the cash event - redeeming and spending what's already been set aside is cash-
+ *  neutral from this walk's perspective; only a genuine funding GAP, surfaced
+ *  separately by computeGoalFundingGaps, would mean fresh cash is actually needed,
+ *  and that's an insight for the CFO layer to raise, not something this function
+ *  invents a transaction for). Today (the start date) never receives an Irregular
+ *  allowance share - the starting balance already reflects whatever's genuinely
+ *  happened today, matching the existing computeProjectedDailyBalances' same
+ *  reasoning for not double-counting the current day. */
+
+const CONFIDENCE_RANK = { Low: 1, Medium: 2, High: 3 };
+const CONFIDENCE_RANK_TO_NAME = { 1: "Low", 2: "Medium", 3: "High" };
+const CONFIDENCE_WEIGHT = { Low: 1, Medium: 2, High: 3 };
+
+/** Blends two independent signals for a credit card's projected payment amount: the
+ *  behavioral signal (every spending stream's card-portion, attributed to this
+ *  specific card) and the Debt Payment commitment's own learned pattern (median of
+ *  actual past payment amounts). Timing always comes from the Debt Payment
+ *  commitment's own day-of-month pattern - the behavioral signal has no timing
+ *  information at all, Irregular streams don't carry a day-of-month concept - only
+ *  the AMOUNT is refined here. Weighted by each signal's own observation-count-based
+ *  confidence (Low/Medium/High -> 1/2/3), so a well-established payment pattern isn't
+ *  distorted by a thin behavioral sample, and vice versa - neither signal is assumed
+ *  superior by default. */
+function computeRefinedCardPaymentAmount(behavioralSignal, debtPaymentPattern) {
+  const bWeight = behavioralSignal ? (CONFIDENCE_WEIGHT[behavioralSignal.confidence] || 0) : 0;
+  const pWeight = debtPaymentPattern ? (CONFIDENCE_WEIGHT[debtPaymentPattern.confidence] || 0) : 0;
+  if (bWeight + pWeight === 0) return null;
+  const refinedAmount = ((behavioralSignal?.amount || 0) * bWeight + (debtPaymentPattern?.amount || 0) * pWeight) / (bWeight + pWeight);
+  return { refinedAmount, behavioralWeight: bWeight, patternWeight: pWeight };
+}
+
+/** For every credit card, works out (a) which Recurring Expense commitments are
+ *  card-charged and must therefore be EXCLUDED from generating their own direct
+ *  cash-projection event (their cash impact belongs to the card's settlement
+ *  instead, not a second, separate outflow), and (b) a refined projected amount for
+ *  that card's own Debt Payment commitment via computeRefinedCardPaymentAmount. A
+ *  card's aggregate behavioral confidence is the WEAKEST of its contributors - an
+ *  Irregular stream's observation count and a Recurring commitment's occurrence
+ *  count aren't directly comparable or summable, so "weakest link" is the
+ *  defensible, conservative choice rather than merging incompatible counts. A stream
+ *  with card spend split across several cards (paymentSplit.byCardAccountId)
+ *  attributes each card's own share correctly, rather than lumping "some card"
+ *  together - necessary for anyone holding more than one credit card. Loan-linked
+ *  Debt Payments (linkedAccountId not a credit card) are left completely untouched -
+ *  this refinement is credit-card specific, since only credit-card spend has this
+ *  "charged now, paid later" timing gap; a loan EMI's amount is already known and
+ *  fixed, nothing to refine. */
+function computeCardPaymentRefinement(commitments, amountBehaviors, forecastStreams, accounts) {
+  const accountType = {};
+  accounts.forEach((a) => { accountType[a.id] = a.type; });
+
+  const excludedRecurringKeys = new Set();
+  const cardBehavioral = {};
+
+  function contribute(cardId, amount, confidence, label) {
+    if (!cardId || amount <= 0) return;
+    if (!cardBehavioral[cardId]) cardBehavioral[cardId] = { amount: 0, minConfidenceRank: Infinity, contributions: [] };
+    cardBehavioral[cardId].amount += amount;
+    const rank = CONFIDENCE_RANK[confidence] || 1;
+    cardBehavioral[cardId].minConfidenceRank = Math.min(cardBehavioral[cardId].minConfidenceRank, rank);
+    cardBehavioral[cardId].contributions.push({ label, amount });
+  }
+
+  commitments.forEach((c) => {
+    if (c.category !== "Expense") return;
+    if (accountType[c.accountId] !== "creditCard") return;
+    excludedRecurringKeys.add(c.key);
+    const ab = amountBehaviors[c.key];
+    const amount = ab && ab.forecastAmount != null ? ab.forecastAmount : c.lastAmount;
+    contribute(c.accountId, amount, ab ? ab.confidence : "Low", c.name);
+  });
+
+  Object.values(forecastStreams).forEach((s) => {
+    if (s.category !== "Expense" || s.forecastAmount == null) return;
+    const split = s.paymentSplit;
+    if (!split || split.cardAmount <= 0) return;
+    Object.entries(split.byCardAccountId).forEach(([cardId, cardAmt]) => {
+      const shareOfCard = cardAmt / split.cardAmount;
+      const forecastCardPortion = s.forecastAmount * split.cardRatio * shareOfCard;
+      contribute(cardId, forecastCardPortion, s.confidence, s.subCategory2);
+    });
+  });
+
+  const refinedDebtPaymentAmounts = {};
+  const cardSpendBreakdowns = {};
+  commitments.forEach((c) => {
+    if (!(c.category === "Transfer" && c.subCategory === "Debt Payment" && c.linkedAccountId)) return;
+    if (accountType[c.linkedAccountId] !== "creditCard") return;
+    const behavioral = cardBehavioral[c.linkedAccountId];
+    const ab = amountBehaviors[c.key];
+    const behavioralSignal = behavioral ? { amount: behavioral.amount, confidence: CONFIDENCE_RANK_TO_NAME[behavioral.minConfidenceRank] } : null;
+    const patternSignal = ab && ab.forecastAmount != null ? { amount: ab.forecastAmount, confidence: ab.confidence } : null;
+    const refined = computeRefinedCardPaymentAmount(behavioralSignal, patternSignal);
+    if (refined) refinedDebtPaymentAmounts[c.key] = refined.refinedAmount;
+    if (behavioral) cardSpendBreakdowns[c.key] = behavioral.contributions;
+  });
+
+  return { excludedRecurringKeys, refinedDebtPaymentAmounts, cardBehavioral, cardSpendBreakdowns };
+}
+
+function computeCashProjection(startBalance, startDateStr, horizonMonths, { commitments = [], amountBehaviors = {}, forecastStreams = {}, accounts = [], cashBuffer = 0 } = {}) {
+  const [sy, sm, sd] = startDateStr.split("-").map(Number);
+  // Inclusive of the LAST day of the horizon, not the first day of the period after -
+  // a 1-month horizon from Jan 1 ends Jan 31, not Feb 1.
+  const endDateObj = new Date(Date.UTC(sy, sm - 1 + horizonMonths, sd - 1));
+  const endDateStr = endDateObj.toISOString().slice(0, 10);
+
+  const refinement = computeCardPaymentRefinement(commitments, amountBehaviors, forecastStreams, accounts);
+  const reroutedKeys = computeRerouteEligibleKeys(commitments);
+
+  const events = [];
+  commitments.forEach((c) => {
+    // Card-charged Expense commitments are excluded entirely - their cash impact
+    // belongs to the card's own Debt Payment settlement below, not a second, direct
+    // outflow of their own (see computeCardPaymentRefinement).
+    if (refinement.excludedRecurringKeys.has(c.key)) return;
+    // Rerouted (single-occurrence, Monthly-or-unset) commitments are ALSO excluded -
+    // their amount is already represented via the Sub2 stream aggregate
+    // (computeForecastStreams uses this exact same set), so generating a direct
+    // event here too would double-count it.
+    if (reroutedKeys.has(c.key)) return;
+    let ty = sy, tm = sm;
+    for (let i = 0; i <= horizonMonths; i++) {
+      const projection = projectOccurrenceForMonth(c, ty, tm);
+      if (projection.recurs) {
+        const ab = amountBehaviors[c.key];
+        const refinedAmount = refinement.refinedDebtPaymentAmounts[c.key];
+        const amount = refinedAmount != null ? refinedAmount : (ab && ab.forecastAmount != null ? ab.forecastAmount : c.lastAmount);
+        const isInflow = c.category === "Income";
+        const confidence = ab ? ab.confidence : "Low";
+        if (projection.date) {
+          if (projection.date >= startDateStr && projection.date <= endDateStr) {
+            events.push({ date: projection.date, monthOnly: false, amount: isInflow ? amount : -amount, source: "recurring", key: c.key, name: c.name, confidence });
+          }
+        } else {
+          // Month known, day genuinely isn't (see projectOccurrenceForMonth) - stated
+          // honestly as monthOnly for the events list, rather than silently dropped.
+          // The balance walk still needs SOME concrete date to apply the amount to,
+          // so it uses the earliest day within the projection's own range as a
+          // conservative placeholder (an outflow hitting early is the safer
+          // assumption for a cash-buffer-focused projection than hitting late).
+          const monthStart = `${ty}-${String(tm).padStart(2, "0")}-01`;
+          const placeholderDate = monthStart < startDateStr ? startDateStr : monthStart;
+          if (placeholderDate <= endDateStr) {
+            events.push({ date: placeholderDate, monthOnly: true, year: ty, month: tm, amount: isInflow ? amount : -amount, source: "recurring", key: c.key, name: c.name, confidence });
+          }
+        }
+      }
+      tm++; if (tm > 12) { tm = 1; ty++; }
+    }
+  });
+
+  // Every stream entering forecastStreams is, by construction, meant for allowance
+  // treatment (Irregular, or a Recurring commitment rerouted here for having only a
+  // single historical occurrence) - no further frequencyClass filter needed here.
+  const allowanceStreams = Object.values(forecastStreams).filter((s) => s.forecastAmount != null);
+  // Only the BANK-paid portion of Expense allowances enters the daily allowance
+  // directly - the card-paid portion's cash impact is already represented via the
+  // refined Debt Payment amount above, so including it again here would double-
+  // count the same spend twice.
+  const totalIrregularExpenseMonthly = allowanceStreams.filter((s) => s.category === "Expense").reduce((sum, s) => {
+    const bankRatio = s.paymentSplit ? s.paymentSplit.bankRatio : 1;
+    return sum + s.forecastAmount * bankRatio;
+  }, 0);
+  const totalIrregularIncomeMonthly = allowanceStreams.filter((s) => s.category === "Income").reduce((sum, s) => sum + s.forecastAmount, 0);
+
+  const dailyStates = [];
+  let balance = startBalance;
+  let minBalance = startBalance, minDate = startDateStr;
+  let d = new Date(startDateStr + "T00:00:00Z");
+  const end = new Date(endDateStr + "T00:00:00Z");
+  while (d <= end) {
+    const dateStr = d.toISOString().slice(0, 10);
+    const daysInThisMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+    const dayEvents = events.filter((e) => e.date === dateStr);
+    let committedDelta = 0;
+    dayEvents.forEach((e) => { committedDelta += e.amount; balance += e.amount; });
+    const dailyIrregularNet = (totalIrregularIncomeMonthly - totalIrregularExpenseMonthly) / daysInThisMonth;
+    const allowanceApplied = dateStr !== startDateStr ? dailyIrregularNet : 0;
+    if (dateStr !== startDateStr) balance += dailyIrregularNet;
+    balance = Math.round(balance * 100) / 100;
+    if (balance < minBalance) { minBalance = balance; minDate = dateStr; }
+    dailyStates.push({ date: dateStr, balance, events: dayEvents, committedDelta, allowanceApplied });
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+
+  const projectedMinimumCash = minBalance;
+  const cashDrawdown = startBalance - projectedMinimumCash;
+  const bufferSurplusOrShortfall = projectedMinimumCash - cashBuffer;
+
+  return {
+    horizon: { months: horizonMonths, startDate: startDateStr, endDate: endDateStr },
+    actualCashState: startBalance,
+    events,
+    dailyStates,
+    projectedMinimumCash,
+    projectedMinimumCashDate: minDate,
+    requiredCashBuffer: cashBuffer,
+    bufferSurplusOrShortfall,
+    cashDrawdown,
+    cardSpendBreakdowns: refinement.cardSpendBreakdowns,
+  };
 }
 
 /** Median monthly discretionary (Variable) spend across recent complete months - the
@@ -423,6 +1633,35 @@ function projectOccurrenceForMonth(commitment, targetYear, targetMonth /* 1-12 *
  *  would understate the real average the earlier it's checked in a month. Median, not
  *  mean, so one unusually large month doesn't skew the daily estimate - same
  *  reasoning as the existing suggested-budget calculation on the Cash Flow screen. */
+/** Walks forward month by month across a date range - not bound to a single
+ *  calendar month the way the Calendar grid's monthEvents is - and collects every
+ *  commitment occurrence that falls inside it, including month-known-but-day-
+ *  unknown occurrences. The Calendar grid has nowhere honest to place those (it's
+ *  fundamentally day-based); a list genuinely can, stated as "sometime this month"
+ *  rather than inventing a specific date for it. */
+function computeUpcomingCommitmentEvents(commitments, fromDateStr, toDateStr) {
+  const events = [];
+  const [fromY, fromM] = fromDateStr.slice(0, 7).split("-").map(Number);
+  const [toY, toM] = toDateStr.slice(0, 7).split("-").map(Number);
+  let y = fromY, m = fromM;
+  while (y < toY || (y === toY && m <= toM)) {
+    commitments.forEach((c) => {
+      const projection = projectOccurrenceForMonth(c, y, m);
+      if (!projection.recurs) return;
+      if (projection.date) {
+        if (projection.date >= fromDateStr && projection.date <= toDateStr) {
+          events.push({ commitment: c, date: projection.date, monthOnly: false });
+        }
+      } else {
+        events.push({ commitment: c, date: null, monthOnly: true, year: y, month: m });
+      }
+    });
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return events;
+}
+
 function computeMedianMonthlyDiscretionary(transactions, viewYear, viewMonth) {
   const currentMonthKey = `${viewYear}-${String(viewMonth).padStart(2, "0")}`;
   const monthTotals = {};
@@ -447,7 +1686,10 @@ function computeMedianMonthlyDiscretionary(transactions, viewYear, viewMonth) {
  *  been spent today if it's been imported; adding another day's worth on top would
  *  double-count it. Only non-"actual" events (projected/overdue) get applied day by
  *  day - real transactions dated today or earlier are already baked into the
- *  starting balance by the resolver. */
+ *  starting balance by the resolver. committedDelta and discretionaryApplied are
+ *  tracked as their own fields, not just folded into balance - a chart or tooltip
+ *  built on this needs to show discretionary as visibly distinct from known
+ *  commitments, never blended into one line that looks more certain than it is. */
 function computeProjectedDailyBalances(startBalance, todayStr, monthEndStr, monthEvents, dailyDiscretionary) {
   const results = [];
   let balance = startBalance;
@@ -456,9 +1698,11 @@ function computeProjectedDailyBalances(startBalance, todayStr, monthEndStr, mont
   while (d <= end) {
     const dateStr = d.toISOString().slice(0, 10);
     const dayEvents = monthEvents.filter((e) => e.date === dateStr && e.kind !== "actual");
-    dayEvents.forEach((e) => { balance += e.direction === "credit" ? e.amount : -e.amount; });
-    if (dateStr > todayStr) balance -= dailyDiscretionary;
-    results.push({ date: dateStr, balance: Math.round(balance * 100) / 100, events: dayEvents });
+    let committedDelta = 0;
+    dayEvents.forEach((e) => { const amt = e.direction === "credit" ? e.amount : -e.amount; committedDelta += amt; balance += amt; });
+    const discretionaryApplied = dateStr > todayStr ? dailyDiscretionary : 0;
+    balance -= discretionaryApplied;
+    results.push({ date: dateStr, balance: Math.round(balance * 100) / 100, events: dayEvents, committedDelta, discretionaryApplied });
     d.setUTCDate(d.getUTCDate() + 1);
   }
   return results;
@@ -469,6 +1713,7 @@ const PALETTE = {
   "Income-Salary": "#2E6659",
   "Income-Dividend": "#3E7C8C",
   "Income-Rent": "#6E8C5A",
+  "Income-Interest": "#4A7A6E",
   "Income-Others": "#8FA089",
   Investment: "#3E7C8C",
   "Expense-Fixed": "#55606B",
@@ -506,6 +1751,14 @@ const monthLabel = (mk) => {
   if (!mk || mk === "unknown") return "Unknown";
   const [y, m] = mk.split("-");
   return new Date(Number(y), Number(m) - 1, 1).toLocaleString("en-IN", { month: "short", year: "numeric" });
+};
+/** "18 Oct" style short date label, for Cash Flow Summary's date displays (Projected
+ *  Minimum Cash's date, the chart's tooltip) - day-and-month only, no year, matching
+ *  the spec's own worked example format. */
+const shortDateLabel = (dateStr) => {
+  if (!dateStr) return "";
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleString("en-IN", { day: "numeric", month: "short" });
 };
 
 /** Flattens a raw CSV/Excel header cell into a consistent, comparable form -
@@ -694,13 +1947,22 @@ function parseDateStr(v) {
 }
 
 /** Collapses a transaction description down to a short, mergeable "merchant key" -
- *  the first three cleaned-up words, e.g. "UPI/SWIGGY/419803038/BILL" becomes
- *  "SWIGGY BILL" (digits and punctuation already stripped by normalizeForMatch).
+ *  the first three MEANINGFUL cleaned-up words (digits and punctuation already
+ *  stripped by normalizeForMatch), e.g. "UPI/SWIGGY/419803038/BILL" becomes "SWIGGY".
+ *  Known generic noise words (MERCHANT_STOPWORDS - UPI, NACH, LTD, PAYMENT...) are
+ *  stripped BEFORE counting to three, not after - otherwise a description whose
+ *  noise prefix is itself 3+ words long (e.g. "NACH-ECS-CR-<payer>-<ref>") would
+ *  collapse every payer sharing that prefix into the same key, silently hiding
+ *  genuinely different transactions from each other. Falls back to the original
+ *  tokens if literally everything was a noise word, so this never returns empty.
  *  This is what lets near-identical bank descriptions for the same merchant group
  *  together in the Review tab and merchant-based reports, rather than every
  *  transaction reference number producing its own unique, ungroupable row. */
 function normalizeMerchant(desc) {
-  return normalizeForMatch(desc).split(" ").slice(0, 3).join(" ");
+  const cleaned = normalizeForMatch(desc);
+  const tokens = cleaned.split(" ").filter(Boolean).filter((t) => !MERCHANT_STOPWORDS.has(t));
+  const meaningful = tokens.length ? tokens : cleaned.split(" ").filter(Boolean);
+  return meaningful.slice(0, 3).join(" ");
 }
 
 // Same cleanup as normalizeMerchant (strip digits/punctuation, collapse whitespace) but
@@ -776,6 +2038,23 @@ function resolveAccountBalanceForPeriod(account, transactions, periodStart, peri
     ? (() => { const d = new Date(periodStart); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); })()
     : periodEnd;
   return resolveBalanceAsOfDate(account, transactions, targetDate);
+}
+
+/** Actual Cash State - the verified, real cash balance across every bank account,
+ *  as of a given date, summed from each account's own resolved closing balance.
+ *  Returns null (not 0) if ANY bank account's balance can't be resolved as of that
+ *  date, rather than silently reporting a partial, understated total as if it were
+ *  complete - an unverifiable total is not a verified one. Shared, top-level version
+ *  of what was previously a local function inside CashFlowCalendarView only (still
+ *  used there, now also the basis for Cash Flow Summary's Actual Cash State). */
+function computeAggregateCashBalance(bankAccounts, transactions, asOfDateStr) {
+  let known = true, total = 0;
+  bankAccounts.forEach((a) => {
+    const res = resolveAccountBalanceForPeriod(a, transactions, "2000-01-01", asOfDateStr, "closing");
+    if (res.value === null) { known = false; return; }
+    total += res.value;
+  });
+  return known ? total : null;
 }
 
 /** Every period-like signal an upload has, as comparable keys. An entry can have up to
@@ -1597,7 +2876,7 @@ function buildExpenseChangeBundle(transactions) {
   transactions.forEach((t) => {
     if (t.category !== "Expense") return;
     const mk = t.date.slice(0, 7);
-    const bucket = pillClass(t.category, t.subCategory, t.tag);
+    const bucket = pillClass(t.category, t.subCategory, t.frequencyClass);
     const signed = t.direction === "credit" ? -t.amount : t.amount;
     if (!byMonth[mk]) byMonth[mk] = { total: 0, buckets: {} };
     byMonth[mk].total += signed;
@@ -1691,7 +2970,7 @@ function buildMonthlySummaryBundle(transactions, merchantAliases) {
     if (t.category === "Expense") {
       const signed = t.direction === "credit" ? -t.amount : t.amount;
       m.expense += signed;
-      const bucket = pillClass(t.category, t.subCategory, t.tag);
+      const bucket = pillClass(t.category, t.subCategory, t.frequencyClass);
       m.buckets[bucket] = (m.buckets[bucket] || 0) + signed;
       const merchant = resolveMerchant(t.merchant || t.description, merchantAliases) || "—";
       m.merchants[merchant] = (m.merchants[merchant] || 0) + signed;
@@ -1765,7 +3044,7 @@ function buildFinancialLeaksBundle(transactions, merchantAliases) {
 /** A specific category's recent trend and top merchants — the bundle behind
  *  "Where is my money going in [category]?". */
 function buildCategoryBundle(categoryKey, transactions, merchantAliases) {
-  const relevant = transactions.filter((t) => t.category === "Expense" && pillClass(t.category, t.subCategory, t.tag) === categoryKey);
+  const relevant = transactions.filter((t) => t.category === "Expense" && pillClass(t.category, t.subCategory, t.frequencyClass) === categoryKey);
   if (relevant.length === 0) return { hasData: false, categoryKey };
   const byMonth = {};
   const byMerchant = {};
@@ -2038,6 +3317,11 @@ const MERCHANT_STOPWORDS = new Set([
   "UPI", "IMPS", "NEFT", "RTGS", "POS", "LTD", "PVT", "LIMITED", "PRIVATE", "INDIA",
   "PAYMENT", "PAYMENTS", "PAY", "TECHNOLOGIES", "TECHNOLOGY", "SERVICES", "SERVICE",
   "SOLUTIONS", "INC", "CORP", "COMPANY", "CO", "THE", "AND", "BILL", "TXN", "REF", "ONLINE",
+  // Generic transaction-type/clearing-mechanism codes - these prefix many bank
+  // description formats (NACH-ECS-CR-<actual payer>-<ref number>) and, left in,
+  // can consume the entire word budget before reaching the part that actually
+  // distinguishes one payer from another (see normalizeMerchant).
+  "NACH", "ECS", "ACH", "ENACH", "CR", "DR", "SI",
 ]);
 
 /** Strips generic banking/corporate noise words (UPI, LTD, TECHNOLOGY, etc.) from a
@@ -2064,6 +3348,23 @@ function resolveMerchant(rawKey, aliases) {
   return group ? group.canonical : rawKey;
 }
 
+/** Field B / "Sub Category" - the merchant-grouping-driven classification. Live-
+ *  computed from Merchant Groups on every read, never stored on the transaction or
+ *  rule - rename or regroup a merchant in Merchant Groups and every affected
+ *  transaction's reading updates instantly, with nothing to backfill. Not user-
+ *  selected per transaction; the only way to change it is to (re)group the merchant.
+ *  Unlike resolveMerchant (which falls back to the raw merchant text - correct for
+ *  its other uses, like top-merchant lists), this specifically returns "Other" when
+ *  a transaction's merchant doesn't belong to any group yet. "Other" is permanently
+ *  reserved - no group can ever be named it (enforced in Merchant Groups' own
+ *  creation/rename UI), so this fallback can never collide with a real group. */
+function merchantSubcategory(t, merchantAliases) {
+  const rawKey = t.merchant || t.description;
+  if (!rawKey) return "Other";
+  const group = (merchantAliases || []).find((g) => g.variants.includes(rawKey));
+  return group ? group.canonical : "Other";
+}
+
 /** Cluster not-yet-grouped merchant strings that share the same "core" signature once
  *  generic banking noise words (UPI, TECHNOLOGY, LTD, ...) are stripped out. */
 function computeSuggestedMerchantClusters(transactions, aliases) {
@@ -2072,7 +3373,11 @@ function computeSuggestedMerchantClusters(transactions, aliases) {
 
   const stats = {};
   transactions.forEach((t) => {
-    if (t.category !== "Expense") return;
+    // Expense and Income both suffer from real merchant/payer-name variation
+    // (different wording across statements for the same subscription or the same
+    // employer's payroll). Investment and Transfer are excluded - their identity
+    // is already handled through linkedAccountId, not a merchant string.
+    if (t.category !== "Expense" && t.category !== "Income") return;
     const key = t.merchant || t.description;
     if (!key || alreadyGrouped.has(key)) return;
     if (!stats[key]) stats[key] = { key, count: 0, total: 0 };
@@ -2103,50 +3408,57 @@ function computeSuggestedMerchantClusters(transactions, aliases) {
  *  (priority = pattern length, same as any other rule) - a user-added or learned rule
  *  with the same or a more specific pattern always wins a tie via matchRule's sort. */
 function seedRules() {
+  // [pattern, category, subCategory, tag, frequencyClass, control]
   const seed = [
-    ["salary", "Income", null, null],
-    ["interest cr", "Income", null, null],
-    ["dividend", "Income", null, null],
-    ["refund", "Income", null, null],
-    ["sip", "Investment", null, null],
-    ["mutual fund", "Investment", null, null],
-    ["zerodha", "Investment", null, null],
-    ["groww", "Investment", null, null],
-    ["coin ", "Investment", null, null],
-    ["nps", "Investment", null, null],
-    ["rd installment", "Investment", null, null],
-    ["fd deposit", "Investment", null, null],
-    ["rent", "Expense", "Fixed", "Household"],
-    ["emi", "Expense", "Fixed", "Personal"],
-    ["loan", "Expense", "Fixed", "Personal"],
-    ["insurance", "Expense", "Fixed", "Personal"],
-    ["premium", "Expense", "Fixed", "Personal"],
-    ["electricity", "Expense", "Fixed", "Household"],
-    ["water bill", "Expense", "Fixed", "Household"],
-    ["gas bill", "Expense", "Fixed", "Household"],
-    ["broadband", "Expense", "Fixed", "Household"],
-    ["wifi", "Expense", "Fixed", "Household"],
-    ["netflix", "Expense", "Fixed", "Personal"],
-    ["spotify", "Expense", "Fixed", "Personal"],
-    ["prime video", "Expense", "Fixed", "Personal"],
-    ["hotstar", "Expense", "Fixed", "Personal"],
-    ["subscription", "Expense", "Fixed", "Personal"],
-    ["swiggy", "Expense", "Variable", "Personal"],
-    ["zomato", "Expense", "Variable", "Personal"],
-    ["restaurant", "Expense", "Variable", "Personal"],
-    ["bigbasket", "Expense", "Variable", "Household"],
-    ["dmart", "Expense", "Variable", "Household"],
-    ["grocery", "Expense", "Variable", "Household"],
-    ["supermarket", "Expense", "Variable", "Household"],
-    ["amazon", "Expense", "Variable", "Personal"],
-    ["flipkart", "Expense", "Variable", "Personal"],
-    ["myntra", "Expense", "Variable", "Personal"],
-    ["uber", "Expense", "Variable", "Personal"],
-    ["ola", "Expense", "Variable", "Personal"],
-    ["petrol", "Expense", "Variable", "Personal"],
-    ["fuel", "Expense", "Variable", "Personal"],
-    ["credit card payment", "Transfer", "Credit card payment", null],
-    ["cc payment", "Transfer", "Credit card payment", null],
+    ["salary", "Income", null, null, "Recurring", null],
+    ["interest cr", "Income", "Interest", null, "Recurring", null],
+    ["dividend", "Income", null, null, "Recurring", null],
+    ["refund", "Income", null, null, "Irregular", null],
+    ["sip", "Investment", "Add", null, "Recurring", null],
+    ["mutual fund", "Investment", "Add", null, "Recurring", null],
+    ["zerodha", "Investment", "Add", null, "Recurring", null],
+    ["groww", "Investment", "Add", null, "Recurring", null],
+    ["coin ", "Investment", "Add", null, "Recurring", null],
+    ["nps", "Investment", "Add", null, "Recurring", null],
+    ["rd installment", "Investment", "Add", null, "Recurring", null],
+    ["fd deposit", "Investment", "Add", null, "One-Time", null],
+    // Fixed/Variable no longer exist as an Expense subCategory - that meaning now
+    // lives in frequencyClass (Recurring/Irregular). Expense keeps only tag
+    // (Household/Personal); subCategory stays null for every Expense row here.
+    ["rent", "Expense", null, "Household", "Recurring", "Committed"],
+    ["emi", "Expense", null, "Personal", "Recurring", "Committed"],
+    ["loan", "Expense", null, "Personal", "Recurring", "Committed"],
+    ["insurance", "Expense", null, "Personal", "Recurring", "Committed"],
+    ["premium", "Expense", null, "Personal", "Recurring", "Committed"],
+    ["electricity", "Expense", null, "Household", "Recurring", "Committed"],
+    ["water bill", "Expense", null, "Household", "Recurring", "Committed"],
+    ["gas bill", "Expense", null, "Household", "Recurring", "Committed"],
+    ["broadband", "Expense", null, "Household", "Recurring", "Committed"],
+    ["wifi", "Expense", null, "Household", "Recurring", "Committed"],
+    ["netflix", "Expense", null, "Personal", "Recurring", "Flexible"],
+    ["spotify", "Expense", null, "Personal", "Recurring", "Flexible"],
+    ["prime video", "Expense", null, "Personal", "Recurring", "Flexible"],
+    ["hotstar", "Expense", null, "Personal", "Recurring", "Flexible"],
+    ["subscription", "Expense", null, "Personal", "Recurring", "Flexible"],
+    ["swiggy", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["zomato", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["restaurant", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["bigbasket", "Expense", null, "Household", "Irregular", "Flexible"],
+    ["dmart", "Expense", null, "Household", "Irregular", "Flexible"],
+    ["grocery", "Expense", null, "Household", "Irregular", "Flexible"],
+    ["supermarket", "Expense", null, "Household", "Irregular", "Flexible"],
+    ["amazon", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["flipkart", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["myntra", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["uber", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["ola", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["petrol", "Expense", null, "Personal", "Irregular", "Flexible"],
+    ["fuel", "Expense", null, "Personal", "Irregular", "Flexible"],
+    // "Credit card payment" is no longer its own subCategory - it's the same
+    // "Debt Payment" a loan EMI uses, distinguished by which account (a
+    // creditCard-type account vs a debt-type one) it links to, not by subCategory.
+    ["credit card payment", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
+    ["cc payment", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
     // These specifically catch the payment-received line that appears ON a credit
     // card's OWN statement (reducing what's owed) — the same real-world payment
     // already captured as a debit on the bank side. Tagging it as Transfer here (never
@@ -2156,18 +3468,20 @@ function seedRules() {
     // (transactions on a card account never count toward the equation's Transfer total,
     // and only Expense-tagged rows count toward a statement's spend total) — this just
     // keeps it out of Uncategorized and away from ever being tagged Expense by mistake.
-    ["payment received", "Transfer", "Credit card payment", null],
-    ["payment recvd", "Transfer", "Credit card payment", null],
-    ["autopay", "Transfer", "Credit card payment", null],
-    ["self transfer", "Transfer", null, null],
-    ["own account", "Transfer", null, null],
+    ["payment received", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
+    ["payment recvd", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
+    ["autopay", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
+    ["self transfer", "Transfer", "Self", null, "Irregular", null],
+    ["own account", "Transfer", "Self", null, "Irregular", null],
   ];
-  return seed.map(([pattern, category, subCategory, tag]) => ({
+  return seed.map(([pattern, category, subCategory, tag, frequencyClass, control]) => ({
     id: uid("rule"),
     pattern,
     category,
     subCategory,
     tag,
+    frequencyClass,
+    control,
     source: "system",
     priority: pattern.length,
   }));
@@ -2217,10 +3531,10 @@ function findTransferCandidates(txn, allTransactions) {
 
 /** Whether a transaction is one of the two Transfer subcategories that genuinely have
  *  a real "other side" to expect and verify - Self (moves between the person's own
- *  accounts) and Credit card payment (settles a card statement). External deliberately
+ *  accounts) and Debt Payment (settles a card statement or loan). External deliberately
  *  isn't included here - see findTransferCandidates for why. */
 function isSubstantiableTransfer(t) {
-  return t.category === "Transfer" && (t.subCategory === "Self" || t.subCategory === "Credit card payment");
+  return t.category === "Transfer" && (t.subCategory === "Self" || t.subCategory === "Debt Payment");
 }
 
 /** @returns {{ status: 'linked'|'substantiated'|'dismissed'|'suggested'|'pending', candidate: object|null }} */
@@ -2241,17 +3555,18 @@ function transferStatus(txn, allTransactions, accounts) {
   return candidates.length > 0 ? { status: "suggested", candidate: candidates[0] } : { status: "pending", candidate: null };
 }
 
-/** Resolves a transaction's category/subCategory/tag into a key for looking up its
- *  display color/label in PALETTE - Expense gets its Fixed/Variable-Household/
- *  Variable-Personal split, Income gets a per-subcategory color if one's defined
+/** Resolves a transaction's category/subCategory/frequencyClass into a key for
+ *  looking up its display color/label in PALETTE - Expense gets its Fixed/
+ *  Variable-Household/Variable-Personal split (subCategory carries Household/
+ *  Personal directly now), Income gets a per-subcategory color if one's defined
  *  (falling back to the plain "Income" color otherwise), everything else uses its
  *  bare category name directly. */
-function pillClass(category, subCategory, tag) {
+function pillClass(category, subCategory, frequencyClass) {
   if (!category) return "Uncategorized";
   if (category === "Expense") {
-    if (subCategory === "Fixed") return "Expense-Fixed";
-    if (subCategory === "Variable" && tag === "Household") return "Expense-Variable-Household";
-    if (subCategory === "Variable" && tag === "Personal") return "Expense-Variable-Personal";
+    if (frequencyClass === "Recurring") return "Expense-Fixed";
+    if (subCategory === "Household") return "Expense-Variable-Household";
+    if (subCategory === "Personal") return "Expense-Variable-Personal";
     return "Expense-Fixed";
   }
   if (category === "Income" && subCategory) {
@@ -2730,8 +4045,11 @@ export default function BeingWealthyLedger() {
       // for anyone with data saved before this consolidation
       const combined = await loadState("appData", null);
       if (combined) {
-        setTransactions(combined.transactions || []);
-        setRules(combined.rules || seedRules());
+        // Taxonomy migration runs here, transparently, on every load - migrateOne is a
+        // no-op for anything already migrated or created fresh, so this costs nothing
+        // once a person's data has passed through it once.
+        setTransactions((combined.transactions || []).map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
+        setRules((combined.rules || seedRules()).map(migrateOne));
         setBudgets(combined.budgets || {});
         setCashBuffer(combined.cashBuffer || 0);
         setMerchantAliases(combined.merchantAliases || []);
@@ -2762,8 +4080,8 @@ export default function BeingWealthyLedger() {
           loadState("budgets", {}),
           loadState("merchantAliases", []),
         ]);
-        setTransactions(t);
-        setRules(r || seedRules());
+        setTransactions(t.map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
+        setRules((r || seedRules()).map(migrateOne));
         setAccounts(a);
         setBudgets(b || {});
         setMerchantAliases(ma || []);
@@ -3084,14 +4402,15 @@ export default function BeingWealthyLedger() {
       const rule = matchRule(t.description, rules);
       const newCategory = rule ? rule.category : null;
       const newSub = rule ? rule.subCategory : null;
-      const newTag = rule ? rule.tag : null;
+      const newFreqClass = rule ? (rule.frequencyClass || null) : null;
+      const newControl = rule ? (rule.control || null) : null;
       const newFreq = rule ? (rule.frequency || null) : null;
       const newPurpose = rule ? (rule.purpose || "Personal") : "Personal";
       const newRuleId = rule ? rule.id : null;
-      if (newCategory !== t.category || newSub !== t.subCategory || newTag !== t.tag
+      if (newCategory !== t.category || newSub !== t.subCategory || newFreqClass !== (t.frequencyClass || null) || newControl !== (t.control || null)
           || newFreq !== (t.frequency || null) || newPurpose !== (t.purpose || "Personal") || newRuleId !== t.matchedRuleId) {
         changed++;
-        return { ...t, category: newCategory, subCategory: newSub, tag: newTag, frequency: newFreq, purpose: newPurpose, matchedRuleId: newRuleId };
+        return { ...t, category: newCategory, subCategory: newSub, frequencyClass: newFreqClass, control: newControl, frequency: newFreq, purpose: newPurpose, matchedRuleId: newRuleId };
       }
       return t;
     }));
@@ -3445,6 +4764,7 @@ export default function BeingWealthyLedger() {
           <TabButton id="review" icon={ListChecks} label="Review" tab={view} setTab={setView} badge={uncategorizedCount || null} />
           <TabButton id="rules" icon={FileText} label="Rules" tab={view} setTab={setView} />
           <TabButton id="accounts" icon={Wallet} label="Accounts" tab={view} setTab={setView} />
+          <TabButton id="recurring" icon={Repeat} label="Recurring" tab={view} setTab={setView} />
         </div>
 
         <div className="bw-panel">
@@ -3475,6 +4795,7 @@ export default function BeingWealthyLedger() {
             <RulesTab
               rules={rules} setRules={setRules} transactions={transactions} onReapplyRules={reapplyRules}
               merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} accounts={accounts}
+              showToast={showToast}
             />
           )}
           {view === "accounts" && (
@@ -3486,6 +4807,9 @@ export default function BeingWealthyLedger() {
               otherInvestments={otherInvestments} setOtherInvestments={setOtherInvestments}
               showToast={showToast} effectiveTier={effectiveTier}
             />
+          )}
+          {view === "recurring" && (
+            <RecurringCommitmentsPanel transactions={transactions} accounts={accounts} rules={rules} merchantAliases={merchantAliases} />
           )}
           {view === "dashboard" && (
             <DashboardOverview
@@ -3500,8 +4824,10 @@ export default function BeingWealthyLedger() {
               accounts={accounts} budgets={budgets} setBudgets={setBudgets}
               cashBuffer={cashBuffer} setCashBuffer={setCashBuffer}
               merchantAliases={merchantAliases} rules={rules}
+              goals={goals} holdingSnapshots={holdingSnapshots}
               onGoToUpload={() => setView("upload")}
               onGoToReview={() => setView("review")}
+              onGoToCFO={() => setView("cfo")}
             />
           )}
           {view === "networth" && (
@@ -3904,6 +5230,177 @@ function ImportCompletionPromptPanel({ prompt, accounts, onConfirm, onSkip }) {
  *  Also hosts the "Confirm" workflow for a parsed-but-not-yet-trusted opening/closing
  *  balance, which writes directly to balanceHistory - the single source of truth for
  *  confirmed balances - rather than to any field on uploadHistory itself. */
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const ORDINAL_WORDS = { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" };
+
+/** Plain-language description of what was actually learned about a commitment's
+ *  timing - stated honestly at whatever precision the evidence supports, never
+ *  more. */
+function describeCommitmentPattern(pattern) {
+  if (!pattern.recurs) return "Not enough history to say anything yet";
+  if (!pattern.hasPattern) return "Recurs, but the exact day varies too much to predict";
+  if (pattern.patternType === "dayOfMonth") return `Around the ${pattern.expectedDay}${pattern.expectedDay === 1 ? "st" : pattern.expectedDay === 2 ? "nd" : pattern.expectedDay === 3 ? "rd" : "th"} of the month`;
+  const ordinal = pattern.expectedOrdinal === "last" ? "last" : ORDINAL_WORDS[pattern.expectedOrdinal] || pattern.expectedOrdinal;
+  return `The ${ordinal} ${WEEKDAY_NAMES[pattern.expectedWeekday]} of the month`;
+}
+
+const CONFIDENCE_TIER_LABEL = { estimate: "Estimate", expected: "Expected", confirmed: "Confirmed" };
+const CONFIDENCE_TIER_COLOR = { estimate: "var(--ochre)", expected: "#7A5C8C", confirmed: "var(--teal)" };
+
+/** Recurring Commitments - shows every group the learner attempted, including its
+ *  honest failures, not just its successes. The Calendar grid can only ever show
+ *  what this screen already knows; when something doesn't show up as an upcoming
+ *  event, the reason is visible here - too few occurrences yet, or a genuinely
+ *  scattered history that never clustered into a predictable day - rather than
+ *  being an invisible, undebuggable gap. */
+function RecurringCommitmentsPanel({ transactions, accounts, rules, merchantAliases }) {
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
+  // Amount Behaviour's home is the categorization screen (Review tab) - this panel
+  // reads that same shared computation rather than computing its own, so the two can
+  // never disagree about the same commitment's reading. c.key is already the exact
+  // same commitmentGroupKey computeAmountBehaviors groups by, so no reconstruction
+  // needed - every Recurring commitment here is guaranteed a match, since Recurring
+  // is a strict subset of what computeAmountBehaviors processes (Recurring+Irregular).
+  const amountBehaviors = useMemo(() => computeAmountBehaviors(transactions, merchantAliases), [transactions, merchantAliases]);
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const [expanded, setExpanded] = useState(new Set());
+
+  // Nearest future occurrence across the next 12 months, for commitments where a
+  // specific day is known - shown as a concrete next date rather than just "recurs
+  // monthly", since that's the actually useful, actionable fact. Computed once per
+  // commitment and reused for both sorting and display, rather than recomputed
+  // separately for each - keeps the two from ever silently disagreeing.
+  function nextOccurrence(c) {
+    if (!c.pattern.hasPattern) return null;
+    const today = new Date();
+    for (let i = 0; i < 13; i++) {
+      const d = new Date(today.getFullYear(), today.getMonth() + i, 1);
+      const projection = projectOccurrenceForMonth(c, d.getFullYear(), d.getMonth() + 1);
+      if (projection.recurs && projection.date && projection.date >= todayISO) return projection.date;
+    }
+    return null;
+  }
+
+  // Commitments sharing an alias (e.g. Netflix + Amazon + Spotify all under
+  // "Subscriptions") collapse into one row - this is the actual point of the alias
+  // system: fewer, higher-signal rows, with the real underlying commitments always
+  // one click away. A collapsed row deliberately shows no combined amount,
+  // frequency, or confidence - those genuinely differ per child (a Monthly ₹500
+  // subscription and an Annual ₹1499 one summed together would be a meaningless
+  // number), so the group row states only what's actually true of the group: its
+  // name and how many distinct commitments are in it. Only aliases actually shared
+  // by 2+ commitments group; an alias used by just one stays a normal row -
+  // nothing to collapse there.
+  const rows = useMemo(() => {
+    const withNext = commitments.map((c) => ({ c, next: nextOccurrence(c) }));
+    const byAlias = {};
+    withNext.forEach((item) => {
+      if (!item.c.alias) return;
+      if (!byAlias[item.c.alias]) byAlias[item.c.alias] = [];
+      byAlias[item.c.alias].push(item);
+    });
+
+    const grouped = [];
+    const consumed = new Set();
+    withNext.forEach((item) => {
+      if (consumed.has(item.c.key)) return;
+      const aliasGroup = item.c.alias ? byAlias[item.c.alias] : null;
+      if (aliasGroup && aliasGroup.length > 1) {
+        aliasGroup.forEach((m) => consumed.add(m.c.key));
+        const earliestNext = aliasGroup.map((m) => m.next).filter(Boolean).sort()[0] || null;
+        grouped.push({ isGroup: true, alias: item.c.alias, members: aliasGroup, sortKey: earliestNext || "9999-99-99" });
+      } else {
+        consumed.add(item.c.key);
+        grouped.push({ isGroup: false, ...item, sortKey: item.next || "9999-99-99" });
+      }
+    });
+    return grouped.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+  }, [commitments, todayISO]);
+
+  function toggleExpand(alias) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(alias)) next.delete(alias); else next.add(alias);
+      return next;
+    });
+  }
+
+  if (commitments.length === 0) {
+    return <div className="bw-empty">No recurring commitments detected yet - categorize some transactions with a Recurring class and a frequency, and they'll show up here.</div>;
+  }
+
+  function renderCommitmentRow({ c, next }, indented) {
+    return (
+      <tr key={c.key} style={indented ? { background: "var(--paper)" } : undefined}>
+        <td style={indented ? { paddingLeft: 26 } : undefined}>{c.name}</td>
+        <td style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace" }}>{c.rawMerchant || "—"}</td>
+        <td style={{ fontSize: 11.5 }}>{c.alias || <span style={{ color: "var(--line)" }}>—</span>}</td>
+        <td>
+          <span className="bw-pill" style={{ background: PALETTE[pillClass(c.category, c.subCategory, "Recurring")] || "#999" }}>
+            {c.category}{c.subCategory ? ` / ${c.subCategory}` : ""}
+          </span>
+        </td>
+        <td className={c.category === "Income" ? "bw-amt credit" : "bw-amt debit"}>{c.category === "Income" ? "+" : "−"}{inr(c.lastAmount)}</td>
+        <td><AmountBehaviorCell groupKey={c.key} frequencyClass="Recurring" amountBehaviors={amountBehaviors} /></td>
+        <td style={{ fontSize: 12.5 }}>{c.frequency || "—"}</td>
+        <td style={{ textAlign: "right" }}>{c.occurrenceCount}</td>
+        <td style={{ fontSize: 12.5, color: "var(--ink-soft)" }}>{describeCommitmentPattern(c.pattern)}</td>
+        <td>
+          {c.pattern.hasPattern ? (
+            <span className="bw-pill" style={{ background: CONFIDENCE_TIER_COLOR[c.pattern.confidenceTier] }}>
+              {CONFIDENCE_TIER_LABEL[c.pattern.confidenceTier]}
+            </span>
+          ) : (
+            <span style={{ color: "var(--ink-soft)", fontSize: 12 }}>{c.pattern.recurs ? "Day unknown" : "—"}</span>
+          )}
+        </td>
+        <td style={{ fontSize: 12.5 }}>{next || (c.pattern.recurs && !c.pattern.hasPattern ? "Sometime, day unknown" : "—")}</td>
+        <td style={{ fontSize: 11.5, color: "var(--ink-soft)", whiteSpace: "nowrap" }}>{c.lastSeenDate}</td>
+      </tr>
+    );
+  }
+
+  return (
+    <div>
+      <h2 className="bw-h2">Recurring commitments</h2>
+      <p className="bw-lead">
+        Every Fixed expense, SIP, Debt-EMI, and recurring Income group the app has tried to learn a timing pattern
+        for - including the ones it couldn't yet. This is what powers the Cash Flow Calendar's upcoming events;
+        anything missing there should have an honest explanation here. Commitments sharing an alias (Merchant
+        Groups) are shown as one collapsed row - click to see the individual commitments underneath.
+      </p>
+
+      <table className="bw-table">
+        <thead>
+          <tr>
+            <th>Name</th><th>Raw merchant/description</th><th>Alias</th><th>Category</th><th style={{ textAlign: "right" }}>Amount</th><th>Amount Behaviour</th><th>Frequency</th>
+            <th style={{ textAlign: "right" }}>Occurrences</th>
+            <th>What we learned</th><th>Confidence</th><th>Next expected</th><th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            if (!row.isGroup) return renderCommitmentRow(row, false);
+            const isOpen = expanded.has(row.alias);
+            return (
+              <React.Fragment key={`group:${row.alias}`}>
+                <tr style={{ cursor: "pointer", background: "rgba(46,102,89,0.04)" }} onClick={() => toggleExpand(row.alias)}>
+                  <td colSpan={12} style={{ fontWeight: 600 }}>
+                    {isOpen ? <ChevronUp size={13} style={{ verticalAlign: -2, marginRight: 5 }} /> : <ChevronRight size={13} style={{ verticalAlign: -2, marginRight: 5 }} />}
+                    {row.alias}
+                    <span className="bw-pill" style={{ marginLeft: 8, background: "var(--slate)", fontWeight: 400 }}>{row.members.length} commitments</span>
+                  </td>
+                </tr>
+                {isOpen && row.members.map((m) => renderCommitmentRow(m, true))}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function AccountsHistoryPanel({ accounts, setAccounts, transactions, setTransactions, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules, otherInvestments, setOtherInvestments, showToast, effectiveTier }) {
   const [showUploadHistory, setShowUploadHistory] = useState(true);
   const [confirmingDeleteBatch, setConfirmingDeleteBatch] = useState(null);
@@ -4459,7 +5956,8 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         amount, direction,
         category: rule ? rule.category : null,
         subCategory: rule ? rule.subCategory : null,
-        tag: rule ? rule.tag : null,
+        frequencyClass: rule ? (rule.frequencyClass || null) : null,
+        control: rule ? (rule.control || null) : null,
         frequency: rule ? (rule.frequency || null) : null,
         purpose: rule ? (rule.purpose || "Personal") : "Personal",
         matchedRuleId: rule ? rule.id : null,
@@ -7434,6 +8932,35 @@ function DocumentClassifierTest({ apiKey, aiModel, customModelId }) {
  *  (transferRows, transferStatus, confirmTransferLink and friends) - superseded by
  *  the simpler Transfers Control table, kept intact rather than deleted in case it's
  *  wanted again. */
+/** Shared read-only display for an Amount Behaviour reading - looked up from the one
+ *  shared computation (amountBehaviors), never computed independently per cell. Takes
+ *  groupKey/frequencyClass directly so it works for both a transaction (groupKey =
+ *  commitmentGroupKey(t), frequencyClass = t.frequencyClass) and a commitment (groupKey
+ *  = c.key, already the same key; frequencyClass = "Recurring" always, by construction)
+ *  - or pass t as a shorthand and both are derived from it. One-Time never shows a
+ *  reading at all (Amount Behaviour doesn't apply - a genuinely singular event has no
+ *  history to be consistent against), and a group with fewer than 2 occurrences shows
+ *  "Not yet determined" rather than guessing. The hover title exposes the full
+ *  underlying metrics for anyone who wants to see the actual numbers, not just trust
+ *  the label. */
+function AmountBehaviorCell({ t, groupKey, frequencyClass, amountBehaviors, merchantAliases }) {
+  const key = groupKey || (t ? commitmentGroupKey(t, merchantAliases) : null);
+  const fc = frequencyClass || t?.frequencyClass;
+  if (!fc || fc === "One-Time") {
+    return <span style={{ color: "var(--line)" }}>—</span>;
+  }
+  const ab = amountBehaviors[key];
+  if (!ab || ab.amountBehavior === "Not Yet Determined") {
+    return <span style={{ color: "var(--ink-soft)", fontSize: 10.5 }}>Not yet determined</span>;
+  }
+  const detail = `${ab.observationCount} occurrence${ab.observationCount === 1 ? "" : "s"} · ${Math.round(ab.consistencyRatio * 100)}% within ±${Math.round(ab.deviationThreshold * 100)}% of median · ${ab.confidence} confidence`;
+  return (
+    <span title={detail} style={{ color: ab.amountBehavior === "Fixed" ? "var(--teal)" : "var(--ochre)", fontWeight: 500 }}>
+      {ab.amountBehavior}
+    </span>
+  );
+}
+
 function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, merchantAliases, showToast, onGoToUpload, holdingSnapshots, debtSchedules }) {
   const [mode, setMode] = useState("byMerchant"); // byMerchant | byTransaction | transfers | investmentsControl | debtControl
   const [showAll, setShowAll] = useState(false);
@@ -7445,8 +8972,20 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   const [transferPeriod, setTransferPeriod] = useState("all"); // all | "YYYY-MM"
 
   const uncategorized = useMemo(() => transactions.filter((t) => !t.category), [transactions]);
+  // Separate from `uncategorized` above (which feeds the by-merchant bulk mode's
+  // blank-slate form, where showing a partially-done transaction risks its already-set
+  // fields being overwritten) - this is specifically for the by-transaction mode's
+  // "show uncategorized only" toggle, whose per-row form pre-fills existing values, so
+  // surfacing a partial transaction here just lets the one missing field get filled in.
+  const needsReview = useMemo(() => transactions.filter((t) => !isFullyCategorized(t)), [transactions]);
 
-  /* ---- Transfer substantiation: Self and Credit-card-payment transfers should have a
+  // Amount Behaviour's one shared computation for this whole tab - both Review modes
+  // (by-merchant and by-transaction) read from this same map by recomputing a
+  // transaction's own group key, rather than each mode computing its own reading that
+  // could silently disagree with the other's.
+  const amountBehaviors = useMemo(() => computeAmountBehaviors(transactions, merchantAliases), [transactions, merchantAliases]);
+
+  /* ---- Transfer substantiation: Self and Debt-Payment transfers should have a
      real other side somewhere in the data. External transfers are excluded entirely —
      money to a landlord or friend has no "other side" in this app, ever.
      NOTE: this matching/linking system is currently DORMANT — Review → Transfers now
@@ -7537,9 +9076,10 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   function commitMerchantGroup(group, patch, remember) {
     const { category } = patch;
     if (!category) return;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? patch.subCategory : null;
-    const finalTag = category === "Expense" ? patch.tag : null;
-    const finalFreq = isFrequencyEligible(category, finalSub) ? (patch.frequency || "Monthly") : null;
+    const finalSub = subCategoryOptionsFor(category).length > 0 ? patch.subCategory : null;
+    const finalFreqClass = patch.frequencyClass || null;
+    const finalFreq = isFrequencyEligible(finalFreqClass) ? (patch.frequency || "Monthly") : null;
+    const finalControl = category === "Expense" && finalFreqClass !== "One-Time" ? (patch.control || null) : null;
     const finalPurpose = patch.purpose || "Personal";
     const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (patch.linkedAccountId || null) : null;
     const rawKeys = [...group.rawKeys];
@@ -7555,8 +9095,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           const ruleId = idx !== -1 ? next[idx].id : uid("rule");
           ruleIdByRaw[raw] = ruleId;
           const rule = {
-            id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag,
-            frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
+            id: ruleId, pattern, category, subCategory: finalSub,
+            frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
             source: "learned", priority: pattern.length,
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
@@ -7569,7 +9109,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       if (!group.txnIds.includes(t.id)) return t;
       const raw = t.merchant || normalizeMerchant(t.description) || t.description;
       return {
-        ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose,
+        ...t, category, subCategory: finalSub, frequency: finalFreq, purpose: finalPurpose,
         linkedAccountId: finalLinkedAccountId,
         matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
       };
@@ -7596,18 +9136,40 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   const [reviewCategoryFilter, setReviewCategoryFilter] = useState("all"); // all | Income | Expense | Investment | Transfer | uncategorized
 
   const list = useMemo(() => {
-    let base = showAll ? transactions : uncategorized;
+    let base = showAll ? transactions : needsReview;
     if (reviewPeriod !== "all") base = base.filter((t) => t.date.slice(0, 7) === reviewPeriod);
     if (reviewAccountFilter !== "all") base = base.filter((t) => t.accountId === reviewAccountFilter);
     if (reviewCategoryFilter !== "all") {
-      base = reviewCategoryFilter === "uncategorized" ? base.filter((t) => !t.category) : base.filter((t) => t.category === reviewCategoryFilter);
+      base = reviewCategoryFilter === "uncategorized" ? base.filter((t) => !isFullyCategorized(t)) : base.filter((t) => t.category === reviewCategoryFilter);
     }
     if (reviewSearch.trim()) {
       const needle = reviewSearch.trim().toLowerCase();
-      base = base.filter((t) => (t.description || "").toLowerCase().includes(needle));
+      base = base.filter((t) => transactionSearchText(t, accounts, merchantAliases).includes(needle));
     }
     if (sortMode === "amount") {
       return [{ key: null, txns: [...base].sort((a, b) => b.amount - a.amount) }];
+    }
+    if (sortMode === "date") {
+      return [{ key: null, txns: [...base].sort((a, b) => b.date.localeCompare(a.date)) }];
+    }
+    if (sortMode === "category") {
+      return [{ key: null, txns: [...base].sort((a, b) => (a.category || "").localeCompare(b.category || "") || b.amount - a.amount) }];
+    }
+    if (sortMode === "description") {
+      return [{ key: null, txns: [...base].sort((a, b) => (a.description || "").localeCompare(b.description || "")) }];
+    }
+    if (sortMode === "account") {
+      const nameOf = (t) => accounts.find((a) => a.id === t.accountId)?.nickname || "";
+      return [{ key: null, txns: [...base].sort((a, b) => nameOf(a).localeCompare(nameOf(b)) || b.amount - a.amount) }];
+    }
+    if (sortMode === "subCategory1") {
+      return [{ key: null, txns: [...base].sort((a, b) => (a.subCategory || "").localeCompare(b.subCategory || "") || b.amount - a.amount) }];
+    }
+    if (sortMode === "subCategory2") {
+      return [{ key: null, txns: [...base].sort((a, b) => merchantSubcategory(a, merchantAliases).localeCompare(merchantSubcategory(b, merchantAliases)) || b.amount - a.amount) }];
+    }
+    if (sortMode === "control") {
+      return [{ key: null, txns: [...base].sort((a, b) => (a.control || "").localeCompare(b.control || "") || b.amount - a.amount) }];
     }
     const map = {};
     base.forEach((t) => {
@@ -7622,7 +9184,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     }));
     groups.sort((a, b) => a.key.localeCompare(b.key) || b.txns.length - a.txns.length);
     return groups;
-  }, [transactions, uncategorized, showAll, sortMode, reviewPeriod, reviewAccountFilter, reviewCategoryFilter, reviewSearch]);
+  }, [transactions, needsReview, showAll, sortMode, reviewPeriod, reviewAccountFilter, reviewCategoryFilter, reviewSearch, accounts, merchantAliases]);
 
   const flatCount = list.reduce((s, g) => s + g.txns.length, 0);
 
@@ -7632,9 +9194,10 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
 
   function commitCategory(txn, patch) {
     const { category } = patch;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? patch.subCategory : null;
-    const finalTag = category === "Expense" ? patch.tag : null;
-    const finalFreq = isFrequencyEligible(category, finalSub) ? (patch.frequency || "Monthly") : null;
+    const finalSub = subCategoryOptionsFor(category).length > 0 ? patch.subCategory : null;
+    const finalFreqClass = patch.frequencyClass || null;
+    const finalFreq = isFrequencyEligible(finalFreqClass) ? (patch.frequency || "Monthly") : null;
+    const finalControl = category === "Expense" && finalFreqClass !== "One-Time" ? (patch.control || null) : null;
     const finalPurpose = patch.purpose || "Personal";
     const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (patch.linkedAccountId || null) : null;
     const shouldRemember = rememberFor[txn.id] !== false;
@@ -7647,16 +9210,17 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
         const existing = rules.find((r) => r.pattern.toLowerCase() === pattern);
         if (existing) {
           ruleId = existing.id;
-          if (existing.category !== category || existing.subCategory !== finalSub || existing.tag !== finalTag
-              || existing.frequency !== finalFreq || existing.purpose !== finalPurpose || existing.linkedAccountId !== finalLinkedAccountId) {
+          if (existing.category !== category || existing.subCategory !== finalSub
+              || existing.frequencyClass !== finalFreqClass || existing.frequency !== finalFreq || existing.control !== finalControl
+              || existing.purpose !== finalPurpose || existing.linkedAccountId !== finalLinkedAccountId) {
             setRules((prev) => prev.map((r) => (r.id === ruleId
-              ? { ...r, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId } : r)));
+              ? { ...r, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId } : r)));
           }
         } else {
           ruleId = uid("rule");
           setRules((prev) => [
             ...prev,
-            { id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, source: "learned", priority: pattern.length },
+            { id: ruleId, pattern, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, source: "learned", priority: pattern.length },
           ]);
         }
       }
@@ -7668,10 +9232,10 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     // down the rest by hand.
     let cascadedCount = 0;
     setTransactions((prev) => prev.map((t) => {
-      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
+      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
       if (pattern && !t.category && t.description.toLowerCase().includes(pattern)) {
         cascadedCount += 1;
-        return { ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
+        return { ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
       }
       return t;
     }));
@@ -7685,11 +9249,12 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   }
 
   /* ---- multi-select bulk tagging: pick an arbitrary set of rows and tag them all at once ---- */
-  function commitBulkSelection(category, subCategory, tag, frequency, purpose, linkedAccountId, remember) {
+  function commitBulkSelection(category, subCategory, frequencyClass, control, frequency, purpose, linkedAccountId, remember) {
     if (!category || selectedIds.length === 0) return;
-    const finalSub = (category === "Expense" || category === "Transfer" || category === "Income" || category === "Investment") ? subCategory : null;
-    const finalTag = category === "Expense" ? tag : null;
-    const finalFreq = isFrequencyEligible(category, finalSub) ? (frequency || "Monthly") : null;
+    const finalSub = subCategoryOptionsFor(category).length > 0 ? subCategory : null;
+    const finalFreqClass = frequencyClass || null;
+    const finalControl = category === "Expense" && finalFreqClass !== "One-Time" ? (control || null) : null;
+    const finalFreq = isFrequencyEligible(finalFreqClass) ? (frequency || "Monthly") : null;
     const finalPurpose = purpose || "Personal";
     const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (linkedAccountId || null) : null;
     const selectedTxns = transactions.filter((t) => selectedIds.includes(t.id));
@@ -7706,8 +9271,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           const ruleId = idx !== -1 ? next[idx].id : uid("rule");
           ruleIdByRaw[raw] = ruleId;
           const rule = {
-            id: ruleId, pattern, category, subCategory: finalSub, tag: finalTag,
-            frequency: finalFreq, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
+            id: ruleId, pattern, category, subCategory: finalSub,
+            frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
             source: "learned", priority: pattern.length,
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
@@ -7720,7 +9285,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       if (!selectedIds.includes(t.id)) return t;
       const raw = t.merchant || normalizeMerchant(t.description) || t.description;
       return {
-        ...t, category, subCategory: finalSub, tag: finalTag, frequency: finalFreq, purpose: finalPurpose,
+        ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose,
         linkedAccountId: finalLinkedAccountId,
         matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
       };
@@ -7751,7 +9316,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           <Sparkles size={13} /> By merchant (bulk){uncategorized.length > 0 ? <span className="badge">{merchantGroups.length}</span> : null}
         </button>
         <button className={`bw-tab ${mode === "byTransaction" ? "active" : ""}`} onClick={() => setMode("byTransaction")}>
-          <ListChecks size={13} /> By transaction
+          <ListChecks size={13} /> By transaction{needsReview.length > 0 ? <span className="badge">{needsReview.length}</span> : null}
         </button>
         <button className={`bw-tab ${mode === "transfers" ? "active" : ""}`} onClick={() => setMode("transfers")}>
           <Repeat size={13} /> Transfers Control
@@ -7790,7 +9355,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
               <thead>
                 <tr>
                   <th>Merchant</th><th style={{ textAlign: "right" }}>Count</th><th style={{ textAlign: "right" }}>Total</th>
-                  <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th>Account</th><th></th>
+                  <th>Category</th><th>Sub</th><th>Class</th><th>Control</th><th>Freq</th><th>Purpose</th><th>Account</th><th></th>
                 </tr>
               </thead>
               <tbody>
@@ -7803,14 +9368,27 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
         )
       ) : (
         <>
+          {showAll && needsReview.length > 0 && (
+            <div style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap",
+              border: "1px solid var(--rust)", borderRadius: 6, padding: "10px 14px", marginBottom: 12,
+              background: "rgba(156,74,52,0.06)",
+            }}>
+              <span style={{ fontSize: 12.5, color: "var(--rust)", display: "flex", alignItems: "center", gap: 7 }}>
+                <AlertCircle size={14} />
+                {needsReview.length} transaction{needsReview.length === 1 ? "" : "s"} {needsReview.length === 1 ? "is" : "are"} missing a category, subcategory, class, control, cadence, purpose, or linked account where relevant.
+              </span>
+              <button className="bw-btn small" onClick={() => setShowAll(false)}>Show only these</button>
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 10 }}>
             <div className="bw-checkbox-row" style={{ marginTop: 0 }}>
               <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} id="showAll" />
-              <label htmlFor="showAll">Show all transactions (not just uncategorized)</label>
+              <label htmlFor="showAll">Show all transactions (not just ones needing review)</label>
             </div>
             <input
               type="text" className="bw-select-inline" style={{ minWidth: 200 }}
-              placeholder="Search description…" value={reviewSearch} onChange={(e) => setReviewSearch(e.target.value)}
+              placeholder="Search description, merchant, account, category…" value={reviewSearch} onChange={(e) => setReviewSearch(e.target.value)}
             />
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
@@ -7840,6 +9418,13 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
               <span style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>Sort:</span>
               <select className="bw-select-inline" value={sortMode} onChange={(e) => setSortMode(e.target.value)}>
                 <option value="amount">Largest amount first</option>
+                <option value="date">Most recent first</option>
+                <option value="category">Category</option>
+                <option value="description">Description (A–Z)</option>
+                <option value="account">Account</option>
+                <option value="subCategory1">Sub Category 1</option>
+                <option value="subCategory2">Sub Category 2</option>
+                <option value="control">Control</option>
                 <option value="similar">Group similar descriptions</option>
               </select>
             </div>
@@ -7871,7 +9456,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                       />
                     </th>
                     <th>Date</th><th>Account</th><th>Description</th><th style={{ textAlign: "right" }}>Amount</th>
-                    <th>Category</th><th>Sub</th><th>Freq</th><th>Tag</th><th>Purpose</th><th>Linked account</th><th>Remember</th>
+                    <th>Category</th><th>Sub Category 1</th><th>Sub Category 2</th><th>Frequency</th><th>Cadence</th><th>Control</th><th>Amount Behaviour</th><th>Purpose</th><th>Linked account</th><th>Remember</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -7879,7 +9464,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                     <React.Fragment key={group.key ?? "flat"}>
                       {sortMode === "similar" && group.txns.length > 1 && (
                         <tr>
-                          <td colSpan={11} style={{
+                          <td colSpan={15} style={{
                             background: "var(--paper)", fontSize: 10.5, color: "var(--ink-soft)",
                             padding: "5px 8px", borderBottom: "1px solid var(--line)",
                           }}>
@@ -7905,7 +9490,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           <td className={`bw-amt ${t.direction}`}>{t.direction === "credit" ? "+" : "−"}{inr(t.amount)}</td>
                           <td>
                             <select className="bw-select-inline" value={t.category || ""}
-                              onChange={(e) => commitCategory(t, { category: e.target.value || null, subCategory: null, tag: t.tag, frequency: t.frequency, purpose: t.purpose })}>
+                              onChange={(e) => commitCategory(t, { category: e.target.value || null, subCategory: null, frequencyClass: t.frequencyClass, control: t.control, frequency: t.frequency, purpose: t.purpose })}>
                               <option value="">—</option>
                               {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
                             </select>
@@ -7913,33 +9498,46 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           <td>
                             {subCategoryOptionsFor(t.category).length > 0 ? (
                               <select className="bw-select-inline" value={t.subCategory || ""}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: e.target.value || null, tag: t.tag, frequency: t.frequency, purpose: t.purpose })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: e.target.value || null, frequencyClass: t.frequencyClass, control: t.control, frequency: t.frequency, purpose: t.purpose })}>
                                 <option value="">—</option>
                                 {subCategoryOptionsFor(t.category).map((s) => <option key={s}>{s}</option>)}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
+                          <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{merchantSubcategory(t, merchantAliases)}</td>
                           <td>
-                            {isFrequencyEligible(t.category, t.subCategory) ? (
+                            {t.category ? (
+                              <select className="bw-select-inline" value={t.frequencyClass || ""}
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: e.target.value || null, control: t.control, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
+                                <option value="">—</option>
+                                {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+                              </select>
+                            ) : <span style={{ color: "var(--line)" }}>—</span>}
+                          </td>
+                          <td>
+                            {isFrequencyEligible(t.frequencyClass) ? (
                               <select className="bw-select-inline" value={t.frequency || "Monthly"}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: e.target.value, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, control: t.control, frequency: e.target.value, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
                           <td>
-                            {t.category === "Expense" ? (
-                              <select className="bw-select-inline" value={t.tag || ""}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: e.target.value || null, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
+                            {t.category === "Expense" && t.frequencyClass !== "One-Time" ? (
+                              <select className="bw-select-inline" value={t.control || ""}
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, control: e.target.value || null, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 <option value="">—</option>
-                                {TAGS.map((tg) => <option key={tg}>{tg}</option>)}
+                                {CONTROLS.map((c) => <option key={c}>{c}</option>)}
                               </select>
+                            ) : t.category === "Expense" && t.frequencyClass === "One-Time" ? (
+                              <span style={{ color: "var(--ink-soft)", fontSize: 10.5 }}>Not applicable</span>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
+                          <td style={{ fontSize: 11 }}><AmountBehaviorCell t={t} amountBehaviors={amountBehaviors} merchantAliases={merchantAliases} /></td>
                           <td>
                             {t.category ? (
                               <select className="bw-select-inline" value={t.purpose || "Personal"}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: t.frequency, purpose: e.target.value, linkedAccountId: t.linkedAccountId })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, control: t.control, frequency: t.frequency, purpose: e.target.value, linkedAccountId: t.linkedAccountId })}>
                                 {PURPOSES.map((p) => <option key={p}>{p}</option>)}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
@@ -7947,7 +9545,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           <td>
                             {linkableAccountTypesFor(t.category, t.subCategory).length > 0 ? (
                               <select className="bw-select-inline" value={t.linkedAccountId || ""}
-                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, tag: t.tag, frequency: t.frequency, purpose: t.purpose, linkedAccountId: e.target.value || null })}>
+                                onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, control: t.control, frequency: t.frequency, purpose: t.purpose, linkedAccountId: e.target.value || null })}>
                                 <option value="">— optional —</option>
                                 {accounts.filter((a) => linkableAccountTypesFor(t.category, t.subCategory).includes(a.type) && a.id !== t.accountId).map((a) => (
                                   <option key={a.id} value={a.id}>{a.nickname}</option>
@@ -7983,9 +9581,10 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
  *  so bulk tagging behaves identically to tagging one row at a time. */
 function BulkActionBar({ count, onApply, onClear, accounts }) {
   const [category, setCategory] = useState("");
-  const [subCategory, setSubCategory] = useState("Variable");
+  const [subCategory, setSubCategory] = useState("");
+  const [frequencyClass, setFrequencyClass] = useState("Recurring");
+  const [control, setControl] = useState("Committed");
   const [frequency, setFrequency] = useState("Monthly");
-  const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
   const [linkedAccountId, setLinkedAccountId] = useState("");
   const [remember, setRemember] = useState(true);
@@ -8016,14 +9615,19 @@ function BulkActionBar({ count, onApply, onClear, accounts }) {
           {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
         </select>
       )}
-      {isFrequencyEligible(category, subCategory) && (
-        <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
-          {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
+      {category && (
+        <select className="bw-select-inline" value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
+          {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
         </select>
       )}
-      {category === "Expense" && (
-        <select className="bw-select-inline" value={tag} onChange={(e) => setTag(e.target.value)}>
-          {TAGS.map((tg) => <option key={tg}>{tg}</option>)}
+      {category === "Expense" && frequencyClass !== "One-Time" && (
+        <select className="bw-select-inline" value={control} onChange={(e) => setControl(e.target.value)}>
+          {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+        </select>
+      )}
+      {category && isFrequencyEligible(frequencyClass) && (
+        <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
+          {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
         </select>
       )}
       {category && (
@@ -8041,7 +9645,7 @@ function BulkActionBar({ count, onApply, onClear, accounts }) {
         <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
         Remember (create rules)
       </label>
-      <button className="bw-btn small" disabled={!category} onClick={() => onApply(category, subCategory, tag, frequency, purpose, linkedAccountId, remember)}>
+      <button className="bw-btn small" disabled={!category} onClick={() => onApply(category, subCategory, frequencyClass, control, frequency, purpose, linkedAccountId, remember)}>
         <Check size={12} /> Apply to {count}
       </button>
       <button className="bw-btn ghost small" onClick={onClear}><X size={12} /> Clear</button>
@@ -8470,9 +10074,10 @@ function ManualLinkPicker({ txn, accountName, candidates, onPick, onCancel }) {
  *  tagging one transaction at a time - just applied to the whole group on Apply. */
 function MerchantRow({ group, onCommit, accounts }) {
   const [category, setCategory] = useState("");
-  const [subCategory, setSubCategory] = useState("Variable");
+  const [subCategory, setSubCategory] = useState("");
+  const [frequencyClass, setFrequencyClass] = useState("Recurring");
+  const [control, setControl] = useState("Committed");
   const [frequency, setFrequency] = useState("Monthly");
-  const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
   const [linkedAccountId, setLinkedAccountId] = useState("");
   const [remember, setRemember] = useState(true);
@@ -8516,16 +10121,25 @@ function MerchantRow({ group, onCommit, accounts }) {
         ) : <span style={{ color: "var(--line)" }}>—</span>}
       </td>
       <td>
-        {isFrequencyEligible(category, subCategory) ? (
-          <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
-            {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
+        {category ? (
+          <select className="bw-select-inline" value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
+            {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
           </select>
         ) : <span style={{ color: "var(--line)" }}>—</span>}
       </td>
       <td>
-        {category === "Expense" ? (
-          <select className="bw-select-inline" value={tag} onChange={(e) => setTag(e.target.value)}>
-            {TAGS.map((tg) => <option key={tg}>{tg}</option>)}
+        {category === "Expense" && frequencyClass !== "One-Time" ? (
+          <select className="bw-select-inline" value={control} onChange={(e) => setControl(e.target.value)}>
+            {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+          </select>
+        ) : category === "Expense" ? (
+          <span style={{ color: "var(--ink-soft)", fontSize: 10.5 }}>Not applicable</span>
+        ) : <span style={{ color: "var(--line)" }}>—</span>}
+      </td>
+      <td>
+        {category && isFrequencyEligible(frequencyClass) ? (
+          <select className="bw-select-inline" value={frequency} onChange={(e) => setFrequency(e.target.value)}>
+            {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
           </select>
         ) : <span style={{ color: "var(--line)" }}>—</span>}
       </td>
@@ -8544,7 +10158,7 @@ function MerchantRow({ group, onCommit, accounts }) {
       </td>
       <td>
         <button className="bw-btn small" disabled={!category}
-          onClick={() => onCommit(group, { category, subCategory, tag, frequency, purpose, linkedAccountId }, remember)}>
+          onClick={() => onCommit(group, { category, subCategory, frequencyClass, control, frequency, purpose, linkedAccountId }, remember)}>
           <Check size={12} /> Apply
         </button>
       </td>
@@ -8567,13 +10181,14 @@ function MerchantRow({ group, onCommit, accounts }) {
  *   - Merchant groups: MerchantGroupsPanel, for combining near-duplicate merchant
  *     strings under one display name (this only affects display - categorization
  *     rules still match the original text). */
-function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAliases, setMerchantAliases, accounts }) {
+function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAliases, setMerchantAliases, accounts, showToast }) {
   const [subTab, setSubTab] = useState("rules"); // rules | merchants
   const [pattern, setPattern] = useState("");
   const [category, setCategory] = useState("Expense");
-  const [subCategory, setSubCategory] = useState("Variable");
+  const [subCategory, setSubCategory] = useState("Household");
+  const [frequencyClass, setFrequencyClass] = useState("Recurring");
+  const [control, setControl] = useState("Committed");
   const [frequency, setFrequency] = useState("Monthly");
-  const [tag, setTag] = useState("Personal");
   const [purpose, setPurpose] = useState("Personal");
   const [linkedAccountId, setLinkedAccountId] = useState("");
   const [confirmingReapply, setConfirmingReapply] = useState(false);
@@ -8590,15 +10205,14 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
     const p = pattern.trim().toLowerCase();
     if (!p) return;
     const finalSub = subCategoryOptionsFor(category).length > 0 ? subCategory : null;
-    const finalFreq = isFrequencyEligible(category, finalSub) ? frequency : null;
+    const finalFreq = isFrequencyEligible(frequencyClass) ? frequency : null;
     const finalLinkedAccountId = linkableAccountTypesFor(category, finalSub).length > 0 ? (linkedAccountId || null) : null;
     setRules((prev) => [
       ...prev.filter((r) => r.pattern.toLowerCase() !== p),
       {
         id: uid("rule"), pattern: p, category,
         subCategory: finalSub,
-        tag: category === "Expense" ? tag : null,
-        frequency: finalFreq,
+        frequencyClass, frequency: finalFreq, control: category === "Expense" && frequencyClass !== "One-Time" ? control : null,
         purpose: purpose || "Personal",
         linkedAccountId: finalLinkedAccountId,
         source: "user", priority: p.length + 1000, // user rules win ties
@@ -8634,7 +10248,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
       </div>
 
       {subTab === "merchants" ? (
-        <MerchantGroupsPanel transactions={transactions} merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} />
+        <MerchantGroupsPanel transactions={transactions} merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} showToast={showToast} />
       ) : (
       <>
       <h2 className="bw-h2">Categorization rules</h2>
@@ -8712,39 +10326,35 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
         </div>
       </div>
       {subCategoryOptionsFor(category).length > 0 && (
-        <div className="bw-grid2">
-          <div className="bw-field">
-            <label>Sub-category</label>
-            <select value={subCategory} onChange={(e) => setSubCategory(e.target.value)}>
-              {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
-            </select>
-          </div>
-          {isFrequencyEligible(category, subCategory) ? (
-            <div className="bw-field">
-              <label>Frequency</label>
-              <select value={frequency} onChange={(e) => setFrequency(e.target.value)}>
-                {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
-              </select>
-            </div>
-          ) : category === "Expense" ? (
-            <div className="bw-field">
-              <label>Tag</label>
-              <select value={tag} onChange={(e) => setTag(e.target.value)}>
-                {TAGS.map((t) => <option key={t}>{t}</option>)}
-              </select>
-            </div>
-          ) : <div />}
+        <div className="bw-field">
+          <label>Sub-category</label>
+          <select value={subCategory} onChange={(e) => setSubCategory(e.target.value)}>
+            {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
+          </select>
         </div>
       )}
-      {isFrequencyEligible(category, subCategory) && category === "Expense" && (
-        <div className="bw-grid2">
-          <div className="bw-field">
-            <label>Tag</label>
-            <select value={tag} onChange={(e) => setTag(e.target.value)}>
-              {TAGS.map((t) => <option key={t}>{t}</option>)}
-            </select>
-          </div>
-          <div />
+      {category && (
+        <div className="bw-field">
+          <label>Class</label>
+          <select value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
+            {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+          </select>
+        </div>
+      )}
+      {category === "Expense" && frequencyClass !== "One-Time" && (
+        <div className="bw-field">
+          <label>Control</label>
+          <select value={control} onChange={(e) => setControl(e.target.value)}>
+            {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+          </select>
+        </div>
+      )}
+      {category && isFrequencyEligible(frequencyClass) && (
+        <div className="bw-field" style={{ maxWidth: 220 }}>
+          <label>Frequency</label>
+          <select value={frequency} onChange={(e) => setFrequency(e.target.value)}>
+            {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
+          </select>
         </div>
       )}
       <div className="bw-field" style={{ maxWidth: 220 }}>
@@ -8776,8 +10386,8 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
             <tr key={r.id}>
               <td style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{r.pattern}</td>
               <td>
-                <span className="bw-pill" style={{ background: PALETTE[pillClass(r.category, r.subCategory, r.tag)] || "#9C8F78" }}>
-                  {r.category}{r.subCategory ? ` / ${r.subCategory}` : ""}{r.frequency ? ` / ${r.frequency}` : ""}{r.tag ? ` / ${r.tag}` : ""}
+                <span className="bw-pill" style={{ background: PALETTE[pillClass(r.category, r.subCategory, r.frequencyClass)] || "#9C8F78" }}>
+                  {r.category}{r.subCategory ? ` / ${r.subCategory}` : ""}{r.frequencyClass ? ` / ${r.frequencyClass}` : ""}{r.control ? ` / ${r.control}` : ""}{r.frequency ? ` / ${r.frequency}` : ""}
                 </span>
                 {r.purpose === "Business" && (
                   <span style={{ fontSize: 9.5, color: "var(--ochre)", border: "1px solid var(--ochre)", borderRadius: 20, padding: "1px 6px", marginLeft: 5 }}>
@@ -8807,17 +10417,17 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
  *  so future imports keep working. Suggestions come from computeSuggestedMerchantClusters
  *  (algorithmic, based on shared "core" text after stripping banking noise words);
  *  groups can also be built or edited entirely by hand below. */
-function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases }) {
+function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases, showToast }) {
   const suggestions = useMemo(
     () => computeSuggestedMerchantClusters(transactions, merchantAliases),
     [transactions, merchantAliases]
   );
 
-  // every distinct raw merchant string seen (Expense only), for the "add variant" pickers
+  // every distinct raw merchant/payer string seen (Expense + Income), for the "add variant" pickers
   const allRawMerchants = useMemo(() => {
     const map = {};
     transactions.forEach((t) => {
-      if (t.category !== "Expense") return;
+      if (t.category !== "Expense" && t.category !== "Income") return;
       const key = t.merchant || t.description;
       if (!key) return;
       map[key] = (map[key] || 0) + t.amount;
@@ -8825,26 +10435,65 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
     return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([k]) => k);
   }, [transactions]);
 
-  function mergeCluster(cluster, name) {
+  // The merchant key shown above is often the truncated, 3-word normalized string -
+  // frequently cryptic on its own ("NEFT CR 4521"). A representative full, untruncated
+  // description (the most recent transaction carrying that key) is kept alongside it
+  // purely so search and the picker UI can show real context - never used for
+  // grouping/matching itself, which still runs on the key exactly as everywhere else.
+  const fullDescriptionByKey = useMemo(() => {
+    const map = {};
+    transactions.forEach((t) => {
+      if (t.category !== "Expense" && t.category !== "Income") return;
+      const key = t.merchant || t.description;
+      if (!key || !t.description) return;
+      if (!map[key] || t.date > map[key].date) map[key] = { text: t.description, date: t.date };
+    });
+    const out = {};
+    Object.entries(map).forEach(([k, v]) => { out[k] = v.text; });
+    return out;
+  }, [transactions]);
+
+  function mergeCluster(cluster, name, type) {
     const finalName = (name || cluster.suggestedName || cluster.core).trim();
     if (!finalName) return;
+    // "Other" is the permanent, reserved fallback Field B/Sub Category uses for any
+    // merchant not (yet) in a group - a real group claiming that name would silently
+    // collide with every still-ungrouped merchant, so it's never allowed.
+    if (finalName.toLowerCase() === "other") {
+      showToast?.("\"Other\" is reserved for ungrouped merchants — please choose a different name.");
+      return;
+    }
     setMerchantAliases((prev) => [
       ...prev,
-      { id: uid("mg"), canonical: finalName, variants: cluster.variants.map((v) => v.key) },
+      { id: uid("mg"), canonical: finalName, type: type || "category", variants: cluster.variants.map((v) => v.key) },
     ]);
   }
 
   function renameGroup(id, name) {
+    // Defensive check - MerchantGroupRow already validates on blur before calling this,
+    // but this is the actual data-mutation point, so it shouldn't rely solely on the
+    // caller having done so.
+    if (name.trim().toLowerCase() === "other") return;
     setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, canonical: name } : g)));
+  }
+
+  // Whether this group's variants get combined for recurring-pattern learning
+  // ("sameCommitment" - an explicit assertion that different bank/UPI text really
+  // describes one recurring bill, like Electricity) or stay separate the way raw
+  // merchant text always has ("category" - the default and the only behavior that
+  // existed before this, safe for a bucket of genuinely different things like
+  // Netflix and Audible both shown under "Subscriptions").
+  function changeGroupType(id, type) {
+    setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, type } : g)));
   }
 
   function removeVariant(id, variant) {
     setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, variants: g.variants.filter((v) => v !== variant) } : g)).filter((g) => g.variants.length > 0));
   }
 
-  function addVariant(id, variant) {
-    if (!variant) return;
-    setMerchantAliases((prev) => prev.map((g) => (g.id === id && !g.variants.includes(variant) ? { ...g, variants: [...g.variants, variant] } : g)));
+  function addVariants(id, variantsToAdd) {
+    if (!variantsToAdd || variantsToAdd.length === 0) return;
+    setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, variants: [...new Set([...g.variants, ...variantsToAdd])] } : g)));
   }
 
   function deleteGroup(id) {
@@ -8885,16 +10534,22 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
           {merchantAliases.map((g) => (
             <MerchantGroupRow
               key={g.id} group={g}
-              availableToAdd={ungroupedRaw}
-              onRename={renameGroup} onRemoveVariant={removeVariant} onAddVariant={addVariant} onDelete={deleteGroup}
+              availableToAdd={ungroupedRaw} fullDescriptionByKey={fullDescriptionByKey}
+              onRename={renameGroup} onRemoveVariant={removeVariant} onAddVariants={addVariants} onDelete={deleteGroup}
+              onChangeType={changeGroupType}
             />
           ))}
         </div>
       )}
 
-      <ManualMerchantGroupCreator availableRaw={ungroupedRaw} onCreate={(name, variants) => {
-        if (!name.trim() || variants.length === 0) return;
-        setMerchantAliases((prev) => [...prev, { id: uid("mg"), canonical: name.trim(), variants }]);
+      <ManualMerchantGroupCreator availableRaw={ungroupedRaw} fullDescriptionByKey={fullDescriptionByKey} onCreate={(name, variants, type) => {
+        const trimmed = name.trim();
+        if (!trimmed || variants.length === 0) return;
+        if (trimmed.toLowerCase() === "other") {
+          showToast?.("\"Other\" is reserved for ungrouped merchants — please choose a different name.");
+          return;
+        }
+        setMerchantAliases((prev) => [...prev, { id: uid("mg"), canonical: trimmed, type: type || "category", variants }]);
       }} />
     </div>
   );
@@ -8902,31 +10557,163 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
 
 /** One algorithmically-suggested merchant cluster, with an editable proposed name and
  *  a one-click "Merge as one" to accept it as a real merchant group. */
+/** Shared type choice for a merchant group - whether its variants should be combined
+ *  for recurring-pattern learning ("sameCommitment": an explicit assertion that
+ *  different bank/UPI text really describes one recurring bill, like Electricity)
+ *  or kept separate the way raw merchant text always has ("category": the default -
+ *  safe for a bucket of genuinely different things, like Netflix and Audible both
+ *  shown under "Subscriptions", where combining them would fabricate a meaningless
+ *  pattern from their unrelated dates). Used by all three group creation/editing
+ *  points so the choice and its explanation are worded identically everywhere. */
+function MerchantGroupTypeSelector({ value, onChange }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 8 }}>
+      <label style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 11.5, cursor: "pointer" }}>
+        <input type="radio" checked={value !== "sameCommitment"} onChange={() => onChange("category")} style={{ marginTop: 2 }} />
+        <span>
+          <strong>Spending category</strong> — these are different things (e.g. Netflix and Audible under "Subscriptions").
+          Shown and totaled together, but each keeps learning its own pattern.
+        </span>
+      </label>
+      <label style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 11.5, cursor: "pointer" }}>
+        <input type="radio" checked={value === "sameCommitment"} onChange={() => onChange("sameCommitment")} style={{ marginTop: 2 }} />
+        <span>
+          <strong>Same recurring bill</strong> — this is really one thing with inconsistent bank text (e.g. Electricity
+          billed under different descriptions each month). Combined so its pattern can actually be learned.
+        </span>
+      </label>
+    </div>
+  );
+}
+
 function SuggestedClusterRow({ cluster, onMerge }) {
   const [name, setName] = useState(cluster.suggestedName);
+  // Defaults to sameCommitment - an algorithmic suggestion clusters near-duplicate
+  // merchant text, which IS the "same bill, inconsistent description" scenario most
+  // of the time (the whole reason these were suggested together at all).
+  const [type, setType] = useState("sameCommitment");
   return (
     <div style={{ border: "1px solid var(--line)", borderRadius: 6, padding: 12, background: "var(--card)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
         <input type="text" className="bw-select-inline" style={{ fontSize: 13, fontWeight: 600, width: 220 }} value={name} onChange={(e) => setName(e.target.value)} />
-        <button className="bw-btn small" onClick={() => onMerge(cluster, name)}><Merge size={12} /> Merge as one</button>
+        <button className="bw-btn small" onClick={() => onMerge(cluster, name, type)}><Merge size={12} /> Merge as one</button>
       </div>
-      <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>
+      <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 8 }}>
         {cluster.variants.map((v) => `${v.key} (${v.count}× · ${inr(v.total)})`).join(" · ")}
       </div>
+      <MerchantGroupTypeSelector value={type} onChange={setType} />
+    </div>
+  );
+}
+
+/** Shared searchable, multi-select checkbox list for picking raw merchant/payer
+ *  strings to group - used by both the "add to existing group" and "create new
+ *  group" flows. Search matches against the FULL, untruncated bank description,
+ *  not just the often-cryptic truncated merchant key ("NEFT CR 4521") shown as the
+ *  option's own label - searching "salary" should find it even when the key itself
+ *  doesn't contain that word. The full description is also shown as a subtitle
+ *  under each option for the same reason - context the truncated key alone hides. */
+function SearchableMerchantPicker({ options, fullDescriptionByKey, selected, onToggle, onSelectAll, onUnselectAll, placeholder }) {
+  const [search, setSearch] = useState("");
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter((k) => k.toLowerCase().includes(q) || (fullDescriptionByKey[k] || "").toLowerCase().includes(q));
+  }, [options, search, fullDescriptionByKey]);
+  const filteredSelectedCount = filtered.filter((k) => selected.includes(k)).length;
+
+  return (
+    <div>
+      <input
+        type="text" className="bw-select-inline" style={{ width: "100%", marginBottom: 8 }}
+        placeholder={placeholder || "Search the full transaction description..."}
+        value={search} onChange={(e) => setSearch(e.target.value)}
+      />
+      {filtered.length === 0 ? (
+        <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{options.length === 0 ? "Nothing available." : "No matches for that search."}</div>
+      ) : (
+        <>
+          {(onSelectAll || onUnselectAll) && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+              {onSelectAll && (
+                <button type="button" className="bw-btn ghost small" disabled={filteredSelectedCount === filtered.length}
+                  onClick={() => onSelectAll(filtered)}>
+                  Select all{search.trim() ? " (search results)" : ""}
+                </button>
+              )}
+              {onUnselectAll && (
+                <button type="button" className="bw-btn ghost small" disabled={filteredSelectedCount === 0}
+                  onClick={() => onUnselectAll(filtered)}>
+                  Unselect all{search.trim() ? " (search results)" : ""}
+                </button>
+              )}
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 220, overflowY: "auto" }}>
+            {filtered.map((k) => {
+              const fullDesc = fullDescriptionByKey[k];
+              return (
+                <label key={k} style={{
+                  fontSize: 11.5, border: `1px solid ${selected.includes(k) ? "var(--teal)" : "var(--line)"}`, borderRadius: 6,
+                  padding: "5px 9px", cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 7,
+                  background: selected.includes(k) ? "rgba(46,102,89,0.08)" : "var(--card)",
+                }}>
+                  <input type="checkbox" checked={selected.includes(k)} onChange={() => onToggle(k)} style={{ margin: "2px 0 0" }} />
+                  <div>
+                    <div style={{ fontWeight: 500 }}>{k}</div>
+                    {fullDesc && fullDesc !== k && <div style={{ fontSize: 10, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace" }}>{fullDesc}</div>}
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
 /** One existing merchant group, editable in place - rename it, remove a variant
- *  (deleting the group entirely once its last variant is gone), add another
- *  ungrouped raw merchant string to it, or delete the whole group. */
-function MerchantGroupRow({ group, availableToAdd, onRename, onRemoveVariant, onAddVariant, onDelete }) {
-  const [addValue, setAddValue] = useState("");
+ *  (deleting the group entirely once its last variant is gone), add one or more
+ *  ungrouped raw merchant strings to it in a single action, or delete the whole
+ *  group. */
+function MerchantGroupRow({ group, availableToAdd, fullDescriptionByKey, onRename, onRemoveVariant, onAddVariants, onDelete, onChangeType }) {
+  const [adding, setAdding] = useState(false);
+  const [toAdd, setToAdd] = useState([]);
+  // Local draft, separate from group.canonical - lets the person type freely (e.g.
+  // "Others" passing through "Other" mid-keystroke) without the reserved-name check
+  // firing on every character. Validation only runs once editing is actually done.
+  const [nameDraft, setNameDraft] = useState(group.canonical);
+
+  function commitRename() {
+    const trimmed = nameDraft.trim();
+    if (!trimmed || trimmed.toLowerCase() === "other") {
+      setNameDraft(group.canonical); // revert - rejected or emptied, nothing to commit
+      return;
+    }
+    if (trimmed !== group.canonical) onRename(group.id, trimmed);
+  }
+
+  function toggle(k) {
+    setToAdd((prev) => (prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]));
+  }
+  function selectAllToAdd(keys) {
+    setToAdd((prev) => [...new Set([...prev, ...keys])]);
+  }
+  function unselectAllToAdd(keys) {
+    setToAdd((prev) => prev.filter((k) => !keys.includes(k)));
+  }
+  function commitAdd() {
+    onAddVariants(group.id, toAdd);
+    setToAdd([]);
+    setAdding(false);
+  }
+
   return (
     <div style={{ border: "1px solid var(--line)", borderRadius: 6, padding: 12, background: "var(--card)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8 }}>
         <input type="text" className="bw-select-inline" style={{ fontSize: 13, fontWeight: 600, width: 220 }}
-          value={group.canonical} onChange={(e) => onRename(group.id, e.target.value)} />
+          value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} onBlur={commitRename} />
         <button className="bw-btn ghost small" onClick={() => onDelete(group.id)}><Trash2 size={12} /> Delete group</button>
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
@@ -8942,55 +10729,70 @@ function MerchantGroupRow({ group, availableToAdd, onRename, onRemoveVariant, on
           </span>
         ))}
       </div>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <select className="bw-select-inline" style={{ flex: 1 }} value={addValue} onChange={(e) => setAddValue(e.target.value)}>
-          <option value="">— add another variant —</option>
-          {availableToAdd.map((k) => <option key={k} value={k}>{k}</option>)}
-        </select>
-        <button className="bw-btn ghost small" disabled={!addValue} onClick={() => { onAddVariant(group.id, addValue); setAddValue(""); }}>
-          <Plus size={12} /> Add
+      <MerchantGroupTypeSelector value={group.type} onChange={(t) => onChangeType(group.id, t)} />
+      {!adding ? (
+        <button className="bw-btn ghost small" disabled={availableToAdd.length === 0} onClick={() => setAdding(true)}>
+          <Plus size={12} /> Add variants
         </button>
-      </div>
+      ) : (
+        <div style={{ border: "1px dashed var(--line)", borderRadius: 6, padding: 10 }}>
+          <SearchableMerchantPicker
+            options={availableToAdd} fullDescriptionByKey={fullDescriptionByKey}
+            selected={toAdd} onToggle={toggle} onSelectAll={selectAllToAdd} onUnselectAll={unselectAllToAdd}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button className="bw-btn small" disabled={toAdd.length === 0} onClick={commitAdd}>
+              <Plus size={12} /> Add {toAdd.length > 0 ? `${toAdd.length} selected` : ""}
+            </button>
+            <button className="bw-btn ghost small" onClick={() => { setToAdd([]); setAdding(false); }}>Cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-/** Builds a brand-new merchant group from scratch - name it, then check off any
- *  number of ungrouped raw merchant strings to combine under that name, for cases
- *  the algorithmic suggestions above don't catch. */
-function ManualMerchantGroupCreator({ availableRaw, onCreate }) {
+/** Builds a brand-new merchant group from scratch - name it, then search and check
+ *  off any number of ungrouped raw merchant strings to combine under that name, for
+ *  cases the algorithmic suggestions above don't catch. */
+function ManualMerchantGroupCreator({ availableRaw, fullDescriptionByKey, onCreate }) {
   const [name, setName] = useState("");
   const [selected, setSelected] = useState([]);
+  // Defaults to category - a manually-picked, diverse selection is more likely a
+  // deliberate spending-category grouping than the "same bill, different text"
+  // scenario the algorithmic suggestions above are built to catch.
+  const [type, setType] = useState("category");
 
   function toggle(k) {
     setSelected((prev) => (prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]));
+  }
+  function selectAll(keys) {
+    setSelected((prev) => [...new Set([...prev, ...keys])]);
+  }
+  function unselectAll(keys) {
+    setSelected((prev) => prev.filter((k) => !keys.includes(k)));
   }
 
   return (
     <div style={{ border: "1px dashed var(--line)", borderRadius: 6, padding: 12 }}>
       <div className="bw-field">
-        <label>Create a group manually — name it, then pick the merchants to combine</label>
+        <label>Create a group manually — name it, then search and pick the merchants to combine</label>
         <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Scapia" />
       </div>
       {availableRaw.length === 0 ? (
         <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>All known merchants are already in a group.</div>
       ) : (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, maxHeight: 140, overflowY: "auto" }}>
-          {availableRaw.map((k) => (
-            <label key={k} style={{
-              fontSize: 11, border: `1px solid ${selected.includes(k) ? "var(--teal)" : "var(--line)"}`, borderRadius: 20,
-              padding: "3px 9px", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 5,
-              background: selected.includes(k) ? "rgba(46,102,89,0.08)" : "var(--card)",
-            }}>
-              <input type="checkbox" checked={selected.includes(k)} onChange={() => toggle(k)} style={{ margin: 0 }} />
-              {k}
-            </label>
-          ))}
+        <div style={{ marginBottom: 10 }}>
+          <SearchableMerchantPicker
+            options={availableRaw} fullDescriptionByKey={fullDescriptionByKey}
+            selected={selected} onToggle={toggle} onSelectAll={selectAll} onUnselectAll={unselectAll}
+          />
         </div>
       )}
+      {selected.length > 0 && <MerchantGroupTypeSelector value={type} onChange={setType} />}
       <button className="bw-btn small" disabled={!name.trim() || selected.length === 0}
-        onClick={() => { onCreate(name, selected); setName(""); setSelected([]); }}>
-        <Merge size={12} /> Create group
+        onClick={() => { onCreate(name, selected, type); setName(""); setSelected([]); setType("category"); }}>
+        <Merge size={12} /> Create group {selected.length > 0 ? `(${selected.length} selected)` : ""}
       </button>
     </div>
   );
@@ -9035,7 +10837,7 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
       if (t.category === "Expense") {
         const signed = t.direction === "credit" ? -t.amount : t.amount;
         m.expense += signed;
-        const key = pillClass(t.category, t.subCategory, t.tag);
+        const key = pillClass(t.category, t.subCategory, t.frequencyClass);
         m.buckets[key] = (m.buckets[key] || 0) + signed;
       }
     });
@@ -9220,7 +11022,7 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
  *  Every number here is either summed directly from transactions, or - for
  *  Opening/Closing - resolved through the shared balance resolver, never a separately
  *  tracked or manually-entered figure. */
-function CashFlowOverview({ transactions, setTransactions, accounts, budgets, setBudgets, cashBuffer, setCashBuffer, merchantAliases, rules, onGoToUpload, onGoToReview }) {
+function CashFlowOverview({ transactions, setTransactions, accounts, budgets, setBudgets, cashBuffer, setCashBuffer, merchantAliases, rules, goals, holdingSnapshots, onGoToUpload, onGoToReview, onGoToCFO }) {
   const months = useMemo(() => {
     const s = new Set(transactions.map((t) => monthKey(t.date)));
     return [...s].sort();
@@ -9233,7 +11035,13 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 
   const [selectedMonth, setSelectedMonth] = useState("all");
   const [drill, setDrill] = useState(null); // { label, txns }
-  const [subView, setSubView] = useState("overview"); // "overview" | "calendar"
+  const [subView, setSubView] = useState("overview"); // "summary" | "overview" | "events"
+  const [eventsInitialFilter, setEventsInitialFilter] = useState(null); // { period, statusFilter } - set by Summary's drill-down, consumed once by Events on mount
+
+  function drillToEvents(period, statusFilter) {
+    setEventsInitialFilter({ period, statusFilter });
+    setSubView("events");
+  }
 
   // "all" | "year" | "month" — a 4-char selection is a year, 7-char (YYYY-MM) is a month
   const periodType = selectedMonth === "all" ? "all" : (selectedMonth.length === 4 ? "year" : "month");
@@ -9260,7 +11068,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
         // reduce spend, not add to it, the same way Investment nets debit-out against credit-in.
         const signedAmt = t.direction === "credit" ? -t.amount : t.amount;
         expense += signedAmt;
-        const key = pillClass(t.category, t.subCategory, t.tag);
+        const key = pillClass(t.category, t.subCategory, t.frequencyClass);
         compBuckets[key] = (compBuckets[key] || 0) + signedAmt;
         const m = resolveMerchant(t.merchant || t.description, merchantAliases);
         merchantTotals[m] = (merchantTotals[m] || 0) + signedAmt;
@@ -9290,7 +11098,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
       const b = buckets[method];
       b.total += signed;
       const m = resolveMerchant(t.merchant || t.description, merchantAliases);
-      if (t.subCategory === "Fixed") {
+      if (t.frequencyClass === "Recurring") {
         b.fixed += signed;
         if (!recurringByMethod[method][m]) recurringByMethod[method][m] = { merchant: m, total: 0, lastDate: "", frequency: t.frequency || "Monthly" };
         recurringByMethod[method][m].total += signed;
@@ -9298,10 +11106,10 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
           recurringByMethod[method][m].lastDate = t.date;
           recurringByMethod[method][m].frequency = t.frequency || "Monthly";
         }
-      } else if (t.subCategory === "Variable" && t.tag === "Household") {
+      } else if (t.frequencyClass === "Irregular" && t.subCategory === "Household") {
         b.varHousehold += signed;
         merchantsByMethod[method].varHousehold[m] = (merchantsByMethod[method].varHousehold[m] || 0) + signed;
-      } else if (t.subCategory === "Variable" && t.tag === "Personal") {
+      } else if (t.frequencyClass === "Irregular" && t.subCategory === "Personal") {
         b.varPersonal += signed;
         merchantsByMethod[method].varPersonal[m] = (merchantsByMethod[method].varPersonal[m] || 0) + signed;
       }
@@ -9345,11 +11153,11 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
       if (t.category === "Expense") {
         const signedAmt = t.direction === "credit" ? -t.amount : t.amount;
         m.expense += signedAmt;
-        const key = pillClass(t.category, t.subCategory, t.tag);
+        const key = pillClass(t.category, t.subCategory, t.frequencyClass);
         m.buckets[key] = (m.buckets[key] || 0) + signedAmt;
         const mrc = resolveMerchant(t.merchant || t.description, merchantAliases);
         m.merchants[mrc] = (m.merchants[mrc] || 0) + signedAmt;
-        if (t.subCategory === "Fixed") {
+        if (t.frequencyClass === "Recurring") {
           const freq = t.frequency || "Monthly";
           m.fixedByFreq[freq] = (m.fixedByFreq[freq] || 0) + signedAmt;
         }
@@ -9398,7 +11206,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
     BUDGET_BUCKETS.forEach((b) => { ctx[b.key] = {}; });
     transactions.forEach((t) => {
       if (t.category !== "Expense") return;
-      const key = pillClass(t.category, t.subCategory, t.tag);
+      const key = pillClass(t.category, t.subCategory, t.frequencyClass);
       if (!ctx[key]) return;
       const m = resolveMerchant(t.merchant || t.description, merchantAliases);
       const signedAmt = t.direction === "credit" ? -t.amount : t.amount;
@@ -9522,7 +11330,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
     // expense would, and were previously an invisible gap versus the real statement.
     const bankAccountIds = new Set(bankAccounts.map((a) => a.id));
     let bankIncome = 0, bankExpense = 0, bankInvestedOut = 0, bankInvestedIn = 0;
-    const transferBreakdown = { Self: 0, "Credit card payment": 0, External: 0 };
+    const transferBreakdown = { Self: 0, "Debt Payment": 0, "Debt Add": 0, External: 0 };
     let netTransfers = 0;
     scoped.forEach((t) => {
       if (!bankAccountIds.has(t.accountId)) return;
@@ -9610,19 +11418,19 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
   // Transfer breakdown for the Breakdown section — rows are accounts/statements
   // (SCB, Kotak, Scapia...), columns are transfer subtype. Different from the equation
   // grid above: this includes credit card accounts too, since a CC statement's own
-  // "Credit card payment" entry (the accrual side, not the bank's cash side) is exactly
+  // "Debt Payment" entry (the accrual side, not the bank's cash side) is exactly
   // what's useful to see here, even though it's excluded from the cash equation itself.
   const transferByAccountGrid = useMemo(() => {
     return accounts
       .map((a) => {
-        const row = { id: a.id, nickname: a.nickname, Self: 0, "Credit card payment": 0, External: 0 };
+        const row = { id: a.id, nickname: a.nickname, Self: 0, "Debt Payment": 0, "Debt Add": 0, External: 0 };
         scoped.forEach((t) => {
           if (t.accountId !== a.id || t.category !== "Transfer") return;
           const signedAmt = t.direction === "credit" ? t.amount : -t.amount;
           const key = t.subCategory || "Self";
           row[key] = (row[key] || 0) + signedAmt;
         });
-        row.total = row.Self + row["Credit card payment"] + row.External;
+        row.total = row.Self + row["Debt Payment"] + row["Debt Add"] + row.External;
         return row;
       })
       .filter((r) => r.total !== 0);
@@ -9740,16 +11548,31 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 
   const subViewTabs = (
     <div className="bw-tabs" style={{ marginBottom: 16 }}>
+      <button className={`bw-tab ${subView === "summary" ? "active" : ""}`} onClick={() => setSubView("summary")}>Summary</button>
+      <button className={`bw-tab ${subView === "events" ? "active" : ""}`} onClick={() => setSubView("events")}>Events</button>
       <button className={`bw-tab ${subView === "overview" ? "active" : ""}`} onClick={() => setSubView("overview")}>Overview</button>
-      <button className={`bw-tab ${subView === "calendar" ? "active" : ""}`} onClick={() => setSubView("calendar")}>Calendar</button>
     </div>
   );
 
-  if (subView === "calendar") {
+  if (subView === "summary") {
     return (
       <div>
         {subViewTabs}
-        <CashFlowCalendarView transactions={transactions} accounts={accounts} rules={rules} cashBuffer={cashBuffer} setCashBuffer={setCashBuffer} />
+        <CashFlowSummaryView transactions={transactions} accounts={accounts} rules={rules} merchantAliases={merchantAliases} goals={goals} holdingSnapshots={holdingSnapshots} cashBuffer={cashBuffer} setCashBuffer={setCashBuffer} onDrillToEvents={drillToEvents} />
+      </div>
+    );
+  }
+
+  if (subView === "events") {
+    return (
+      <div>
+        {subViewTabs}
+        <CashFlowEventsView
+          transactions={transactions} accounts={accounts} rules={rules} merchantAliases={merchantAliases}
+          goals={goals} holdingSnapshots={holdingSnapshots} cashBuffer={cashBuffer}
+          initialPeriod={eventsInitialFilter?.period} initialStatusFilter={eventsInitialFilter?.statusFilter}
+          onConsumedInitialFilter={() => setEventsInitialFilter(null)}
+        />
       </div>
     );
   }
@@ -9998,7 +11821,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                   <tbody>
                     {data.recurring.map((c) => (
                       <tr key={c.merchant} style={{ cursor: "pointer" }}
-                        onClick={() => openDrill(c.merchant || "—", (t) => t.category === "Expense" && t.subCategory === "Fixed" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === c.merchant)}>
+                        onClick={() => openDrill(c.merchant || "—", (t) => t.category === "Expense" && t.frequencyClass === "Recurring" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === c.merchant)}>
                         <td>{c.merchant || "—"}</td>
                         <td><span className="bw-pill" style={{ background: "var(--slate)", fontSize: 10 }}>{c.frequency}</span></td>
                         <td className="bw-amt debit">{inr(c.amortizedAmount)}</td>
@@ -10019,7 +11842,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                     <tbody>
                       {data.topVarHousehold.map(([m, v]) => (
                         <tr key={m} style={{ cursor: "pointer" }}
-                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Household" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
+                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Household" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
                           <td>{m || "—"}</td><td className="bw-amt debit">{inr(v)}</td>
                         </tr>
                       ))}
@@ -10036,7 +11859,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                     <tbody>
                       {data.topVarPersonal.map(([m, v]) => (
                         <tr key={m} style={{ cursor: "pointer" }}
-                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Personal" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
+                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Personal" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
                           <td>{m || "—"}</td><td className="bw-amt debit">{inr(v)}</td>
                         </tr>
                       ))}
@@ -10086,18 +11909,19 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
       )}
 
       <div className="bw-section-label" style={{ marginTop: 26 }}>Transfer</div>
-      <p className="bw-lead" style={{ marginBottom: 12 }}>By account/statement — a credit card row here shows its own "Credit card payment" entry (accrual side), separate from the bank's actual cash-side payment.</p>
+      <p className="bw-lead" style={{ marginBottom: 12 }}>By account/statement — a credit card row here shows its own "Debt Payment" entry (accrual side), separate from the bank's actual cash-side payment.</p>
       {transferByAccountGrid.length === 0 ? (
         <div className="bw-empty">No transfers this period.</div>
       ) : (
         <table className="bw-table" style={{ marginBottom: 22 }}>
-          <thead><tr><th>Account</th><th style={{ textAlign: "right" }}>Self</th><th style={{ textAlign: "right" }}>Credit card payment</th><th style={{ textAlign: "right" }}>External</th><th style={{ textAlign: "right" }}>Total</th></tr></thead>
+          <thead><tr><th>Account</th><th style={{ textAlign: "right" }}>Self</th><th style={{ textAlign: "right" }}>Debt Payment</th><th style={{ textAlign: "right" }}>Debt Add</th><th style={{ textAlign: "right" }}>External</th><th style={{ textAlign: "right" }}>Total</th></tr></thead>
           <tbody>
             {transferByAccountGrid.map((r) => (
               <tr key={r.id}>
                 <td>{r.nickname}</td>
                 <td style={{ textAlign: "right" }}>{r.Self !== 0 ? inr(r.Self) : "—"}</td>
-                <td style={{ textAlign: "right" }}>{r["Credit card payment"] !== 0 ? inr(r["Credit card payment"]) : "—"}</td>
+                <td style={{ textAlign: "right" }}>{r["Debt Payment"] !== 0 ? inr(r["Debt Payment"]) : "—"}</td>
+                <td style={{ textAlign: "right" }}>{r["Debt Add"] !== 0 ? inr(r["Debt Add"]) : "—"}</td>
                 <td style={{ textAlign: "right" }}>{r.External !== 0 ? inr(r.External) : "—"}</td>
                 <td style={{ textAlign: "right", fontWeight: 600 }}>{inr(r.total)}</td>
               </tr>
@@ -10230,27 +12054,1419 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
 /* ---------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------- */
-/* Cash Flow Calendar — a forward-looking cash view, distinct from the      */
-/* transaction-history-focused Overview above. Shows only financially      */
-/* significant, recurring-type events (isFrequencyEligible categories),    */
-/* not every transaction — a day-by-day feed of every grocery purchase     */
-/* would bury the events that actually matter to plan around. Historical   */
-/* (already-happened) events and projected (learned-pattern, not-yet-      */
-/* happened) events are always visually distinct — never rendered          */
-/* identically, the same honesty discipline applied to balance confidence  */
-/* tiers elsewhere in this app. Projection math (forward balance curve)    */
-/* and the minimum-buffer setting are deliberately not part of this first  */
-/* build — this covers the grid itself only.                               */
+/* Cash Flow Calendar & List — the forward-looking cash views, distinct     */
+/* from the transaction-history-focused Overview above. Calendar's grid     */
+/* shows only financially significant, recurring-type events                */
+/* (isFrequencyEligible categories), not every transaction — a day-by-day   */
+/* feed of every grocery purchase would bury the events that actually       */
+/* matter to plan around. Historical (already-happened) and projected       */
+/* (learned-pattern, not-yet-happened) events are always visually distinct  */
+/* — never rendered identically, the same honesty discipline applied to    */
+/* balance confidence tiers elsewhere in this app. Projection math (the     */
+/* forward balance curve) and the minimum-buffer setting are both built,    */
+/* feeding Calendar's Understand/Control sections. ListView, further below, */
+/* is the financial event ledger — every real cash event, not just the      */
+/* significant recurring ones, organized around a navigable anchor month    */
+/* with visible Past/Upcoming context on either side.                       */
 /* ---------------------------------------------------------------------- */
 
-function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCashBuffer }) {
+/** The financial event ledger - every real cash event (not just recurring ones),
+ *  organized around a navigable anchor month with visible context on either side
+ *  (Past / This Month / Upcoming), rather than either a rigid single-month view or
+ *  an unanchored rolling window. Status vocabulary is deliberately drawn straight
+ *  from the app's own confidence system - Actual, Overdue, Confirmed, Expected,
+ *  Estimated - rather than inventing new synonyms, so the same word means the same
+ *  thing everywhere in the app. Each row states why it exists. No per-row edit/
+ *  delete/notes here - commitments are derived from transaction history, not
+ *  stored, editable records; a genuinely person-declared plan belongs in Goals. */
+function ListView({ transactions, accounts, rules, merchantAliases }) {
+  const [viewYear, setViewYear] = useState(new Date().getFullYear());
+  const [viewMonth, setViewMonth] = useState(new Date().getMonth() + 1);
+  const [search, setSearch] = useState("");
+  const [accountFilter, setAccountFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [expandedGroups, setExpandedGroups] = useState(new Set());
+  function toggleGroup(sectionKey) {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(sectionKey)) next.delete(sectionKey); else next.add(sectionKey);
+      return next;
+    });
+  }
+
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const accountName = (id) => accounts.find((a) => a.id === id)?.nickname || "—";
+
+  function changeMonth(delta) {
+    let m = viewMonth + delta, y = viewYear;
+    if (m > 12) { m = 1; y += 1; } else if (m < 1) { m = 12; y -= 1; }
+    setViewMonth(m); setViewYear(y);
+  }
+  const monthLabelStr = new Date(viewYear, viewMonth - 1, 1).toLocaleString("en-IN", { month: "long", year: "numeric" });
+
+  // Every row for one specific month - real transactions plus commitment
+  // projections for that month, including month-known-day-unknown ones (shown as
+  // "Sometime this month" rather than a fabricated date). Self transfers excluded,
+  // same reasoning as the Cash Flow "See" breakdown - they net to zero and aren't
+  // a real cash event entering or leaving the overall picture.
+  function eventsForMonth(y, m) {
+    const monthKey = `${y}-${String(m).padStart(2, "0")}`;
+    const list = [];
+    transactions
+      .filter((t) => t.date.slice(0, 7) === monthKey && !(t.category === "Transfer" && t.subCategory === "Self"))
+      .forEach((t) => {
+        const rawKey = t.merchant || t.description;
+        const resolved = resolveMerchant(rawKey, merchantAliases);
+        list.push({
+          id: t.id, date: t.date, sortKey: t.date, name: resolved || rawKey,
+          groupKey: resolved && resolved !== rawKey ? resolved : null,
+          amount: t.amount, direction: t.direction, status: "Actual",
+          category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, accountId: t.accountId,
+          why: "Confirmed from your imported statement.",
+        });
+      });
+    commitments.forEach((c) => {
+      const projection = projectOccurrenceForMonth(c, y, m);
+      if (!projection.recurs) return;
+      const isInflow = c.category === "Income";
+      if (!projection.date) {
+        list.push({
+          id: `proj:${c.key}:${y}-${m}`, date: null, sortKey: `${monthKey}-99`, name: c.name, groupKey: c.alias || null,
+          amount: c.lastAmount, direction: isInflow ? "credit" : "debit",
+          category: c.category, subCategory: c.subCategory, frequencyClass: "Recurring", accountId: c.linkedAccountId,
+          status: "Sometime this month",
+          why: `Recurs ${c.frequency}, but the exact day isn't established yet (${c.occurrenceCount} occurrence${c.occurrenceCount === 1 ? "" : "s"} seen, no consistent day).`,
+        });
+        return;
+      }
+      const isOverdue = projection.date < todayStr;
+      const status = isOverdue ? "Overdue" : (c.pattern.confidenceTier === "confirmed" ? "Confirmed" : c.pattern.confidenceTier === "expected" ? "Expected" : "Estimated");
+      const why = isOverdue
+        ? `Expected by ${projection.date} based on your recurring pattern (${c.occurrenceCount} occurrence${c.occurrenceCount === 1 ? "" : "s"} seen), but hasn't been confirmed yet.`
+        : c.pattern.confidenceTier === "estimate"
+          ? `Seen once so far, on ${c.lastSeenDate} - projected forward on the same day; this will refine once a second occurrence confirms the pattern.`
+          : `Recurring ${c.category}${c.subCategory ? "/" + c.subCategory : ""}, seen ${c.occurrenceCount} times - ${describeCommitmentPattern(c.pattern).toLowerCase()}.`;
+      list.push({
+        id: `proj:${c.key}:${projection.date}`, date: projection.date, sortKey: projection.date, name: c.name, groupKey: c.alias || null,
+        amount: c.lastAmount, direction: isInflow ? "credit" : "debit",
+        category: c.category, subCategory: c.subCategory, frequencyClass: "Recurring", accountId: c.linkedAccountId,
+        status, why,
+      });
+    });
+    return list.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+  }
+
+  const prevM = viewMonth === 1 ? 12 : viewMonth - 1, prevY = viewMonth === 1 ? viewYear - 1 : viewYear;
+  const nextM = viewMonth === 12 ? 1 : viewMonth + 1, nextY = viewMonth === 12 ? viewYear + 1 : viewYear;
+
+  function applyFilters(list) {
+    return list.filter((r) => {
+      if (search.trim() && !r.name.toLowerCase().includes(search.trim().toLowerCase())) return false;
+      if (accountFilter !== "all" && r.accountId !== accountFilter) return false;
+      if (categoryFilter !== "all" && r.category !== categoryFilter) return false;
+      if (statusFilter !== "all" && r.status !== statusFilter) return false;
+      return true;
+    });
+  }
+
+  const pastRows = useMemo(() => applyFilters(eventsForMonth(prevY, prevM)), [transactions, commitments, prevY, prevM, todayStr, search, accountFilter, categoryFilter, statusFilter]);
+  const thisMonthRows = useMemo(() => applyFilters(eventsForMonth(viewYear, viewMonth)), [transactions, commitments, viewYear, viewMonth, todayStr, search, accountFilter, categoryFilter, statusFilter]);
+  const upcomingRows = useMemo(() => applyFilters(eventsForMonth(nextY, nextM)), [transactions, commitments, nextY, nextM, todayStr, search, accountFilter, categoryFilter, statusFilter]);
+
+  function sectionTotals(rows) {
+    const inflow = rows.filter((r) => r.direction === "credit").reduce((s, r) => s + r.amount, 0);
+    const outflow = rows.filter((r) => r.direction === "debit").reduce((s, r) => s + r.amount, 0);
+    return { inflow, outflow, net: inflow - outflow };
+  }
+
+  // Opening/Closing for the anchor month - resolved from real data for a past
+  // month, honestly projected (reusing the same forward-projection math Calendar's
+  // Understand section uses) only when the anchor is the current, in-progress
+  // month, and left as "-" for anything further out - full multi-month forecasting
+  // is deliberately Forecast's job, not duplicated here.
+  const isCurrentMonth = viewYear === new Date().getFullYear() && viewMonth === new Date().getMonth() + 1;
+  const monthStartStr = `${viewYear}-${String(viewMonth).padStart(2, "0")}-01`;
+  const monthEndStr = `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(new Date(viewYear, viewMonth, 0).getDate()).padStart(2, "0")}`;
+  const dayBeforeMonthStart = new Date(new Date(monthStartStr).getTime() - 86400000).toISOString().slice(0, 10);
+
+  function resolveAggregateBalance(asOfDateStr) {
+    let known = true, total = 0;
+    bankAccounts.forEach((a) => {
+      const res = resolveAccountBalanceForPeriod(a, transactions, "2000-01-01", asOfDateStr, "closing");
+      if (res.value === null) { known = false; return; }
+      total += res.value;
+    });
+    return known ? total : null;
+  }
+
+  const openingBalance = useMemo(() => resolveAggregateBalance(dayBeforeMonthStart), [bankAccounts, transactions, dayBeforeMonthStart]);
+
+  const closingBalance = useMemo(() => {
+    if (!isCurrentMonth) return monthEndStr <= todayStr ? resolveAggregateBalance(monthEndStr) : null;
+    if (openingBalance === null) return null;
+    const dailyDiscretionary = (() => {
+      const medianMonthly = computeMedianMonthlyDiscretionary(transactions, viewYear, viewMonth);
+      const daysInMonth = new Date(viewYear, viewMonth, 0).getDate();
+      const daysRemaining = Math.max(1, daysInMonth - Number(todayStr.slice(8, 10)));
+      return medianMonthly / daysRemaining;
+    })();
+    const todaysBalance = resolveAggregateBalance(todayStr);
+    if (todaysBalance === null) return null;
+    const projection = computeProjectedDailyBalances(todaysBalance, todayStr, monthEndStr, thisMonthRows.filter((r) => r.status !== "Actual" && r.status !== "Sometime this month").map((r) => ({ date: r.date, kind: r.status === "Overdue" ? "overdue" : "projected", direction: r.direction, amount: r.amount })), dailyDiscretionary);
+    return projection.length > 0 ? projection[projection.length - 1].balance : null;
+  }, [isCurrentMonth, monthEndStr, todayStr, openingBalance, transactions, viewYear, viewMonth, thisMonthRows]);
+
+  const totals = sectionTotals(thisMonthRows);
+
+  const categoryOptions = useMemo(() => [...new Set([...transactions.map((t) => t.category), ...commitments.map((c) => c.category)].filter(Boolean))], [transactions, commitments]);
+  const STATUS_COLOR = { Actual: "var(--ink)", Overdue: "var(--rust)", Confirmed: "var(--teal)", Expected: "#7A5C8C", Estimated: "var(--ochre)", "Sometime this month": "var(--slate)" };
+
+  // Groups rows sharing a groupKey (alias) within one section into a single
+  // collapsed row - only where 2+ rows actually share it, the same rule as
+  // Recurring Commitments. Amount sums across members (consistent with how the
+  // section's own totals already sum unrelated things together); category, account
+  // and status show "Mixed" where members genuinely differ rather than picking one
+  // arbitrarily and implying it speaks for all of them.
+  function groupRows(rows) {
+    const byKey = {};
+    rows.forEach((r) => { if (r.groupKey) { (byKey[r.groupKey] = byKey[r.groupKey] || []).push(r); } });
+    const consumed = new Set();
+    const out = [];
+    rows.forEach((r) => {
+      if (consumed.has(r.id)) return;
+      const members = r.groupKey ? byKey[r.groupKey] : null;
+      if (members && members.length > 1) {
+        members.forEach((m) => consumed.add(m.id));
+        const netAmount = members.reduce((s, m) => s + (m.direction === "credit" ? m.amount : -m.amount), 0);
+        const dates = members.map((m) => m.date).filter(Boolean).sort();
+        const allSameCategory = members.every((m) => m.category === members[0].category && m.subCategory === members[0].subCategory);
+        const allSameStatus = members.every((m) => m.status === members[0].status);
+        const allSameAccount = members.every((m) => m.accountId === members[0].accountId);
+        out.push({
+          isGroup: true, groupKey: r.groupKey, members,
+          dateLabel: dates.length === 0 ? "Multiple" : dates.length === 1 ? dates[0] : `${dates[0]} – ${dates[dates.length - 1]}`,
+          netAmount, allSameCategory, allSameStatus, allSameAccount,
+        });
+      } else {
+        consumed.add(r.id);
+        out.push({ isGroup: false, row: r });
+      }
+    });
+    return out;
+  }
+
+  function renderSection(title, rows, showTotals) {
+    const displayRows = groupRows(rows);
+    return (
+      <div style={{ marginBottom: 22 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+          <div className="bw-section-label" style={{ margin: 0 }}>{title}</div>
+          {showTotals && (
+            <div style={{ fontSize: 11.5, fontFamily: "'IBM Plex Mono', monospace" }}>
+              <span style={{ color: "var(--teal)" }}>+{inr(showTotals.inflow)}</span>{" "}
+              <span style={{ color: "var(--rust)" }}>−{inr(showTotals.outflow)}</span>{" "}
+              <span style={{ fontWeight: 600 }}>{inr(showTotals.net)}</span>
+            </div>
+          )}
+        </div>
+        {rows.length === 0 ? (
+          <div className="bw-empty">Nothing here.</div>
+        ) : (
+          <table className="bw-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Event</th><th>Category</th><th>Account</th>
+                <th style={{ textAlign: "right" }}>Amount</th><th>Status</th><th>Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayRows.map((dr) => {
+                if (!dr.isGroup) {
+                  const r = dr.row;
+                  return (
+                    <tr key={r.id}>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 12 }}>{r.date || "—"}</td>
+                      <td>{r.name}</td>
+                      <td>
+                        {r.category ? (
+                          <span className="bw-pill" style={{ background: PALETTE[pillClass(r.category, r.subCategory, r.frequencyClass)] || "#999", fontSize: 10 }}>
+                            {r.category}{r.subCategory ? ` / ${r.subCategory}` : ""}
+                          </span>
+                        ) : "—"}
+                      </td>
+                      <td style={{ fontSize: 11.5 }}>{r.accountId ? accountName(r.accountId) : "—"}</td>
+                      <td className={r.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{r.direction === "credit" ? "+" : "−"}{inr(r.amount)}</td>
+                      <td><span className="bw-pill" style={{ background: STATUS_COLOR[r.status] || "var(--slate)" }}>{r.status}</span></td>
+                      <td style={{ fontSize: 11, color: "var(--ink-soft)", maxWidth: 280 }}>{r.why}</td>
+                    </tr>
+                  );
+                }
+                const sectionKey = `${title}:${dr.groupKey}`;
+                const isOpen = expandedGroups.has(sectionKey);
+                const first = dr.members[0];
+                return (
+                  <React.Fragment key={sectionKey}>
+                    <tr style={{ cursor: "pointer", background: "rgba(46,102,89,0.04)" }} onClick={() => toggleGroup(sectionKey)}>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 12 }}>{dr.dateLabel}</td>
+                      <td style={{ fontWeight: 600 }}>
+                        {isOpen ? <ChevronUp size={13} style={{ verticalAlign: -2, marginRight: 5 }} /> : <ChevronRight size={13} style={{ verticalAlign: -2, marginRight: 5 }} />}
+                        {dr.groupKey}
+                        <span className="bw-pill" style={{ marginLeft: 8, background: "var(--slate)", fontWeight: 400 }}>{dr.members.length} events</span>
+                      </td>
+                      <td>
+                        {dr.allSameCategory ? (
+                          <span className="bw-pill" style={{ background: PALETTE[pillClass(first.category, first.subCategory, first.frequencyClass)] || "#999", fontSize: 10 }}>
+                            {first.category}{first.subCategory ? ` / ${first.subCategory}` : ""}
+                          </span>
+                        ) : <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>Mixed</span>}
+                      </td>
+                      <td style={{ fontSize: 11.5 }}>{dr.allSameAccount ? (first.accountId ? accountName(first.accountId) : "—") : "Mixed"}</td>
+                      <td className={dr.netAmount >= 0 ? "bw-amt credit" : "bw-amt debit"}>{dr.netAmount >= 0 ? "+" : "−"}{inr(Math.abs(dr.netAmount))}</td>
+                      <td>{dr.allSameStatus ? <span className="bw-pill" style={{ background: STATUS_COLOR[first.status] || "var(--slate)" }}>{first.status}</span> : <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>Mixed</span>}</td>
+                      <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{dr.members.length} events grouped under "{dr.groupKey}" — click to see each.</td>
+                    </tr>
+                    {isOpen && dr.members.map((r) => (
+                      <tr key={r.id} style={{ background: "var(--paper)" }}>
+                        <td style={{ whiteSpace: "nowrap", fontSize: 12, paddingLeft: 26 }}>{r.date || "—"}</td>
+                        <td style={{ paddingLeft: 26 }}>{r.name}</td>
+                        <td>
+                          {r.category ? (
+                            <span className="bw-pill" style={{ background: PALETTE[pillClass(r.category, r.subCategory, r.frequencyClass)] || "#999", fontSize: 10 }}>
+                              {r.category}{r.subCategory ? ` / ${r.subCategory}` : ""}
+                            </span>
+                          ) : "—"}
+                        </td>
+                        <td style={{ fontSize: 11.5 }}>{r.accountId ? accountName(r.accountId) : "—"}</td>
+                        <td className={r.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{r.direction === "credit" ? "+" : "−"}{inr(r.amount)}</td>
+                        <td><span className="bw-pill" style={{ background: STATUS_COLOR[r.status] || "var(--slate)" }}>{r.status}</span></td>
+                        <td style={{ fontSize: 11, color: "var(--ink-soft)", maxWidth: 280 }}>{r.why}</td>
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        <button className="bw-btn ghost small" onClick={() => changeMonth(-1)}>&lsaquo;</button>
+        <span style={{ fontWeight: 600, minWidth: 140, textAlign: "center" }}>{monthLabelStr}</span>
+        <button className="bw-btn ghost small" onClick={() => changeMonth(1)}>&rsaquo;</button>
+        <button className="bw-btn ghost small" onClick={() => { setViewYear(new Date().getFullYear()); setViewMonth(new Date().getMonth() + 1); }}>Today</button>
+      </div>
+
+      <div className="bw-summary-row" style={{ gridTemplateColumns: "repeat(5, 1fr)", marginBottom: 16 }}>
+        <Stat label="Total income" value={inr(totals.inflow)} color="var(--teal)" />
+        <Stat label="Total expenses" value={inr(totals.outflow)} color="var(--rust)" />
+        <Stat label="Net cash flow" value={inr(totals.net)} color={totals.net >= 0 ? "var(--teal)" : "var(--rust)"} />
+        <Stat label="Opening balance" value={openingBalance !== null ? inr(openingBalance) : "—"} color="var(--ink)" hint={dayBeforeMonthStart} />
+        <Stat
+          label={isCurrentMonth ? "Closing balance (projected)" : "Closing balance"}
+          value={closingBalance !== null ? inr(closingBalance) : "—"}
+          color="var(--ink)"
+          hint={closingBalance === null && !isCurrentMonth && monthEndStr > todayStr ? "See Forecast for future months" : monthEndStr}
+        />
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18 }}>
+        <input type="text" className="bw-select-inline" style={{ flex: 1, minWidth: 180 }} placeholder="Search events..." value={search} onChange={(e) => setSearch(e.target.value)} />
+        <select className="bw-select-inline" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+          <option value="all">All accounts</option>
+          {accounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+        </select>
+        <select className="bw-select-inline" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+          <option value="all">All categories</option>
+          {categoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <select className="bw-select-inline" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="all">All status</option>
+          {Object.keys(STATUS_COLOR).map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </div>
+
+      {renderSection(`Past (${new Date(prevY, prevM - 1, 1).toLocaleString("en-IN", { month: "short", year: "numeric" })})`, pastRows, sectionTotals(pastRows))}
+      {renderSection(`This month (${monthLabelStr})`, thisMonthRows, totals)}
+      {renderSection(`Upcoming (${new Date(nextY, nextM - 1, 1).toLocaleString("en-IN", { month: "short", year: "numeric" })})`, upcomingRows, sectionTotals(upcomingRows))}
+    </div>
+  );
+}
+
+const CASH_FLOW_EVENT_BUCKET_ORDER = ["SCHEDULED", "EXPECTED", "PLANNED", "PROJECTED"];
+const CASH_FLOW_EVENT_BUCKET_HINT = {
+  SCHEDULED: "Recurring, well-established pattern",
+  EXPECTED: "Recurring, pattern still being learned",
+  PLANNED: "From your goals",
+  PROJECTED: "Behavioural allowance for irregular spending",
+};
+
+/** Cash Flow Summary - the new output view telling one financial story: current
+ *  verified cash, what's happening (confidence-bucketed event totals), where cash is
+ *  going (the trajectory chart, the central visual), how safe that leaves the person
+ *  (minimum cash / drawdown / buffer), and how that compares with what's actually
+ *  happened (savings rate). The chart is deliberately the largest, most prominent
+ *  element - everything else is supporting context around it, not equal-weight KPI
+ *  cards. Consumes the calculation-layer functions built for the Forecasting Engine
+ *  directly; no calculation happens inside this component beyond simple derivations
+ *  (chart point assembly, insight text formatting) from their already-computed
+ *  output. */
+/** The Performance table itself - months as columns, Actual/Projected/Variance as
+ *  rows, at the Total level. Every cell is a drill-down entry point into
+ *  PerformanceAuditDrawer, not just a specific row - clicking anywhere in a month's
+ *  column opens that month's audit. */
+function CashFlowPerformanceSection({ performance, monthKeys, onSelectMonth }) {
+  return (
+    <div style={{ marginBottom: 26 }}>
+      <h2 className="bw-h2" style={{ marginBottom: 2 }}>Cash Flow Performance</h2>
+      <p className="bw-lead" style={{ marginBottom: 14 }}>How actual cash flow compared with what was projected and planned.</p>
+      <div style={{ overflowX: "auto" }}>
+        <table className="bw-table">
+          <thead>
+            <tr>
+              <th></th>
+              {monthKeys.map((mk) => <th key={mk} style={{ textAlign: "right" }}>{monthLabel(mk)}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Actual</td>
+              {monthKeys.map((mk) => (
+                <td key={mk} className="bw-amt" style={{ cursor: "pointer" }} onClick={() => onSelectMonth(mk)}>
+                  {inr(performance[mk].actual.total)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td>Projected</td>
+              {monthKeys.map((mk) => (
+                <td key={mk} className="bw-amt" style={{ cursor: "pointer", color: "var(--ink-soft)" }} onClick={() => onSelectMonth(mk)}>
+                  {inr(performance[mk].projected.total)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td>Variance</td>
+              {monthKeys.map((mk) => {
+                const variance = performance[mk].actual.total - performance[mk].projected.total;
+                return (
+                  <td
+                    key={mk} className="bw-amt" style={{ cursor: "pointer", color: variance >= 0 ? "var(--teal)" : "var(--rust)" }}
+                    onClick={() => onSelectMonth(mk)}
+                  >
+                    {variance >= 0 ? "+" : "−"}{inr(Math.abs(variance))}
+                  </td>
+                );
+              })}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/** Cash Flow Performance's Audit Drawer - given one month's already-computed
+ *  rollup (actual + projected, both nested total -> byCategory -> bySub2), drills
+ *  from Category down to Sub2 down to the real underlying Actual transactions, all
+ *  within the same panel via internal state rather than stacking separate drawers.
+ *  Reuses the same fixed-overlay panel and DetailField/row visual language as
+ *  EventDetailDrawer, rather than inventing a new drawer pattern. */
+function PerformanceAuditDrawer({ monthData, accountName, onClose }) {
+  const [drill, setDrill] = useState({ level: "category", category: null });
+  const { actual, projected, label } = monthData;
+
+  let rows = [];
+  let title = label;
+  let backTo = null;
+
+  if (drill.level === "category") {
+    const categories = new Set([...Object.keys(actual.byCategory), ...Object.keys(projected.byCategory)]);
+    rows = [...categories].sort().map((cat) => ({
+      key: cat, name: cat,
+      actualTotal: actual.byCategory[cat]?.total || 0,
+      projectedTotal: projected.byCategory[cat]?.total || 0,
+      onClick: () => setDrill({ level: "sub2", category: cat }),
+    }));
+  } else if (drill.level === "sub2") {
+    const actualSub2 = actual.byCategory[drill.category]?.bySub2 || {};
+    const projectedSub2 = projected.byCategory[drill.category]?.bySub2 || {};
+    const labels = new Set([...Object.keys(actualSub2), ...Object.keys(projectedSub2)]);
+    rows = [...labels].sort().map((lbl) => ({
+      key: lbl, name: lbl,
+      actualTotal: actualSub2[lbl]?.total || 0,
+      projectedTotal: projectedSub2[lbl]?.total || 0,
+      underlyingActualEvents: actualSub2[lbl]?.events || [],
+      onClick: (actualSub2[lbl]?.events || []).length > 0 ? () => setDrill({ level: "transactions", category: drill.category, sub2Label: lbl }) : null,
+    }));
+    title = `${label} · ${drill.category}`;
+    backTo = () => setDrill({ level: "category", category: null });
+  } else if (drill.level === "transactions") {
+    const actualSub2 = actual.byCategory[drill.category]?.bySub2 || {};
+    rows = actualSub2[drill.sub2Label]?.events || [];
+    title = `${label} · ${drill.category} · ${drill.sub2Label}`;
+    backTo = () => setDrill({ level: "sub2", category: drill.category });
+  }
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(33,38,43,0.35)", zIndex: 60, display: "flex", justifyContent: "flex-end" }}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "min(460px, 100%)", background: "var(--card)", height: "100%", overflowY: "auto", padding: 22, boxShadow: "-4px 0 16px rgba(0,0,0,0.12)" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {backTo && <button className="bw-btn ghost small" onClick={backTo}>‹ Back</button>}
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, fontWeight: 600 }}>{title}</div>
+          </div>
+          <button className="bw-btn ghost small" onClick={onClose}><X size={14} /></button>
+        </div>
+        <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "6px 0 16px" }}>
+          {drill.level === "category" ? "Actual vs projected, by category."
+            : drill.level === "sub2" ? "Actual vs projected, by sub category."
+            : "The real transactions behind this actual total."}
+        </p>
+
+        {drill.level === "transactions" ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {rows.length === 0 ? <div className="bw-empty">No transactions.</div> : [...rows].sort((a, b) => a.date.localeCompare(b.date)).map((e) => (
+              <div key={e.id} style={{ border: "1px solid var(--line)", borderRadius: 4, padding: "6px 8px", fontSize: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>{e.name}</span>
+                  <span className={`bw-amt ${e.direction === "inflow" ? "credit" : "debit"}`}>{e.direction === "inflow" ? "+" : "−"}{inr(e.amount)}</span>
+                </div>
+                <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 1 }}>
+                  {shortDateLabel(e.date)}{e.accountId ? ` · ${accountName(e.accountId)}` : ""}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <table className="bw-table">
+            <thead><tr><th></th><th style={{ textAlign: "right" }}>Actual</th><th style={{ textAlign: "right" }}>Projected</th><th style={{ textAlign: "right" }}>Variance</th></tr></thead>
+            <tbody>
+              {rows.map((r) => {
+                const variance = r.actualTotal - r.projectedTotal;
+                return (
+                  <tr key={r.key} style={r.onClick ? { cursor: "pointer" } : undefined} onClick={r.onClick || undefined}>
+                    <td>{r.name}</td>
+                    <td className="bw-amt">{inr(r.actualTotal)}</td>
+                    <td className="bw-amt" style={{ color: "var(--ink-soft)" }}>{inr(r.projectedTotal)}</td>
+                    <td className="bw-amt" style={{ color: variance >= 0 ? "var(--teal)" : "var(--rust)" }}>{variance >= 0 ? "+" : "−"}{inr(Math.abs(variance))}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, goals, holdingSnapshots, cashBuffer, setCashBuffer, onDrillToEvents }) {
+  const [horizonMonths, setHorizonMonths] = useState(3);
+  const [selectedPerformanceMonth, setSelectedPerformanceMonth] = useState(null);
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const currentMonthKey = todayStr.slice(0, 7);
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+
+  // Cash Flow Performance - trailing 6 calendar months including the current,
+  // in-progress one (matching the confirmed example: comparing whatever Actual has
+  // happened so far this month against the full month's backtested forecast).
+  const performanceMonthKeys = useMemo(() => {
+    const [ty, tm] = currentMonthKey.split("-").map(Number);
+    const keys = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(Date.UTC(ty, tm - 1 - i, 1));
+      keys.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`);
+    }
+    return keys;
+  }, [currentMonthKey]);
+  const performance = useMemo(
+    () => computeCashFlowPerformance(transactions, accounts, rules, merchantAliases, goals, holdingSnapshots, performanceMonthKeys),
+    [transactions, accounts, rules, merchantAliases, goals, holdingSnapshots, performanceMonthKeys]
+  );
+  const accountName = (id) => accounts.find((a) => a.id === id)?.nickname || "—";
+
+  const actualCashState = useMemo(() => computeAggregateCashBalance(bankAccounts, transactions, todayStr), [bankAccounts, transactions, todayStr]);
+
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
+  const amountBehaviors = useMemo(() => computeAmountBehaviors(transactions, merchantAliases), [transactions, merchantAliases]);
+  const forecastStreams = useMemo(() => computeForecastStreams(transactions, accounts, commitments, merchantAliases, currentMonthKey), [transactions, accounts, commitments, merchantAliases, currentMonthKey]);
+
+  const projection = useMemo(() => {
+    if (actualCashState === null) return null;
+    return computeCashProjection(actualCashState, todayStr, horizonMonths, { commitments, amountBehaviors, forecastStreams, accounts, cashBuffer });
+  }, [actualCashState, todayStr, horizonMonths, commitments, amountBehaviors, forecastStreams, accounts, cashBuffer]);
+
+  const cashFlowEvents = useMemo(() => {
+    if (!projection) return null;
+    return computeCashFlowEvents({
+      transactions, accounts, merchantAliases, projection, commitments, amountBehaviors, goals, holdingSnapshots, forecastStreams,
+      startDateStr: todayStr, endDateStr: projection.horizon.endDate, todayStr,
+    });
+  }, [projection, transactions, accounts, merchantAliases, commitments, amountBehaviors, goals, holdingSnapshots, forecastStreams, todayStr]);
+
+  const eventSummary = useMemo(() => (cashFlowEvents ? computeCashFlowEventSummary(cashFlowEvents) : null), [cashFlowEvents]);
+
+  const projectedSavingsRate = useMemo(() => (eventSummary ? computeProjectedSavingsRate(eventSummary) : null), [eventSummary]);
+  const actualSavingsRate = useMemo(() => computeActualSavingsRate(transactions, 6, currentMonthKey), [transactions, currentMonthKey]);
+
+  // A short trailing "actual" segment for the chart's left-hand side, so the
+  // trajectory visually starts from somewhere rather than appearing from nowhere at
+  // today - monthly samples (not daily) to keep this cheap, since each sample calls
+  // computeAggregateCashBalance across every bank account.
+  const trailingActualPoints = useMemo(() => {
+    const points = [];
+    for (let i = 3; i >= 1; i--) {
+      const d = new Date(todayStr);
+      d.setMonth(d.getMonth() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      const balance = computeAggregateCashBalance(bankAccounts, transactions, dateStr);
+      if (balance !== null) points.push({ date: dateStr, balance });
+    }
+    return points;
+  }, [bankAccounts, transactions, todayStr]);
+
+  // Two separate series (actualBalance / projectedBalance) sharing one x-axis, each
+  // null outside its own range, overlapping at today so the two lines visually
+  // connect - the standard recharts pattern for a single chart with two differently-
+  // styled segments, rather than one line that can't change color partway through.
+  const chartData = useMemo(() => {
+    if (!projection) return [];
+    const points = [];
+    trailingActualPoints.forEach((p) => points.push({ date: p.date, actualBalance: p.balance, projectedBalance: null }));
+    points.push({ date: todayStr, actualBalance: actualCashState, projectedBalance: actualCashState });
+    projection.dailyStates.forEach((d) => {
+      if (d.date === todayStr) return;
+      points.push({ date: d.date, actualBalance: null, projectedBalance: d.balance });
+    });
+    return points;
+  }, [trailingActualPoints, projection, todayStr, actualCashState]);
+
+  const insight = useMemo(() => {
+    if (!projection || !projectedSavingsRate) return "";
+    const parts = [];
+    const { projectedMinimumCash, projectedMinimumCashDate, bufferSurplusOrShortfall } = projection;
+    const horizonLabel = `${horizonMonths} month${horizonMonths === 1 ? "" : "s"}`;
+    if (cashBuffer > 0) {
+      if (bufferSurplusOrShortfall >= 0) {
+        parts.push(`Your projected cash stays above your required buffer through the next ${horizonLabel}, with a surplus of ${inr(bufferSurplusOrShortfall)} at its lowest point on ${shortDateLabel(projectedMinimumCashDate)}.`);
+      } else {
+        parts.push(`Your projected cash dips ${inr(Math.abs(bufferSurplusOrShortfall))} below your required buffer around ${shortDateLabel(projectedMinimumCashDate)}.`);
+      }
+    } else {
+      parts.push(`Your projected minimum cash over the next ${horizonLabel} is ${inr(projectedMinimumCash)}, around ${shortDateLabel(projectedMinimumCashDate)}.`);
+    }
+    if (projectedSavingsRate.rate != null && actualSavingsRate.rate != null) {
+      const diff = projectedSavingsRate.rate - actualSavingsRate.rate;
+      const trend = Math.abs(diff) < 1 ? "in line with" : diff > 0 ? "up from" : "down from";
+      parts.push(`Your projected savings rate is ${Math.round(projectedSavingsRate.rate)}%, ${trend} your recent actual rate of ${Math.round(actualSavingsRate.rate)}%.`);
+    }
+    return parts.join(" ");
+  }, [projection, projectedSavingsRate, actualSavingsRate, cashBuffer, horizonMonths]);
+
+  if (transactions.length === 0) {
+    return <div className="bw-empty">Import a statement first — the cash flow summary fills in as soon as there's data.</div>;
+  }
+  if (actualCashState === null) {
+    return <div className="bw-empty">Actual Cash State can't be verified yet — make sure your bank account balances are confirmed (see Upload → Accounts).</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 20 }}>
+        <h2 className="bw-h2" style={{ margin: 0 }}>Cash Flow Summary</h2>
+        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          <span style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>Horizon:</span>
+          <select className="bw-select-inline" value={horizonMonths} onChange={(e) => setHorizonMonths(Number(e.target.value))}>
+            <option value={1}>1 month</option>
+            <option value={3}>3 months</option>
+            <option value={6}>6 months</option>
+            <option value={12}>12 months</option>
+          </select>
+        </div>
+      </div>
+
+      {/* 0. HISTORY - Cash Flow Performance (Actual vs Projected, a genuine backtest) */}
+      <CashFlowPerformanceSection performance={performance} monthKeys={performanceMonthKeys} onSelectMonth={setSelectedPerformanceMonth} />
+
+      {/* 1. WHERE AM I? - Actual Cash State */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--ink-soft)" }}>Cash Position</div>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 34, fontWeight: 600, marginTop: 4, color: "var(--ink)" }}>{inr(actualCashState)}</div>
+        <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginTop: 2 }}>Actual Cash State · Verified: {shortDateLabel(todayStr)}</div>
+      </div>
+
+      {/* 2. WHAT'S HAPPENING? - confidence-bucketed event totals */}
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Cash Flow Events</div>
+      <p className="bw-lead" style={{ marginBottom: 12 }}>Over the next {horizonMonths} month{horizonMonths === 1 ? "" : "s"}, summarized by confidence.</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 24 }}>
+        {CASH_FLOW_EVENT_BUCKET_ORDER.map((bucket) => {
+          const b = eventSummary ? eventSummary[bucket] : { inflow: 0, outflow: 0 };
+          if (b.inflow === 0 && b.outflow === 0) return null;
+          const bucketEventCount = cashFlowEvents ? cashFlowEvents.filter((e) => e.status === bucket).length : 0;
+          return (
+            <div
+              key={bucket} className="bw-stat"
+              onClick={onDrillToEvents ? () => onDrillToEvents(`next${horizonMonths}`, bucket) : undefined}
+              style={onDrillToEvents ? { cursor: "pointer" } : undefined}
+            >
+              <div className="label">{bucket}</div>
+              {b.inflow > 0 && <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: "var(--teal)", fontSize: 15, marginTop: 4 }}>+{inr(b.inflow)}</div>}
+              {b.outflow > 0 && <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: "var(--ink)", fontSize: 15, marginTop: b.inflow > 0 ? 2 : 4 }}>−{inr(b.outflow)}</div>}
+              <div style={{ fontSize: 10, color: "var(--ink-soft)", marginTop: 4 }}>{CASH_FLOW_EVENT_BUCKET_HINT[bucket]}</div>
+              {onDrillToEvents && (
+                <div style={{ fontSize: 10.5, color: "var(--teal)", marginTop: 6, display: "flex", alignItems: "center", gap: 3 }}>
+                  {bucketEventCount} event{bucketEventCount === 1 ? "" : "s"} <ArrowRight size={10} />
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {eventSummary && CASH_FLOW_EVENT_BUCKET_ORDER.every((b) => eventSummary[b].inflow === 0 && eventSummary[b].outflow === 0) && (
+          <div className="bw-empty" style={{ gridColumn: "1 / -1" }}>No recurring commitments, behavioural allowances, or near-term goals detected yet for this horizon.</div>
+        )}
+      </div>
+
+      {/* 3. WHERE AM I GOING? - the central visual */}
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Projected Cash Position</div>
+      <ResponsiveContainer width="100%" height={280}>
+        <AreaChart data={chartData}>
+          <defs>
+            <linearGradient id="cfsActualFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="var(--teal)" stopOpacity={0.25} />
+              <stop offset="95%" stopColor="var(--teal)" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="cfsProjectedFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="var(--ochre)" stopOpacity={0.2} />
+              <stop offset="95%" stopColor="var(--ochre)" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+          <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={shortDateLabel} minTickGap={40} />
+          <YAxis tick={{ fontSize: 10 }} tickFormatter={(v) => `${(v / 100000).toFixed(1)}L`} />
+          <Tooltip formatter={(v) => (v == null ? "—" : inr(v))} labelFormatter={shortDateLabel} />
+          {cashBuffer > 0 && (
+            <ReferenceLine y={cashBuffer} stroke="var(--rust)" strokeDasharray="4 4"
+              label={{ value: "Required buffer", position: "insideTopRight", fontSize: 10, fill: "var(--rust)" }} />
+          )}
+          <Area type="monotone" dataKey="actualBalance" name="Actual" stroke="var(--teal)" fill="url(#cfsActualFill)" strokeWidth={2} dot={false} connectNulls={false} />
+          <Area type="monotone" dataKey="projectedBalance" name="Projected" stroke="var(--ochre)" strokeDasharray="4 3" fill="url(#cfsProjectedFill)" strokeWidth={2} dot={false} connectNulls={false} />
+          {projection && (
+            <ReferenceDot x={projection.projectedMinimumCashDate} y={projection.projectedMinimumCash} r={5} fill="var(--rust)" stroke="var(--card)" strokeWidth={2} />
+          )}
+        </AreaChart>
+      </ResponsiveContainer>
+
+      {/* 4. HOW SAFE AM I? - minimum cash / drawdown / buffer */}
+      <div className="bw-summary-row" style={{ marginTop: 20, marginBottom: 24 }}>
+        <Stat label="Projected Minimum Cash" value={projection ? inr(projection.projectedMinimumCash) : "—"} hint={projection ? shortDateLabel(projection.projectedMinimumCashDate) : null} />
+        <Stat label="Cash Drawdown" value={projection ? inr(projection.cashDrawdown) : "—"} hint={projection ? `From ${inr(actualCashState)} to ${inr(projection.projectedMinimumCash)}` : null} />
+        <Stat label="Required Cash Buffer" value={inr(cashBuffer)} hint="Set below" color={cashBuffer > 0 ? undefined : "var(--ink-soft)"} />
+        <Stat
+          label={projection && projection.bufferSurplusOrShortfall >= 0 ? "Buffer Surplus" : "Buffer Shortfall"}
+          value={projection ? `${projection.bufferSurplusOrShortfall >= 0 ? "+" : "−"}${inr(Math.abs(projection.bufferSurplusOrShortfall))}` : "—"}
+          color={projection ? (projection.bufferSurplusOrShortfall >= 0 ? "var(--teal)" : "var(--rust)") : undefined}
+        />
+      </div>
+
+      <div className="bw-field" style={{ maxWidth: 220, marginBottom: 24 }}>
+        <label>Required Cash Buffer</label>
+        <input type="number" value={cashBuffer || ""} placeholder="e.g. 500000" onChange={(e) => setCashBuffer(Number(e.target.value) || 0)} />
+      </div>
+
+      {/* 5. AM I ACHIEVING MY PLAN? - savings rate comparison, built as an extensible
+         row so a future Budgeted column is a one-line addition, not a redesign */}
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Savings Rate</div>
+      <div className="bw-summary-row" style={{ marginBottom: 24 }}>
+        {[
+          { label: "Actual", rate: actualSavingsRate.rate, amount: actualSavingsRate.savings },
+          { label: "Projected", rate: projectedSavingsRate ? projectedSavingsRate.rate : null, amount: projectedSavingsRate ? projectedSavingsRate.savings : null },
+        ].map((col) => (
+          <Stat
+            key={col.label}
+            label={col.label}
+            value={col.rate != null ? `${col.rate.toFixed(0)}%` : "—"}
+            hint={col.amount != null ? inr(col.amount) : null}
+            color={col.rate != null ? (col.rate >= 0 ? "var(--teal)" : "var(--rust)") : undefined}
+          />
+        ))}
+      </div>
+
+      {/* 6. WHAT SHOULD I KNOW? */}
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Insights</div>
+      <div style={{ border: "1px solid var(--line)", borderRadius: 6, padding: 16, background: "var(--card)", fontSize: 13, lineHeight: 1.6 }}>
+        {insight || "Not enough data yet to generate an insight for this horizon."}
+      </div>
+
+      {selectedPerformanceMonth && (
+        <PerformanceAuditDrawer monthData={performance[selectedPerformanceMonth]} accountName={accountName} onClose={() => setSelectedPerformanceMonth(null)} />
+      )}
+    </div>
+  );
+}
+
+const EVENT_PERIOD_OPTIONS = [
+  { value: "thisMonth", label: "This month" },
+  { value: "next1", label: "Next month" },
+  { value: "next3", label: "Next 3 months" },
+  { value: "next6", label: "Next 6 months" },
+  { value: "next12", label: "Next 12 months" },
+  { value: "last3", label: "Last 3 months" },
+  { value: "last6", label: "Last 6 months" },
+];
+
+/** Resolves a period preset to concrete [startDateStr, endDateStr] bounds. "next1/3/6/12"
+ *  match Summary's own horizon math exactly (sd-1 of the month N later, inclusive of
+ *  the last day) so a drill-down from Summary's horizon selector lands on identical
+ *  bounds, not an approximation. "thisMonth" is the calendar month containing today,
+ *  regardless of how far into it today falls - both past and future days within it
+ *  are relevant (real ACTUAL days so far, plus what's still expected). "lastN"
+ *  looks backward from today, for reviewing/reconciling what already happened. */
+function resolveEventPeriod(periodValue, todayStr) {
+  const [ty, tm, td] = todayStr.split("-").map(Number);
+  if (periodValue === "thisMonth") {
+    const start = `${ty}-${String(tm).padStart(2, "0")}-01`;
+    const daysInMonth = new Date(Date.UTC(ty, tm, 0)).getUTCDate();
+    const end = `${ty}-${String(tm).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
+    return { startDateStr: start, endDateStr: end };
+  }
+  const nextMatch = /^next(\d+)$/.exec(periodValue);
+  if (nextMatch) {
+    const months = Number(nextMatch[1]);
+    const endObj = new Date(Date.UTC(ty, tm - 1 + months, td - 1));
+    return { startDateStr: todayStr, endDateStr: endObj.toISOString().slice(0, 10) };
+  }
+  const lastMatch = /^last(\d+)$/.exec(periodValue);
+  if (lastMatch) {
+    const months = Number(lastMatch[1]);
+    const startObj = new Date(Date.UTC(ty, tm - 1 - months, td));
+    return { startDateStr: startObj.toISOString().slice(0, 10), endDateStr: todayStr };
+  }
+  return { startDateStr: todayStr, endDateStr: todayStr };
+}
+
+const EVENT_STATUS_ORDER = ["ACTUAL", "SCHEDULED", "EXPECTED", "PLANNED", "PROJECTED"];
+const EVENT_STATUS_COLOR = {
+  ACTUAL: "var(--ink)", SCHEDULED: "var(--teal)", EXPECTED: "#3E7C8C",
+  PLANNED: "var(--ochre)", PROJECTED: "var(--slate)",
+};
+const EVENT_TYPE_OPTIONS = ["Income", "Expense", "Investment", "Transfer"];
+
+const EVENT_QUICK_FILTERS = [
+  { value: "all", label: "All" },
+  { value: "Actual", label: "Actual" },
+  { value: "Future", label: "Future" },
+  { value: "NeedsReview", label: "Needs review" },
+];
+
+/** V1 filters per the spec: quick status pills (All/Actual/Future/Needs review) plus
+ *  progressive-disclosure dropdowns for event type and account, and search. "Needs
+ *  review" is a V1 proxy (EXPECTED - lower-confidence recurring pattern - or
+ *  PROJECTED - behavioural allowance, not yet a specific event) rather than the
+ *  fuller reconciliation-status concept (Matched/Unsubstantiated/etc.), which is
+ *  parked for later - this still gives a genuinely useful "what's worth a closer
+ *  look" filter without inventing a reconciliation status this V1 doesn't compute. */
+function EventFilterBar({ statusFilter, setStatusFilter, typeFilter, setTypeFilter, accountFilter, setAccountFilter, search, setSearch, accounts }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+        {EVENT_QUICK_FILTERS.map((f) => (
+          <button
+            key={f.value}
+            className="bw-tab"
+            style={statusFilter === f.value ? undefined : { boxShadow: "none", background: "transparent" }}
+            onClick={() => setStatusFilter(f.value)}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+        <input
+          type="text" className="bw-select-inline" style={{ flex: "1 1 220px", padding: "6px 9px" }}
+          placeholder="Search description, account, category…" value={search} onChange={(e) => setSearch(e.target.value)}
+        />
+        <select className="bw-select-inline" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+          <option value="all">All types</option>
+          {EVENT_TYPE_OPTIONS.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select className="bw-select-inline" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+          <option value="all">All accounts</option>
+          {accounts.map((a) => <option key={a.id} value={a.id}>{a.nickname}</option>)}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+/** A compact, scannable row - never a large card, per the spec's explicit design
+ *  guidance. Actual vs future is never color-alone: a check/circle icon plus the
+ *  status label text together carry that distinction, so it still reads correctly
+ *  without relying on color perception. */
+function EventRow({ event, accountName, onSelect }) {
+  const isActual = event.status === "ACTUAL";
+  const isProjected = event.status === "PROJECTED";
+  const Icon = isActual ? Check : Circle;
+  return (
+    <div
+      onClick={() => onSelect(event)}
+      style={{
+        display: "flex", alignItems: "center", gap: 10, padding: "8px 4px", cursor: "pointer",
+        borderBottom: "1px solid var(--line)", opacity: isActual ? 1 : 0.92,
+      }}
+    >
+      <Icon size={13} style={{ color: isActual ? "var(--teal)" : "var(--ink-soft)", flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{event.name || "—"}</div>
+        <div style={{ fontSize: 10.5, color: "var(--ink-soft)", display: "flex", gap: 6, alignItems: "center", marginTop: 1 }}>
+          <span style={{ color: EVENT_STATUS_COLOR[event.status], fontWeight: 600 }}>
+            {isProjected ? "PROJECTED · AVERAGE" : event.status}
+          </span>
+          {event.underlyingEvents && <span>· {event.underlyingEvents.length} transaction{event.underlyingEvents.length === 1 ? "" : "s"}</span>}
+          {isProjected && event.occurrencesPerMonth != null && <span>· ~{event.occurrencesPerMonth.toFixed(1)}x/month typically</span>}
+          {!event.underlyingEvents && event.accountId && <span>· {accountName(event.accountId)}</span>}
+          {!event.underlyingEvents && !isProjected && event.category && <span>· {event.category}</span>}
+          {!event.underlyingEvents && !isProjected && event.subCategory2 && <span>· {event.subCategory2}</span>}
+          {event.cashDeferred && <span title="Cash impact deferred to a later card settlement">· deferred</span>}
+        </div>
+      </div>
+      <div className={`bw-amt ${event.direction === "inflow" ? "credit" : "debit"}`} style={{ flexShrink: 0 }}>
+        {event.direction === "inflow" ? "+" : "−"}{inr(event.amount)}
+      </div>
+    </div>
+  );
+}
+
+/** Groups events chronologically - by month, then by specific date within it. ACTUAL
+ *  (aggregated by Sub2/Sub1 via aggregateActualForDisplay) and PROJECTED (already
+ *  one-per-stream-per-month) each get their own dedicated section, kept distinct
+ *  from "Sometime this month" - that bucket is specifically for named
+ *  SCHEDULED/EXPECTED things with genuinely uncertain timing (a real, specific
+ *  recurring payment whose day isn't pinned down yet), not aggregate category
+ *  summaries, which are a different kind of thing entirely. */
+function groupEventsForList(events) {
+  const aggregated = aggregateActualForDisplay(events);
+  const byMonth = {};
+  aggregated.forEach((e) => {
+    const mk = e.date ? e.date.slice(0, 7) : `${e.year}-${String(e.month).padStart(2, "0")}`;
+    if (!byMonth[mk]) byMonth[mk] = { dated: {}, monthOnlyRecurring: [], actualSummary: [], projectedSummary: [] };
+    if (e.status === "ACTUAL") byMonth[mk].actualSummary.push(e);
+    else if (e.status === "PROJECTED") byMonth[mk].projectedSummary.push(e);
+    else if (e.date && !e.monthOnly) {
+      if (!byMonth[mk].dated[e.date]) byMonth[mk].dated[e.date] = [];
+      byMonth[mk].dated[e.date].push(e);
+    } else {
+      byMonth[mk].monthOnlyRecurring.push(e);
+    }
+  });
+  return Object.keys(byMonth).sort().map((mk) => {
+    const dateGroups = Object.keys(byMonth[mk].dated).sort().map((d) => ({ date: d, events: byMonth[mk].dated[d] }));
+    return {
+      monthKey: mk, label: monthLabel(mk), dateGroups,
+      monthOnlyRecurring: byMonth[mk].monthOnlyRecurring,
+      actualSummary: byMonth[mk].actualSummary.sort((a, b) => b.amount - a.amount),
+      projectedSummary: byMonth[mk].projectedSummary.sort((a, b) => b.amount - a.amount),
+    };
+  });
+}
+
+/** The main operational view - a compact, date-grouped list. This is where review
+ *  and reconciliation actually happens, per the spec's own reasoning for defaulting
+ *  here over Calendar. */
+function EventListView({ events, todayStr, accountName, onSelect }) {
+  const groups = useMemo(() => groupEventsForList(events), [events]);
+
+  if (events.length === 0) {
+    return <div className="bw-empty">No events match the current period and filters.</div>;
+  }
+
+  return (
+    <div>
+      {groups.map((g) => (
+        <div key={g.monthKey} style={{ marginBottom: 22 }}>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>{g.label}</div>
+
+          {g.actualSummary.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              {g.actualSummary.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+            </div>
+          )}
+
+          {g.dateGroups.map(({ date, events: dayEvents }) => (
+            <div key={date} style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace", margin: "8px 0 2px" }}>
+                {shortDateLabel(date)}{date === todayStr ? " · Today" : ""}
+              </div>
+              {dayEvents.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+            </div>
+          ))}
+
+          {g.monthOnlyRecurring.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace", margin: "8px 0 2px" }}>Sometime this month</div>
+              {g.monthOnlyRecurring.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+            </div>
+          )}
+
+          {g.projectedSummary.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace", margin: "8px 0 2px" }}>Projected (statistical average)</div>
+              {g.projectedSummary.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** A simple, event-focused month grid - answers WHEN cash moves, deliberately not a
+ *  reproduction of Summary's own trajectory chart. Internal month navigation, since
+ *  the selected period can span more than one month. monthOnly events (no known day)
+ *  can't be placed on a day cell honestly, so they're listed separately below the
+ *  grid rather than forced onto a fabricated date. */
+function EventCalendarView({ events, startDateStr, endDateStr, todayStr, selectedDay, setSelectedDay, onSelect, accountName }) {
+  const [viewMonthKey, setViewMonthKey] = useState(startDateStr.slice(0, 7));
+  const [vy, vm] = viewMonthKey.split("-").map(Number);
+
+  function changeMonth(delta) {
+    let y = vy, m = vm + delta;
+    if (m > 12) { m = 1; y += 1; } else if (m < 1) { m = 12; y -= 1; }
+    setViewMonthKey(`${y}-${String(m).padStart(2, "0")}`);
+    setSelectedDay(null);
+  }
+
+  const byDate = useMemo(() => {
+    const map = {};
+    events.filter((e) => e.date && !e.monthOnly && e.date.slice(0, 7) === viewMonthKey).forEach((e) => {
+      if (!map[e.date]) map[e.date] = [];
+      map[e.date].push(e);
+    });
+    return map;
+  }, [events, viewMonthKey]);
+
+  const monthOnlyThisMonth = useMemo(
+    () => events.filter((e) => e.monthOnly && `${e.year}-${String(e.month).padStart(2, "0")}` === viewMonthKey),
+    [events, viewMonthKey]
+  );
+
+  const firstOfMonth = new Date(Date.UTC(vy, vm - 1, 1));
+  const daysInMonth = new Date(Date.UTC(vy, vm, 0)).getUTCDate();
+  const leadingBlanks = firstOfMonth.getUTCDay(); // 0 = Sunday
+  const cells = [];
+  for (let i = 0; i < leadingBlanks; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const selectedDayEvents = selectedDay ? (byDate[selectedDay] || []) : [];
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <button className="bw-btn ghost small" onClick={() => changeMonth(-1)}>‹</button>
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600 }}>{monthLabel(viewMonthKey)}</div>
+        <button className="bw-btn ghost small" onClick={() => changeMonth(1)}>›</button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, fontSize: 10, color: "var(--ink-soft)", marginBottom: 4, textAlign: "center" }}>
+        {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => <div key={i}>{d}</div>)}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3 }}>
+        {cells.map((d, i) => {
+          if (d === null) return <div key={i} />;
+          const dateStr = `${vy}-${String(vm).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+          const dayEvents = byDate[dateStr] || [];
+          const net = dayEvents.reduce((s, e) => s + (e.direction === "inflow" ? e.amount : -e.amount), 0);
+          const isToday = dateStr === todayStr;
+          const isSelected = dateStr === selectedDay;
+          return (
+            <div
+              key={i} onClick={() => dayEvents.length > 0 && setSelectedDay(isSelected ? null : dateStr)}
+              style={{
+                border: `1px solid ${isSelected ? "var(--teal)" : "var(--line)"}`, borderRadius: 4, padding: "5px 4px", minHeight: 46,
+                cursor: dayEvents.length > 0 ? "pointer" : "default",
+                background: isToday ? "rgba(46,102,89,0.08)" : "#fff",
+              }}
+            >
+              <div style={{ fontSize: 10.5, color: isToday ? "var(--teal)" : "var(--ink-soft)", fontWeight: isToday ? 600 : 400 }}>{d}</div>
+              {dayEvents.length > 0 && (
+                <div style={{ fontSize: 9.5, fontFamily: "'IBM Plex Mono', monospace", color: net >= 0 ? "var(--teal)" : "var(--rust)", marginTop: 2 }}>
+                  {net >= 0 ? "+" : "−"}{(Math.abs(net) / 1000).toFixed(0)}k
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {selectedDay && (
+        <div style={{ marginTop: 14, border: "1px solid var(--line)", borderRadius: 6, padding: 10, background: "#fff" }}>
+          <div style={{ fontSize: 11.5, fontWeight: 600, marginBottom: 6 }}>{shortDateLabel(selectedDay)}</div>
+          {selectedDayEvents.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+        </div>
+      )}
+
+      {monthOnlyThisMonth.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Sometime this month</div>
+          {monthOnlyThisMonth.map((e) => <EventRow key={e.id} event={e} accountName={accountName} onSelect={onSelect} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CONFIDENCE_DISPLAY = { Low: "Low", Medium: "Moderate", High: "High" };
+
+/** Builds the "why is this event here" explanation - the most important question
+ *  Event Detail answers, per the spec. Different basis per status/source, showing
+ *  only information that actually exists (never inventing a field the underlying
+ *  model doesn't support, per the spec's explicit instruction). */
+function eventBasisLines(event) {
+  const lines = [];
+  if (event.status === "ACTUAL") {
+    if (event.underlyingEvents) {
+      lines.push(["Why this total exists", `Combines ${event.underlyingEvents.length} confirmed transaction${event.underlyingEvents.length === 1 ? "" : "s"} from your imported statement this month.`]);
+    } else {
+      lines.push(["Why this event exists", "Confirmed from your imported statement."]);
+      if (event.cashDeferred) lines.push(["Cash impact", "Charged to a credit card - settles later via that card's payment, not counted as cash leaving today."]);
+    }
+    return lines;
+  }
+  if (event.status === "SCHEDULED" || event.status === "EXPECTED") {
+    lines.push(["Why this event exists", event.status === "SCHEDULED" ? "Scheduled recurring event" : "Expected from a recurring pattern still being learned"]);
+    lines.push(["Basis", event.status === "SCHEDULED" ? "Existing recurring pattern (well-established)" : "Recurring pattern (fewer occurrences observed so far)"]);
+    if (event.confidence) lines.push(["Amount confidence", CONFIDENCE_DISPLAY[event.confidence] || event.confidence]);
+    return lines;
+  }
+  if (event.status === "PLANNED") {
+    lines.push(["Why this event exists", "From one of your goals"]);
+    lines.push(["Basis", event.direction === "inflow" ? "Redemption from the investment set aside for this goal" : "The goal's target cost"]);
+    return lines;
+  }
+  if (event.status === "PROJECTED") {
+    lines.push(["What this is", "A statistical average, not a known cash event - this amount is not certain to occur exactly as shown, on this or any specific day."]);
+    lines.push(["Basis", "Behavioural forecast (run rate)"]);
+    lines.push(["Based on", `${event.category || "Spending"} pattern${event.name ? ` (${event.name})` : ""}`]);
+    if (event.observationMonths) lines.push(["Observation period", `${event.observationMonths} month${event.observationMonths === 1 ? "" : "s"}`]);
+    if (event.typicalOccurrenceAmount != null && event.occurrencesPerMonth != null) {
+      lines.push(["Typical amount when it happens", inr(event.typicalOccurrenceAmount)]);
+      lines.push(["Typical frequency", `~${event.occurrencesPerMonth.toFixed(1)} times/month`]);
+    }
+    lines.push(["Projected monthly average", inr(event.amount)]);
+    if (event.cardChargedAmount) lines.push(["Also charged to a card", `${inr(event.cardChargedAmount)} of this category's typical spend - shown under the card's own payment instead, not counted here too.`]);
+    if (event.confidence) lines.push(["Confidence", CONFIDENCE_DISPLAY[event.confidence] || event.confidence]);
+  }
+  return lines;
+}
+
+/** Event Detail - a drawer explaining one event: what it is, why it's here, its cash
+ *  impact, and (for credit-card events) related events along the settlement chain.
+ *  Deliberately does not reproduce Summary's own projection chart - "cash after this
+ *  event" is looked up as a single number from the projection's own daily walk, not
+ *  a chart of its own. */
+function EventDetailDrawer({ event, allEvents, accounts, accountName, projection, onClose, onSelectRelated }) {
+  const basisLines = useMemo(() => eventBasisLines(event), [event]);
+  const relatedEvents = useMemo(() => findRelatedCardEvents(event, allEvents, accounts), [event, allEvents, accounts]);
+  const cashAfter = useMemo(() => {
+    if (!projection || !event.date || event.monthOnly) return null;
+    const state = projection.dailyStates.find((d) => d.date === event.date);
+    return state ? state.balance : null;
+  }, [projection, event]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(33,38,43,0.35)", zIndex: 60, display: "flex", justifyContent: "flex-end" }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "min(420px, 100%)", background: "var(--card)", height: "100%", overflowY: "auto", padding: 22, boxShadow: "-4px 0 16px rgba(0,0,0,0.12)" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, maxWidth: 320 }}>{event.name || "—"}</div>
+          <button className="bw-btn ghost small" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div className={`bw-amt ${event.direction === "inflow" ? "credit" : "debit"}`} style={{ fontSize: 22, marginBottom: 2 }}>
+          {event.direction === "inflow" ? "+" : "−"}{inr(event.amount)}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 16 }}>
+          {event.date ? shortDateLabel(event.date) : `Sometime in ${monthLabel(`${event.year}-${String(event.month).padStart(2, "0")}`)}`}
+          {" · "}<span style={{ color: EVENT_STATUS_COLOR[event.status], fontWeight: 600 }}>{event.status}</span>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16, fontSize: 12.5 }}>
+          {event.accountId && <DetailField label="Account" value={accountName(event.accountId)} />}
+          {event.linkedAccountId && <DetailField label="Linked account" value={accountName(event.linkedAccountId)} />}
+          {event.category && <DetailField label="Category" value={event.category} />}
+          {event.subCategory && <DetailField label="Sub category 1" value={event.subCategory} />}
+          {event.subCategory2 && <DetailField label="Sub category 2" value={event.subCategory2} />}
+          {event.frequency && <DetailField label="Cadence" value={event.frequency} />}
+          {event.occurrenceCount != null && <DetailField label="Times observed" value={`${event.occurrenceCount}`} />}
+          {event.amountBehavior && <DetailField label="Amount behaviour" value={`${event.amountBehavior}${event.amountConfidence ? ` (${CONFIDENCE_DISPLAY[event.amountConfidence] || event.amountConfidence} confidence)` : ""}`} />}
+        </div>
+
+        <div className="bw-section-label" style={{ marginTop: 0 }}>Why is this here?</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16, fontSize: 12.5 }}>
+          {basisLines.map(([label, value]) => <DetailField key={label} label={label} value={value} />)}
+        </div>
+
+        {cashAfter !== null && (
+          <>
+            <div className="bw-section-label" style={{ marginTop: 0 }}>Cash impact</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16, fontSize: 12.5 }}>
+              <DetailField label={event.direction === "inflow" ? "Cash increases by" : "Cash decreases by"} value={inr(event.amount)} />
+              <DetailField label="Projected cash after this event" value={inr(cashAfter)} />
+            </div>
+          </>
+        )}
+
+        {relatedEvents.length > 0 && (
+          <>
+            <div className="bw-section-label" style={{ marginTop: 0 }}>Related events</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+              {relatedEvents.map((re) => (
+                <div
+                  key={re.id} onClick={() => onSelectRelated(re)}
+                  style={{ cursor: "pointer", border: "1px solid var(--line)", borderRadius: 4, padding: "6px 8px", fontSize: 12, display: "flex", justifyContent: "space-between" }}
+                >
+                  <span>{re.name}</span>
+                  <span className={`bw-amt ${re.direction === "inflow" ? "credit" : "debit"}`}>{re.direction === "inflow" ? "+" : "−"}{inr(re.amount)}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {event.underlyingEvents && event.underlyingEvents.length > 0 && (
+          <>
+            <div className="bw-section-label" style={{ marginTop: 0 }}>Transactions in this total</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+              {[...event.underlyingEvents].sort((a, b) => a.date.localeCompare(b.date)).map((u) => (
+                <div key={u.id} style={{ border: "1px solid var(--line)", borderRadius: 4, padding: "6px 8px", fontSize: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{u.name}</span>
+                    <span className={`bw-amt ${u.direction === "inflow" ? "credit" : "debit"}`}>{u.direction === "inflow" ? "+" : "−"}{inr(u.amount)}</span>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 1 }}>
+                    {shortDateLabel(u.date)}{u.accountId ? ` · ${accountName(u.accountId)}` : ""}{u.cashDeferred ? " · deferred (card)" : ""}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {event.cardSpendBreakdown && event.cardSpendBreakdown.length > 0 && (
+          <>
+            <div className="bw-section-label" style={{ marginTop: 0 }}>What this is made up of</div>
+            <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "0 0 8px" }}>
+              The spending categories and recurring charges expected to be settled by this payment.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+              {[...event.cardSpendBreakdown].sort((a, b) => b.amount - a.amount).map((c, i) => (
+                <div key={i} style={{ border: "1px solid var(--line)", borderRadius: 4, padding: "6px 8px", fontSize: 12, display: "flex", justifyContent: "space-between" }}>
+                  <span>{c.label || "—"}</span>
+                  <span className="bw-amt debit">−{inr(c.amount)}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {event.historicalTransactions && event.historicalTransactions.length > 0 && (
+          <>
+            <div className="bw-section-label" style={{ marginTop: 0 }}>History - past occurrences behind this pattern</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+              {[...event.historicalTransactions].sort((a, b) => b.date.localeCompare(a.date)).map((h) => (
+                <div key={h.id} style={{ border: "1px solid var(--line)", borderRadius: 4, padding: "6px 8px", fontSize: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{h.description || h.merchant || "—"}</span>
+                    <span className={`bw-amt ${h.direction === "credit" ? "credit" : "debit"}`}>{h.direction === "credit" ? "+" : "−"}{inr(Math.abs(h.amount))}</span>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 1 }}>
+                    {shortDateLabel(h.date)}{h.accountId ? ` · ${accountName(h.accountId)}` : ""}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DetailField({ label, value }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--ink-soft)" }}>{label}</div>
+      <div>{value}</div>
+    </div>
+  );
+}
+
+/** Cash Flow Events - the operational/evidence layer beneath Cash Flow Summary.
+ *  Deliberately does NOT repeat Summary's own analytical content (Actual Cash State,
+ *  the trajectory chart, Minimum Cash/Drawdown/Buffer, Savings Rate) - this screen
+ *  answers "what causes it", not "how is my cash behaving". Consumes
+ *  computeCashFlowEvents directly - the same unified list Summary's own bucket
+ *  totals are derived from, so the two screens can never disagree about what's
+ *  happening. initialPeriod/initialStatusFilter let Summary's drill-down land here
+ *  with the same horizon and status already applied, rather than forcing the person
+ *  to reconfigure context they already set. */
+function CashFlowEventsView({ transactions, accounts, rules, merchantAliases, goals, holdingSnapshots, cashBuffer, initialPeriod, initialStatusFilter, onConsumedInitialFilter }) {
+  const [period, setPeriod] = useState(initialPeriod || "thisMonth");
+  const [viewMode, setViewMode] = useState("list"); // "list" | "calendar"
+  const [statusFilter, setStatusFilter] = useState(initialStatusFilter || "all"); // all | Actual | Future | NeedsReview | one of EVENT_STATUS_ORDER
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [accountFilter, setAccountFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [selectedEvent, setSelectedEvent] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(null);
+
+  // Consume the initial filter handed down from Summary's drill-down exactly once -
+  // afterward the person is free to change period/status/view without it snapping back.
+  useEffect(() => {
+    if ((initialPeriod || initialStatusFilter) && onConsumedInitialFilter) onConsumedInitialFilter();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const currentMonthKey = todayStr.slice(0, 7);
+  const { startDateStr, endDateStr } = useMemo(() => resolveEventPeriod(period, todayStr), [period, todayStr]);
+
+  const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
+  const amountBehaviors = useMemo(() => computeAmountBehaviors(transactions, merchantAliases), [transactions, merchantAliases]);
+  const forecastStreams = useMemo(() => computeForecastStreams(transactions, accounts, commitments, merchantAliases, currentMonthKey), [transactions, accounts, commitments, merchantAliases, currentMonthKey]);
+  const actualCashState = useMemo(() => computeAggregateCashBalance(bankAccounts, transactions, todayStr), [bankAccounts, transactions, todayStr]);
+
+  // The projection must cover through the period's own end, which may extend
+  // further than any horizon Summary happens to be showing right now.
+  const horizonMonths = useMemo(() => Math.max(1, monthsBetweenKeys(todayStr.slice(0, 7), endDateStr.slice(0, 7)) + 1), [todayStr, endDateStr]);
+  const projection = useMemo(() => {
+    if (actualCashState === null) return null;
+    return computeCashProjection(actualCashState, todayStr, horizonMonths, { commitments, amountBehaviors, forecastStreams, accounts, cashBuffer });
+  }, [actualCashState, todayStr, horizonMonths, commitments, amountBehaviors, forecastStreams, accounts, cashBuffer]);
+
+  const allEvents = useMemo(() => {
+    if (!projection) return [];
+    return computeCashFlowEvents({
+      transactions, accounts, merchantAliases, projection, commitments, amountBehaviors, goals, holdingSnapshots, forecastStreams,
+      startDateStr, endDateStr, todayStr,
+    });
+  }, [projection, transactions, accounts, merchantAliases, commitments, amountBehaviors, goals, holdingSnapshots, forecastStreams, startDateStr, endDateStr, todayStr]);
+
+  const accountName = (id) => accounts.find((a) => a.id === id)?.nickname || "—";
+
+  const filteredEvents = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return allEvents.filter((e) => {
+      if (statusFilter === "Actual" && e.status !== "ACTUAL") return false;
+      if (statusFilter === "Future" && e.status === "ACTUAL") return false;
+      if (statusFilter === "NeedsReview" && !(e.status === "EXPECTED" || (e.status === "PROJECTED"))) return false;
+      if (EVENT_STATUS_ORDER.includes(statusFilter) && e.status !== statusFilter) return false;
+      if (typeFilter !== "all" && e.category !== typeFilter) return false;
+      if (accountFilter !== "all" && e.accountId !== accountFilter) return false;
+      if (q) {
+        const hay = [e.name, accountName(e.accountId), e.category, e.subCategory, e.status].filter(Boolean).join(" ").toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [allEvents, statusFilter, typeFilter, accountFilter, search, accounts]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
+        <h2 className="bw-h2" style={{ margin: 0 }}>Cash Flow Events</h2>
+        <select className="bw-select-inline" value={period} onChange={(e) => setPeriod(e.target.value)}>
+          {EVENT_PERIOD_OPTIONS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+        </select>
+      </div>
+
+      <div className="bw-tabs" style={{ marginBottom: 16 }}>
+        <button className={`bw-tab ${viewMode === "list" ? "active" : ""}`} onClick={() => setViewMode("list")}><ListChecks size={13} /> List</button>
+        <button className={`bw-tab ${viewMode === "calendar" ? "active" : ""}`} onClick={() => setViewMode("calendar")}><PieIcon size={13} /> Calendar</button>
+      </div>
+
+      <EventFilterBar
+        statusFilter={statusFilter} setStatusFilter={setStatusFilter}
+        typeFilter={typeFilter} setTypeFilter={setTypeFilter}
+        accountFilter={accountFilter} setAccountFilter={setAccountFilter}
+        search={search} setSearch={setSearch}
+        accounts={accounts}
+      />
+
+
+      {viewMode === "list" ? (
+        <EventListView events={filteredEvents} todayStr={todayStr} accountName={accountName} onSelect={setSelectedEvent} />
+      ) : (
+        <EventCalendarView events={filteredEvents} startDateStr={startDateStr} endDateStr={endDateStr} todayStr={todayStr} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onSelect={setSelectedEvent} accountName={accountName} />
+      )}
+
+      {selectedEvent && (
+        <EventDetailDrawer
+          event={selectedEvent} allEvents={allEvents} accounts={accounts} accountName={accountName} projection={projection}
+          onClose={() => setSelectedEvent(null)} onSelectRelated={setSelectedEvent}
+        />
+      )}
+    </div>
+  );
+}
+
+function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCashBuffer, onGoToCFO, merchantAliases }) {
   const todayStr = new Date().toISOString().slice(0, 10);
   const now = new Date();
   const [viewYear, setViewYear] = useState(now.getFullYear());
   const [viewMonth, setViewMonth] = useState(now.getMonth() + 1); // 1-12
   const [selectedDay, setSelectedDay] = useState(null);
+  const [expandedSideGroups, setExpandedSideGroups] = useState(new Set());
+  function toggleSideGroup(key) {
+    setExpandedSideGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+  // Groups side-list events sharing an alias into one collapsed entry - same rule
+  // as List and Recurring Commitments: only where 2+ events actually share it.
+  // Combined amount sums across members; date shows a range when they differ.
+  function groupSideEvents(events) {
+    const byKey = {};
+    events.forEach((e) => { if (e.groupKey) { (byKey[e.groupKey] = byKey[e.groupKey] || []).push(e); } });
+    const consumed = new Set();
+    const out = [];
+    events.forEach((e) => {
+      if (consumed.has(e.id)) return;
+      const members = e.groupKey ? byKey[e.groupKey] : null;
+      if (members && members.length > 1) {
+        members.forEach((m) => consumed.add(m.id));
+        const netAmount = members.reduce((s, m) => s + (m.direction === "credit" ? m.amount : -m.amount), 0);
+        const dates = members.map((m) => m.date).sort();
+        out.push({
+          isGroup: true, groupKey: e.groupKey, members, netAmount,
+          dateLabel: dates[0] === dates[dates.length - 1] ? dates[0] : `${dates[0]} – ${dates[dates.length - 1]}`,
+        });
+      } else {
+        consumed.add(e.id);
+        out.push({ isGroup: false, e });
+      }
+    });
+    return out;
+  }
+  const monthLabelStr = new Date(viewYear, viewMonth - 1, 1).toLocaleString("en-IN", { month: "long", year: "numeric" });
 
-  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules), [transactions, accounts, rules]);
+  const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
 
   // One event per day this month: a real transaction if it already happened, a
   // projected occurrence from a learned pattern if it hasn't. A commitment whose
@@ -10261,20 +13477,28 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
   const monthEvents = useMemo(() => {
     const events = [];
     transactions
-      .filter((t) => t.category && isFrequencyEligible(t.category, t.subCategory))
+      .filter((t) => t.frequencyClass && isFrequencyEligible(t.frequencyClass))
       .forEach((t) => {
         const [y, m] = t.date.split("-").map(Number);
         if (y === viewYear && m === viewMonth) {
+          const rawKey = t.merchant || t.description;
+          const resolved = resolveMerchant(rawKey, merchantAliases);
           events.push({
             id: t.id, date: t.date, kind: "actual",
-            name: t.merchant || t.description, amount: t.amount, direction: t.direction,
+            name: resolved || rawKey, groupKey: resolved && resolved !== rawKey ? resolved : null,
+            amount: t.amount, direction: t.direction,
             category: t.category, subCategory: t.subCategory,
           });
         }
       });
     commitments.forEach((c) => {
-      const projectedDate = projectOccurrenceForMonth(c, viewYear, viewMonth);
-      if (!projectedDate) return;
+      const projection = projectOccurrenceForMonth(c, viewYear, viewMonth);
+      // A month-only recurrence (day genuinely unknown) is real information, but
+      // the Calendar grid is fundamentally day-based - it has nowhere honest to
+      // place a dot with no day. That fact still surfaces on List and Recurring
+      // Commitments, which aren't day-bound the way this grid is.
+      if (!projection.recurs || !projection.date) return;
+      const projectedDate = projection.date;
       // A future date is a genuine forward projection. A past date with no matching
       // real transaction is a MORE important signal, not one to drop silently - it
       // means something expected by now hasn't shown up yet, either because it
@@ -10284,8 +13508,8 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
       events.push({
         id: `proj:${c.key}:${projectedDate}`, date: projectedDate,
         kind: projectedDate > todayStr ? "projected" : "overdue",
-        name: c.name, amount: c.lastAmount, direction: isInflow ? "credit" : "debit",
-        category: c.category, subCategory: c.subCategory, confidence: c.pattern.confidence,
+        name: c.name, groupKey: c.alias || null, amount: c.lastAmount, direction: isInflow ? "credit" : "debit",
+        category: c.category, subCategory: c.subCategory, confidence: c.pattern.confidence, confidenceTier: c.pattern.confidenceTier,
       });
     });
     return events.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
@@ -10325,6 +13549,36 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
   const projectedMonthEndBalance = projectedDaily.length > 0 ? projectedDaily[projectedDaily.length - 1].balance : null;
   const projectedMinimumBalance = projectedDaily.length > 0 ? Math.min(...projectedDaily.map((p) => p.balance)) : null;
 
+  // Safe to Spend = today's real balance, minus every known committed outflow still
+  // ahead this month (EMI/SIP/Fixed/etc. that haven't happened yet), minus the buffer
+  // - deliberately excludes discretionary spend, since that's the very thing this
+  // number exists to answer "how much room is left for."
+  const upcomingCommittedOutflows = monthEvents
+    .filter((e) => e.date >= todayStr && e.kind !== "actual" && e.direction === "debit")
+    .reduce((s, e) => s + e.amount, 0);
+  const safeToSpend = todaysBalance !== null ? todaysBalance - upcomingCommittedOutflows - cashBuffer : null;
+
+  // Deterministic, rule-based observations - no AI narration in this first pass.
+  // Each one states a real, already-computed number; nothing here is invented or
+  // estimated beyond what the projection itself already is.
+  const insights = useMemo(() => {
+    if (todaysBalance === null || !isCurrentMonthView) return [];
+    const list = [];
+    if (cashBuffer > 0 && projectedMinimumBalance !== null && projectedMinimumBalance < cashBuffer) {
+      const minDay = projectedDaily.reduce((min, p) => (p.balance < min.balance ? p : min), projectedDaily[0]);
+      list.push(`Your projected balance dips to ${inr(projectedMinimumBalance)} on ${minDay.date.slice(8, 10)} ${monthLabelStr.split(" ")[0].slice(0, 3)} — below your buffer of ${inr(cashBuffer)}.`);
+    }
+    const upcomingDebits = monthEvents.filter((e) => e.date >= todayStr && e.kind !== "actual" && e.direction === "debit");
+    if (upcomingDebits.length > 0) {
+      const largest = upcomingDebits.reduce((max, e) => (e.amount > max.amount ? e : max), upcomingDebits[0]);
+      list.push(`Your largest upcoming outflow is ${largest.name} on ${largest.date.slice(8, 10)} ${monthLabelStr.split(" ")[0].slice(0, 3)} (${inr(largest.amount)}).`);
+    }
+    if (safeToSpend !== null) {
+      list.push(`You have ${inr(Math.max(0, safeToSpend))} available to spend this month without dipping below your buffer.`);
+    }
+    return list;
+  }, [todaysBalance, isCurrentMonthView, cashBuffer, projectedMinimumBalance, projectedDaily, monthEvents, todayStr, safeToSpend, monthLabelStr]);
+
   // The "See" breakdown - all real transactions in the month (not just the frequency-
   // eligible ones the calendar grid plots), bucketed per the agreed structure. This
   // deliberately becomes the source for the hero stats above too, so the summary
@@ -10339,21 +13593,27 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
       income: 0, redemption: 0, investments: 0, loans: 0,
       fixedExpenses: 0, ccPayments: 0, discretionaryHousehold: 0, discretionaryPersonal: 0,
     };
+    // "Debt Payment" now covers both a loan EMI/lumpsum payment and a credit card
+    // payment - the linked account's own type is what tells them apart, since they
+    // no longer have separate subCategory values. An unlinked Debt Payment (no
+    // linkedAccountId set) falls back to the loans bucket, the more common case,
+    // rather than a third "unspecified" bucket that would just fragment the total.
     transactions.filter((t) => t.date.slice(0, 7) === monthKey).forEach((t) => {
       const amt = Math.abs(t.amount);
+      const linkedAccount = t.linkedAccountId ? accounts.find((a) => a.id === t.linkedAccountId) : null;
       if (t.category === "Income" && t.direction === "credit") buckets.income += amt;
       else if (t.category === "Investment" && t.subCategory === "Redemption") buckets.redemption += amt;
-      else if (t.category === "Investment" && (t.subCategory === "SIP" || t.subCategory === "Lumpsum")) buckets.investments += amt;
-      else if (t.category === "Transfer" && t.subCategory === "Debt-EMI") buckets.loans += amt;
-      else if (t.category === "Expense" && t.subCategory === "Fixed") buckets.fixedExpenses += amt;
-      else if (t.category === "Transfer" && t.subCategory === "Credit card payment") buckets.ccPayments += amt;
-      else if (t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Household") buckets.discretionaryHousehold += amt;
-      else if (t.category === "Expense" && t.subCategory === "Variable" && t.tag === "Personal") buckets.discretionaryPersonal += amt;
+      else if (t.category === "Investment" && t.subCategory === "Add") buckets.investments += amt;
+      else if (t.category === "Transfer" && t.subCategory === "Debt Payment" && linkedAccount?.type === "creditCard") buckets.ccPayments += amt;
+      else if (t.category === "Transfer" && t.subCategory === "Debt Payment") buckets.loans += amt;
+      else if (t.category === "Expense" && t.frequencyClass === "Recurring") buckets.fixedExpenses += amt;
+      else if (t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Household") buckets.discretionaryHousehold += amt;
+      else if (t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Personal") buckets.discretionaryPersonal += amt;
     });
     const totalInflow = buckets.income + buckets.redemption;
     const totalOutflow = buckets.investments + buckets.loans + buckets.fixedExpenses + buckets.ccPayments + buckets.discretionaryHousehold + buckets.discretionaryPersonal;
     return { ...buckets, totalInflow, totalOutflow, net: totalInflow - totalOutflow };
-  }, [transactions, viewYear, viewMonth]);
+  }, [transactions, accounts, viewYear, viewMonth]);
 
   const totalInflows = seeBreakdown.totalInflow;
   const totalOutflows = seeBreakdown.totalOutflow;
@@ -10381,7 +13641,6 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
     setViewMonth(m); setViewYear(y); setSelectedDay(null);
   }
 
-  const monthLabelStr = new Date(viewYear, viewMonth - 1, 1).toLocaleString("en-IN", { month: "long", year: "numeric" });
   const selectedDayEvents = selectedDay ? eventsOnDay(selectedDay) : [];
   const selectedDateStr = selectedDay ? `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(selectedDay).padStart(2, "0")}` : null;
 
@@ -10496,29 +13755,126 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
             <div className="bw-empty">Nothing more expected for the rest of this month.</div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
-              {monthEvents.filter((e) => e.date >= todayStr).map((e) => (
-                <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0" }}>
-                  <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
-                  <span style={{ flex: 1 }}>{e.name}{e.kind === "projected" ? <span style={{ color: "var(--ink-soft)", fontStyle: "italic" }}> (expected)</span> : ""}</span>
-                  <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
-                </div>
-              ))}
+              {groupSideEvents(monthEvents.filter((e) => e.date >= todayStr)).map((item) => {
+                if (!item.isGroup) {
+                  const e = item.e;
+                  return (
+                    <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0" }}>
+                      <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                      <span style={{ flex: 1 }}>{e.name}{e.kind === "projected" ? <span style={{ color: "var(--ink-soft)", fontStyle: "italic" }}> {e.confidenceTier === "estimate" ? "(estimated, seen once so far)" : e.confidenceTier === "expected" ? "(expected, based on limited history)" : "(expected)"}</span> : ""}</span>
+                      <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                    </div>
+                  );
+                }
+                const key = `up:${item.groupKey}`;
+                const isOpen = expandedSideGroups.has(key);
+                return (
+                  <div key={key}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", cursor: "pointer" }} onClick={() => toggleSideGroup(key)}>
+                      <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{item.dateLabel}</span>
+                      <span style={{ flex: 1, fontWeight: 600 }}>
+                        {isOpen ? <ChevronUp size={11} style={{ verticalAlign: -1, marginRight: 4 }} /> : <ChevronRight size={11} style={{ verticalAlign: -1, marginRight: 4 }} />}
+                        {item.groupKey} <span style={{ fontWeight: 400, color: "var(--ink-soft)" }}>({item.members.length})</span>
+                      </span>
+                      <span className={item.netAmount >= 0 ? "bw-amt credit" : "bw-amt debit"}>{item.netAmount >= 0 ? "+" : "−"}{inr(Math.abs(item.netAmount))}</span>
+                    </div>
+                    {isOpen && item.members.map((e) => (
+                      <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, padding: "3px 0 3px 18px", color: "var(--ink-soft)" }}>
+                        <span style={{ whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                        <span style={{ flex: 1 }}>{e.name}</span>
+                        <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
             </div>
           )}
 
-          <div className="bw-section-label" style={{ marginTop: 0 }}>Already happened this month</div>
-          {monthEvents.filter((e) => e.date < todayStr).length === 0 ? (
-            <div className="bw-empty">Nothing yet this month.</div>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Confirmed this month</div>
+          {monthEvents.filter((e) => e.date < todayStr && e.kind === "actual").length === 0 ? (
+            <div className="bw-empty">Nothing confirmed yet this month.</div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {monthEvents.filter((e) => e.date < todayStr).map((e) => (
-                <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", opacity: 0.75 }}>
-                  <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
-                  <span style={{ flex: 1 }}>{e.name}{e.kind === "overdue" ? <span style={{ color: "var(--ochre)", fontStyle: "italic" }}> (expected, not yet confirmed)</span> : ""}</span>
-                  <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
-                </div>
-              ))}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+              {groupSideEvents(monthEvents.filter((e) => e.date < todayStr && e.kind === "actual")).map((item) => {
+                if (!item.isGroup) {
+                  const e = item.e;
+                  return (
+                    <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0" }}>
+                      <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                      <span style={{ flex: 1 }}>{e.name}</span>
+                      <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                    </div>
+                  );
+                }
+                const key = `confirmed:${item.groupKey}`;
+                const isOpen = expandedSideGroups.has(key);
+                return (
+                  <div key={key}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", cursor: "pointer" }} onClick={() => toggleSideGroup(key)}>
+                      <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{item.dateLabel}</span>
+                      <span style={{ flex: 1, fontWeight: 600 }}>
+                        {isOpen ? <ChevronUp size={11} style={{ verticalAlign: -1, marginRight: 4 }} /> : <ChevronRight size={11} style={{ verticalAlign: -1, marginRight: 4 }} />}
+                        {item.groupKey} <span style={{ fontWeight: 400, color: "var(--ink-soft)" }}>({item.members.length})</span>
+                      </span>
+                      <span className={item.netAmount >= 0 ? "bw-amt credit" : "bw-amt debit"}>{item.netAmount >= 0 ? "+" : "−"}{inr(Math.abs(item.netAmount))}</span>
+                    </div>
+                    {isOpen && item.members.map((e) => (
+                      <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, padding: "3px 0 3px 18px", color: "var(--ink-soft)" }}>
+                        <span style={{ whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                        <span style={{ flex: 1 }}>{e.name}</span>
+                        <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
             </div>
+          )}
+
+          {monthEvents.filter((e) => e.date < todayStr && e.kind === "overdue").length > 0 && (
+            <>
+              <div className="bw-section-label" style={{ marginTop: 0 }}>Overdue — expected, not yet confirmed</div>
+              <p style={{ fontSize: 10.5, color: "var(--ink-soft)", margin: "-4px 0 8px" }}>
+                Not counted in the totals above or the "See" breakdown - these are projections whose expected date has
+                passed with no matching imported transaction yet, not confirmed cash movements.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {groupSideEvents(monthEvents.filter((e) => e.date < todayStr && e.kind === "overdue")).map((item) => {
+                  if (!item.isGroup) {
+                    const e = item.e;
+                    return (
+                      <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0" }}>
+                        <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                        <span style={{ flex: 1, color: "var(--ochre)" }}>{e.name}</span>
+                        <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                      </div>
+                    );
+                  }
+                  const key = `overdue:${item.groupKey}`;
+                  const isOpen = expandedSideGroups.has(key);
+                  return (
+                    <div key={key}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", cursor: "pointer" }} onClick={() => toggleSideGroup(key)}>
+                        <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap", marginRight: 8 }}>{item.dateLabel}</span>
+                        <span style={{ flex: 1, fontWeight: 600, color: "var(--ochre)" }}>
+                          {isOpen ? <ChevronUp size={11} style={{ verticalAlign: -1, marginRight: 4 }} /> : <ChevronRight size={11} style={{ verticalAlign: -1, marginRight: 4 }} />}
+                          {item.groupKey} <span style={{ fontWeight: 400, color: "var(--ink-soft)" }}>({item.members.length})</span>
+                        </span>
+                        <span className={item.netAmount >= 0 ? "bw-amt credit" : "bw-amt debit"}>{item.netAmount >= 0 ? "+" : "−"}{inr(Math.abs(item.netAmount))}</span>
+                      </div>
+                      {isOpen && item.members.map((e) => (
+                        <div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, padding: "3px 0 3px 18px", color: "var(--ink-soft)" }}>
+                          <span style={{ whiteSpace: "nowrap", marginRight: 8 }}>{e.date.slice(8, 10)} {monthLabelStr.split(" ")[0].slice(0, 3)}</span>
+                          <span style={{ flex: 1 }}>{e.name}</span>
+                          <span className={e.direction === "credit" ? "bw-amt credit" : "bw-amt debit"}>{e.direction === "credit" ? "+" : "−"}{inr(e.amount)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -10567,6 +13923,116 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
           correct for this all-accounts view (Self nets to zero across every account combined), but will need
           revisiting once a per-account filter exists.
         </p>
+      </div>
+
+      <div style={{ marginTop: 24, border: "1px solid var(--line)", borderRadius: 8, padding: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ background: "#7A5C8C", color: "#fff", borderRadius: "50%", width: 22, height: 22, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>2</span>
+          <span style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Understand</span>
+          <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>What does this mean for my cash?</span>
+        </div>
+
+        {!isCurrentMonthView ? (
+          <div className="bw-empty">Only shown for the current month — the projection needs today's real balance to anchor to.</div>
+        ) : todaysBalance === null ? (
+          <div className="bw-empty">Today's bank balance isn't confirmed yet — import a recent statement to see the projection.</div>
+        ) : (
+          <>
+            <div style={{ fontWeight: 600, fontSize: 13, margin: "14px 0 2px" }}>Projected cash balance</div>
+            <p style={{ fontSize: 10.5, color: "var(--ink-soft)", margin: "0 0 8px" }}>
+              Includes an estimated {inr(dailyDiscretionary)}/day for typical discretionary spending (median of
+              recent months, spread evenly) — hover any day to see committed vs. discretionary separately.
+            </p>
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={projectedDaily.map((p) => ({ day: p.date.slice(8, 10), balance: p.balance, committedDelta: p.committedDelta, discretionaryApplied: p.discretionaryApplied, events: p.events }))}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                <XAxis dataKey="day" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `${(v / 1000).toFixed(0)}k`} />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const p = payload[0].payload;
+                    return (
+                      <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 6, fontSize: 12, padding: "8px 10px" }}>
+                        <div style={{ fontWeight: 600, marginBottom: 4 }}>{monthLabelStr.split(" ")[0].slice(0, 3)} {label} — {inr(p.balance)}</div>
+                        {p.events.length > 0 && p.events.map((e, i) => (
+                          <div key={i} style={{ color: e.direction === "credit" ? "var(--teal)" : "var(--rust)" }}>
+                            {e.name}{e.kind === "overdue" ? " (overdue)" : ""}: {e.direction === "credit" ? "+" : "−"}{inr(e.amount)}
+                          </div>
+                        ))}
+                        {p.discretionaryApplied > 0 && (
+                          <div style={{ color: "var(--ochre)", fontStyle: "italic" }}>Discretionary (estimated): −{inr(p.discretionaryApplied)}</div>
+                        )}
+                        {p.events.length === 0 && p.discretionaryApplied === 0 && (
+                          <div style={{ color: "var(--ink-soft)" }}>No known activity</div>
+                        )}
+                      </div>
+                    );
+                  }}
+                />
+                {cashBuffer > 0 && <ReferenceLine y={cashBuffer} stroke="var(--ochre)" strokeDasharray="4 4" label={{ value: "Buffer", position: "insideTopLeft", fontSize: 10, fill: "var(--ochre)" }} />}
+                <Line type="monotone" dataKey="balance" stroke={projectedMinimumBalance !== null && cashBuffer > 0 && projectedMinimumBalance < cashBuffer ? "var(--rust)" : "var(--teal)"} strokeWidth={2} dot={{ r: 2 }} />
+              </LineChart>
+            </ResponsiveContainer>
+
+            <div className="bw-summary-row" style={{ gridTemplateColumns: "repeat(3, 1fr)", marginTop: 14 }}>
+              <Stat
+                label="Minimum balance"
+                value={inr(projectedMinimumBalance)}
+                color={cashBuffer > 0 && projectedMinimumBalance < cashBuffer ? "var(--rust)" : "var(--ink)"}
+                hint={(() => {
+                  const minDay = projectedDaily.reduce((min, p) => (p.balance < min.balance ? p : min), projectedDaily[0]);
+                  return minDay ? `on ${minDay.date.slice(8, 10)} ${monthLabelStr.split(" ")[0].slice(0, 3)}` : null;
+                })()}
+              />
+              <Stat label="Your buffer" value={cashBuffer > 0 ? inr(cashBuffer) : "Not set"} color="var(--ink)" />
+              <Stat
+                label="Status"
+                value={cashBuffer === 0 ? "—" : (projectedMinimumBalance >= cashBuffer ? "Comfortable" : "Below buffer")}
+                color={cashBuffer === 0 ? "var(--ink-soft)" : (projectedMinimumBalance >= cashBuffer ? "var(--teal)" : "var(--rust)")}
+              />
+            </div>
+          </>
+        )}
+      </div>
+
+      <div style={{ marginTop: 24, border: "1px solid var(--line)", borderRadius: 8, padding: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ background: "var(--teal)", color: "#fff", borderRadius: "50%", width: 22, height: 22, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>3</span>
+          <span style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Control</span>
+          <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>What can I do about it?</span>
+        </div>
+
+        {!isCurrentMonthView || todaysBalance === null ? (
+          <div className="bw-empty" style={{ marginTop: 14 }}>
+            {!isCurrentMonthView ? "Only shown for the current month." : "Today's bank balance isn't confirmed yet."}
+          </div>
+        ) : (
+          <>
+            <div style={{ margin: "14px 0 16px", padding: 14, background: "rgba(46,102,89,0.06)", border: "1px solid var(--teal)", borderRadius: 6 }}>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--ink-soft)" }}>Safe to spend</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 24, fontWeight: 600, color: safeToSpend >= 0 ? "var(--teal)" : "var(--rust)" }}>{inr(Math.max(0, safeToSpend))}</div>
+              <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginTop: 2 }}>
+                Available this month without going below your {cashBuffer > 0 ? `${inr(cashBuffer)} buffer` : "buffer (not yet set)"}.
+              </div>
+            </div>
+
+            {insights.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--ink-soft)", marginBottom: 6 }}>Insights</div>
+                <ul style={{ margin: 0, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {insights.map((text, i) => <li key={i} style={{ fontSize: 12.5 }}>{text}</li>)}
+                </ul>
+              </div>
+            )}
+
+            {onGoToCFO && (
+              <button className="bw-btn" style={{ width: "100%", justifyContent: "center" }} onClick={onGoToCFO}>
+                Ask your CFO
+              </button>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -10897,6 +14363,7 @@ function DebtControlView({ transactions, accounts, debtSchedules }) {
 
   const debtAccounts = useMemo(() => accounts.filter((a) => a.type === "debt"), [accounts]);
   const ccAccounts = useMemo(() => accounts.filter((a) => a.type === "creditCard"), [accounts]);
+  const ccAccountIds = useMemo(() => new Set(ccAccounts.map((a) => a.id)), [ccAccounts]);
   const bankAccounts = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
   const bankAccountIds = useMemo(() => new Set(bankAccounts.map((a) => a.id)), [bankAccounts]);
 
@@ -10909,15 +14376,19 @@ function DebtControlView({ transactions, accounts, debtSchedules }) {
   // filter against entirely different account sets.
   function switchTab(tab) { setSubTab(tab); setAccountFilter("all"); }
 
-  /* ---- Classic Debt tab: bank-side Debt-EMI/Disbursement/Lumpsum vs. schedule-side ---- */
+  /* ---- Classic Debt tab: bank-side Debt Payment/Debt Add vs. schedule-side ---- */
   const classicRows = useMemo(() => {
     return transactions
       .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId)
-        && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(t.subCategory))
+        && ["Debt Payment", "Debt Add"].includes(t.subCategory) && !(t.linkedAccountId && ccAccountIds.has(t.linkedAccountId)))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
       .map((t) => ({
-        id: t.id, date: t.date, description: t.description, type: t.subCategory,
+        id: t.id, date: t.date, description: t.description,
+        // EMI vs a one-off Lumpsum Payment used to be two distinct subCategory values;
+        // now both are "Debt Payment", told apart by frequencyClass instead - recombined
+        // here into the same readable label the old subCategory alone used to give.
+        type: t.subCategory === "Debt Payment" ? (t.frequencyClass === "Recurring" ? "Debt-EMI" : "Debt-Lumpsum Payment") : "Debt-Disbursement",
         accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
         amount: t.direction === "credit" ? t.amount : -t.amount,
       }))
@@ -10955,15 +14426,18 @@ function DebtControlView({ transactions, accounts, debtSchedules }) {
   const classicByAccount = useMemo(() => {
     const bankGroups = {};
     transactions
-      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId) && ["Debt-EMI", "Debt-Disbursement", "Debt-Lumpsum Payment"].includes(t.subCategory))
+      .filter((t) => t.category === "Transfer" && bankAccountIds.has(t.accountId) && ["Debt Payment", "Debt Add"].includes(t.subCategory) && !(t.linkedAccountId && ccAccountIds.has(t.linkedAccountId)))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .forEach((t) => {
         const key = t.linkedAccountId || "unlinked";
         if (!bankGroups[key]) bankGroups[key] = { emiBank: 0, disbursement: 0, lumpsum: 0 };
         const amount = t.direction === "credit" ? t.amount : -t.amount;
-        if (t.subCategory === "Debt-EMI") bankGroups[key].emiBank += Math.abs(amount);
-        if (t.subCategory === "Debt-Disbursement") bankGroups[key].disbursement += amount;
-        if (t.subCategory === "Debt-Lumpsum Payment") bankGroups[key].lumpsum += Math.abs(amount);
+        // EMI vs a one-off Lumpsum Payment both use subCategory "Debt Payment" now -
+        // frequencyClass (Recurring vs everything else) is what tells them apart, the
+        // same distinction the old separate subCategory values used to carry directly.
+        if (t.subCategory === "Debt Payment" && t.frequencyClass === "Recurring") bankGroups[key].emiBank += Math.abs(amount);
+        if (t.subCategory === "Debt Payment" && t.frequencyClass !== "Recurring") bankGroups[key].lumpsum += Math.abs(amount);
+        if (t.subCategory === "Debt Add") bankGroups[key].disbursement += amount;
       });
     const allKeys = new Set([...Object.keys(bankGroups), ...debtAccounts.map((a) => a.id)]);
     return [...allKeys]
@@ -10992,7 +14466,7 @@ function DebtControlView({ transactions, accounts, debtSchedules }) {
      to live in Transfers Control, moved here with a per-card merged table added ---- */
   const ccCombinedRows = useMemo(() => {
     const bankRows = transactions
-      .filter((t) => t.category === "Transfer" && t.subCategory === "Credit card payment" && bankAccountIds.has(t.accountId))
+      .filter((t) => t.category === "Transfer" && t.subCategory === "Debt Payment" && bankAccountIds.has(t.accountId) && t.linkedAccountId && ccAccountIds.has(t.linkedAccountId))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
       .map((t) => ({
@@ -11028,7 +14502,7 @@ function DebtControlView({ transactions, accounts, debtSchedules }) {
   const ccByAccount = useMemo(() => {
     const paymentGroups = {};
     transactions
-      .filter((t) => t.category === "Transfer" && t.subCategory === "Credit card payment" && bankAccountIds.has(t.accountId))
+      .filter((t) => t.category === "Transfer" && t.subCategory === "Debt Payment" && bankAccountIds.has(t.accountId) && t.linkedAccountId && ccAccountIds.has(t.linkedAccountId))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .forEach((t) => {
         const key = t.linkedAccountId || "unlinked";
@@ -11271,15 +14745,19 @@ function InvestmentsControlView({ transactions, accounts, holdingSnapshots }) {
     return [...s].sort().reverse();
   }, [transactions]);
 
-  /* ---- Bank side: individual SIP/Lumpsum/Redemption transactions ---- */
+  /* ---- Bank side: individual Investment Add/Redemption transactions ---- */
   const bankRows = useMemo(() => {
     return transactions
       .filter((t) => t.category === "Investment" && bankAccountIds.has(t.accountId)
-        && ["SIP", "Lumpsum", "Redemption"].includes(t.subCategory))
+        && ["Add", "Redemption"].includes(t.subCategory))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .filter((t) => accountFilter === "all" || (t.linkedAccountId || "unlinked") === accountFilter)
       .map((t) => ({
-        id: t.id, date: t.date, description: t.description, type: t.subCategory,
+        id: t.id, date: t.date, description: t.description,
+        // What used to be a single "SIP"/"Lumpsum"/"Redemption" subCategory value is
+        // now Add/Redemption plus frequencyClass (Recurring/One-Time) - recombined here
+        // into the same kind of readable label the old subCategory alone used to give.
+        type: t.subCategory === "Add" ? (t.frequencyClass === "Recurring" ? "SIP" : "Lumpsum") : "Redemption",
         accountId: t.accountId, linkedAccountId: t.linkedAccountId || null,
         amount: t.direction === "credit" ? t.amount : -t.amount,
       }))
@@ -11322,13 +14800,13 @@ function InvestmentsControlView({ transactions, accounts, holdingSnapshots }) {
   const byAccount = useMemo(() => {
     const bankGroups = {};
     transactions
-      .filter((t) => t.category === "Investment" && bankAccountIds.has(t.accountId) && ["SIP", "Lumpsum", "Redemption"].includes(t.subCategory))
+      .filter((t) => t.category === "Investment" && bankAccountIds.has(t.accountId) && ["Add", "Redemption"].includes(t.subCategory))
       .filter((t) => period === "all" || t.date.slice(0, 7) === period)
       .forEach((t) => {
         const key = t.linkedAccountId || "unlinked";
         if (!bankGroups[key]) bankGroups[key] = { added: 0, redeemed: 0 };
         const amount = Math.abs(t.direction === "credit" ? t.amount : -t.amount);
-        if (t.subCategory === "SIP" || t.subCategory === "Lumpsum") bankGroups[key].added += amount;
+        if (t.subCategory === "Add") bankGroups[key].added += amount;
         if (t.subCategory === "Redemption") bankGroups[key].redeemed += amount;
       });
     const allKeys = new Set([...Object.keys(bankGroups), ...investmentAccounts.map((a) => a.id)]);
@@ -12995,7 +16473,7 @@ function TransactionsZone({ scoped, accounts, accountName }) {
                   <td>{t.description}</td>
                   <td>
                     {t.category ? (
-                      <span className="bw-pill" style={{ background: PALETTE[pillClass(t.category, t.subCategory, t.tag)] || "#9C8F78", fontSize: 10 }}>
+                      <span className="bw-pill" style={{ background: PALETTE[pillClass(t.category, t.subCategory, t.frequencyClass)] || "#9C8F78", fontSize: 10 }}>
                         {t.category}{t.subCategory ? ` / ${t.subCategory}` : ""}
                       </span>
                     ) : <span style={{ fontSize: 10.5, color: "var(--rust)" }}>Uncategorized</span>}
@@ -13069,7 +16547,7 @@ function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, 
   const activeThread = chatThreads.find((t) => t.id === activeThreadId);
 
   const categoryOptions = useMemo(() => {
-    const keys = new Set(transactions.filter((t) => t.category === "Expense").map((t) => pillClass(t.category, t.subCategory, t.tag)));
+    const keys = new Set(transactions.filter((t) => t.category === "Expense").map((t) => pillClass(t.category, t.subCategory, t.frequencyClass)));
     return [...keys].map((k) => ({ value: k, label: CATEGORY_LABELS[k] || k }));
   }, [transactions]);
   const accountOptions = accounts.map((a) => ({ value: a.id, label: a.nickname }));
