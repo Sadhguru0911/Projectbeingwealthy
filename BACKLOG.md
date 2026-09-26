@@ -81,6 +81,41 @@ AI's (#23) usage metering genuinely can't work without it. Even then, a lighter-
 identity (an emailed token, closer to how AI providers hand out API keys) was suggested
 as possibly a better fit than full OAuth.
 
+### Consolidate migration guards into a single schemaVersion check
+Currently three separate per-transaction functions run on every load — `migrateOne`
+(guarded: skips anything that already has `frequencyClass`), `refreshMerchantKey` and
+`backfillMissingFrequency` (both unguarded, safe to re-run unconditionally since they
+only ever fill a gap or recompute a derived value, never overwrite a deliberate
+choice). This is standard, expected practice for an app with no backend to track "which
+installs are on which schema version" — a restored backup, an old browser profile, or a
+machine not opened in months could load old-shape data at any point, and this is what
+makes that self-healing rather than silently stuck. Confirmed as not a problem to ship
+as-is. The real upgrade, if ever wanted: one `schemaVersion` field stored on the whole
+data blob, checked once per load (`if (version < CURRENT) runMigrations()`) instead of
+scattered per-function guards — cleaner, one place to reason about, easier to extend as
+more migrations accumulate over time. An architectural improvement, not a fix for
+something broken — revisit if/when the number of migration functions grows enough that
+tracking them individually gets unwieldy, not preemptively.
+
+### Goal funding-gap detection for long-term goal types
+The Forecasting Engine's goal-funding-gap check (is a goal's planned SIP actually
+happening, or has it silently stopped) works cleanly today for exactly two goal
+types — Emergency Fund and Short-term — because those are the only ones with
+`assignedInstrumentKeys`, a real link to specific holdings. The check itself needs no
+new data model: compare a linked instrument's `investedValue` (cost basis, so it only
+moves on real contributions/redemptions, never on market price swings) across
+consecutive `holdingSnapshots` against the goal's required SIP rate from
+`computeGoalMath`.
+Every other goal type (education, marriage, house, car, retirement, custom) has no
+such link — they're funded from `computeGoalsTracking`'s pooled "SIP auto-absorption"
+across the whole portfolio's invested value, not a specific assigned instrument. A
+per-goal funding-gap check doesn't have anything to attribute to for these; the only
+thing checkable today is a portfolio-wide aggregate ("is total invested value growing
+at roughly the sum of all long-term goals' required rates"), which can tell you
+something is off but not which goal is actually underfunded. Deliberately scoped out
+of V1 for this reason — revisit once there's a per-goal instrument link (or equivalent)
+for the pooled goal types too, not as a blind aggregate check in the meantime.
+
 ---
 
 ## Completed (for reference — remove entries here once genuinely irrelevant)
