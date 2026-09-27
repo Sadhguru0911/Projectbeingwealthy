@@ -81,6 +81,34 @@ AI's (#23) usage metering genuinely can't work without it. Even then, a lighter-
 identity (an emailed token, closer to how AI providers hand out API keys) was suggested
 as possibly a better fit than full OAuth.
 
+### Multi-segment document detection (NSDL/CDSL-style consolidated statements)
+Every classifier in the unified upload flow — Stage 1 and the investment flow's finer
+one alike — returns a single enum value: this document IS equity, OR mutual fund, OR
+bank statement. There's no way for either schema to express "this document contains
+several of these." An NSDL/CDSL consolidated account statement (equity + mutual funds,
+sometimes bonds/AIFs too, all in one file, typically in separate sections) breaks this
+assumption directly: the model is forced to pick just one type, and whichever
+sections it doesn't pick are never surfaced as missed — they're silently never looked
+at. This is a pre-existing gap, not something the account-type unification (built
+right after this was raised) introduces or worsens.
+Proper handling needs three genuinely separate pieces of work, not one schema tweak:
+(1) detection becomes segment-based — "what sections does this document contain and
+where" rather than "what is this document"; (2) extraction runs per detected segment,
+since equity and mutual fund holdings have real structural differences that one
+column-mapping can't cover; (3) import creates multiple accounts from one file rather
+than the "one statement in, one account out" assumption baked in everywhere today.
+There's also a distinct honesty question worth solving alongside this, not after:
+what should happen for a segment type outside the supported enum entirely (bonds,
+AIFs)? The right answer is an explicit "found X, imported it; also found Y, which
+isn't supported yet" message — which needs the classifier asked to report everything
+it sees, not just asked to pick its best single match. Silently dropping an
+unsupported section, or crashing on it, are both worse than saying so plainly.
+Deliberately sequenced after the account-type unification, not built alongside it —
+that piece was already well-scoped and ready to build; this is a genuinely larger,
+separate effort (new detection schema, multi-pass extraction, multi-account import)
+that deserves its own dedicated design pass rather than expanding the current one
+mid-flight.
+
 ### Consolidate migration guards into a single schemaVersion check
 Currently three separate per-transaction functions run on every load — `migrateOne`
 (guarded: skips anything that already has `frequencyClass`), `refreshMerchantKey` and
