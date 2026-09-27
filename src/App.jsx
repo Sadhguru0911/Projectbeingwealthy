@@ -2572,13 +2572,20 @@ function migrateToOtherInvestments(accounts, assetBalances, manualAssets) {
 /* path into any real import flow.                                         */
 /* ------------------------------------------------------------------------ */
 
+// Investment holdings return their SPECIFIC sub-type directly, not the coarser
+// "investment_holding" umbrella this schema used before - the whole point of the
+// unified account-type model is that Stage 1 is the ONE place this gets decided, so
+// nothing downstream (the investment flow's own former second classifier, now
+// removed) needs to re-ask the same question on the same sample content. The
+// distinguishing criteria below are the same ones already proven reliable in that
+// now-removed classifier, carried over rather than reinvented.
 const DOCUMENT_CLASSIFY_SCHEMA = {
   type: "OBJECT",
   properties: {
     documentCategory: {
       type: "STRING",
-      enum: ["bank_statement", "credit_card_statement", "investment_holding", "debt_schedule", "other_investment_statement", "unknown"],
-      description: "What kind of financial document this is. 'bank_statement' is a savings/current account transaction history. 'credit_card_statement' is a credit card transaction/billing statement. 'investment_holding' is any holdings/portfolio export — stocks, mutual funds, NPS, or ULIP (all structurally similar: units, price, value, no fixed schedule). 'debt_schedule' is a loan amortization schedule (opening balance, EMI, principal, interest, closing balance per period). 'other_investment_statement' is a single-balance investment account with no regular trading activity — a PF passbook, or a gold/property valuation. Use 'unknown' only if genuinely unclear from what's visible.",
+      enum: ["bank_statement", "credit_card_statement", "equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding", "debt_schedule", "other_investment_statement", "unknown"],
+      description: "What kind of financial document this is. 'bank_statement' is a savings/current account transaction history. 'credit_card_statement' is a credit card transaction/billing statement. 'equity_holding' is a stock/demat holdings export (has ISIN, Sector, or LTP/Current Price columns/mentions). 'mutual_fund_holding' is a mutual fund holdings export (has Folio Number, AMC, Scheme Name, or NAV columns/mentions). 'nps_holding' is an NPS (National Pension System) statement — often has PRAN, scheme/fund manager name, units, and NAV; structurally treat it like a mutual fund holding. 'ulip_holding' is a ULIP (unit-linked insurance) fund-value statement — often has Policy Number, fund name, units, and NAV; structurally treat it like a mutual fund holding too. 'debt_schedule' is a loan amortization schedule (opening balance, EMI, principal, interest, closing balance per period). 'other_investment_statement' is a single-balance investment account with no regular trading activity — a PF passbook, or a gold/property valuation. Use 'unknown' only if genuinely unclear from what's visible, including a document that appears to mix several of these categories together (e.g. an NSDL/CDSL consolidated statement covering both equity and mutual funds in one file) - do not force a single-category guess onto a document that isn't really one.",
     },
     institution: { type: "STRING", nullable: true, description: "The bank, broker, insurer, or platform name, if identifiable from a title, logo caption, letterhead, or a repeated label. Null if genuinely not findable — never guessed." },
     confidence: { type: "STRING", enum: ["high", "medium", "low"], description: "How confident this classification is, based on how clearly the document matches one category over the others." },
@@ -2594,10 +2601,11 @@ async function callDocumentClassify(inputParts, apiKey, aiModel) {
   const effectiveModel = aiModel || "gemini-3.6-flash";
   const preamble = [
     "You are looking at the first part of a financial document — could be a bank statement, credit card",
-    "statement, an investment holdings export, a loan amortization schedule, or a single-balance investment",
-    "statement (like a PF passbook or a gold/property valuation). Identify which of these categories it is,",
-    "and the institution if identifiable. This is a CLASSIFICATION step only — do not extract any transaction",
-    "or holding data yet, just determine what kind of document this is.",
+    "statement, an equity/demat holdings export, a mutual fund holdings export, an NPS or ULIP statement, a",
+    "loan amortization schedule, or a single-balance investment statement (like a PF passbook or a gold/property",
+    "valuation). Identify which of these categories it is, and the institution if identifiable. This is a",
+    "CLASSIFICATION step only — do not extract any transaction or holding data yet, just determine what kind of",
+    "document this is.",
   ].join("\n");
   const parts = [...inputParts, { text: preamble }];
   const response = await fetch(
@@ -5763,6 +5771,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
   const [unifiedResult, setUnifiedResult] = useState(null);
   const [showManualTabs, setShowManualTabs] = useState(false);
   const [investmentInitialFile, setInvestmentInitialFile] = useState(null);
+  const [investmentInitialDocumentType, setInvestmentInitialDocumentType] = useState(null); // the sub-type Stage 1 already determined (equity_holding/mutual_fund_holding/nps_holding/ulip_holding) - passed down so InvestmentImportFlow's own classification calls don't need to re-ask the same question
   const [debtInitialFile, setDebtInitialFile] = useState(null);
   const [investmentInitialPassword, setInvestmentInitialPassword] = useState("");
   const [debtInitialPassword, setDebtInitialPassword] = useState("");
@@ -6034,15 +6043,25 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
    *  handles that document type. Nothing about extraction changes here — this only
    *  decides which flow gets the file. */
   function routeClassifiedFile(category, file, pwd) {
-    if (category === "investment_holding") {
+    if (["equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding"].includes(category)) {
+      // The specific sub-type is already known from Stage 1 - carried down as a prop
+      // rather than asked again, since the investment flow's own former classifier
+      // (now removed) would otherwise re-ask the exact same question on the exact
+      // same sample content.
       setSource("investment");
       setInvestmentInitialPassword(pwd || "");
       setInvestmentInitialFile(file);
+      setInvestmentInitialDocumentType(category);
     } else if (category === "debt_schedule") {
       setSource("debt");
       setDebtInitialPassword(pwd || "");
       setDebtInitialFile(file);
     } else if (category === "bank_statement" || category === "credit_card_statement") {
+      // Propagate the classifier's own determination straight to the account type
+      // dropdown - it controls the debit/credit sign convention reconciliation
+      // depends on, and was previously left untouched here, silently defaulting to
+      // whatever it was last set to regardless of what was actually just classified.
+      setAccountType(category === "credit_card_statement" ? "creditCard" : "bank");
       if (/\.pdf$/i.test(file.name)) {
         // Bank/CC PDF extraction is a deliberate two-step flow (select, then a
         // separate "Extract" click) — land on it pre-filled rather than reaching in
@@ -6058,7 +6077,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         setPastePreview(null);
       } else {
         setSource("csv");
-        handleFile(file); // the bank/CC CSV flow, already AI-refined
+        handleFile(file, category); // the bank/CC CSV flow, already AI-refined; category already known, no need for its own AI call to re-guess it
       }
     } else if (category === "other_investment_statement") {
       setUnifiedError('This looks like a PF, Gold, or Property statement — those are imported from Investments → "Other Investments", not here.');
@@ -6123,7 +6142,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     handleUnifiedFile(unifiedPendingFile, unifiedPassword);
   }
 
-  async function handleFile(file) {
+  async function handleFile(file, knownDocumentType) {
     if (!file) return;
     setFileName(file.name);
     setHeaders(null);
@@ -6144,7 +6163,11 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
           try {
             const sample = buildSpreadsheetSample(data, 30);
             const embeddedImages = /\.xlsx$/i.test(file.name) ? await extractEmbeddedImages(file) : [];
-            const result = await callClassifyAndMap(sample, file.name, embeddedImages);
+            // knownDocumentType is only ever set when Stage 1 already classified this
+            // file (routeClassifiedFile passes it through) - a direct click on the
+            // manual "CSV file" tab has nothing known yet, so this is correctly
+            // undefined there, falling back to letting the AI classify as before.
+            const result = await callClassifyAndMap(sample, file.name, embeddedImages, knownDocumentType);
             setAiSuggestion(result);
           } catch {
             /* silent — the heuristic-based defaults remain in place */
@@ -6708,16 +6731,25 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     required: ["documentType", "headerRowIndex", "columnMapping"],
   };
 
-  async function callClassifyAndMap(sampleText, fileName, embeddedImages) {
+  async function callClassifyAndMap(sampleText, fileName, embeddedImages, knownDocumentType) {
     const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
     const hasImages = embeddedImages && embeddedImages.length > 0;
+    // When Stage 1 has already classified this file, don't ask the same question again
+    // on the same sample content - drop documentType from the schema entirely (the ...
+    // spread with an undefined value omits the key once JSON-serialized) and required,
+    // and tell the AI directly what type this already is so it still knows which
+    // columnMapping fields are relevant for it.
+    const schema = knownDocumentType
+      ? { ...CLASSIFY_MAP_SCHEMA, properties: { ...CLASSIFY_MAP_SCHEMA.properties, documentType: undefined }, required: CLASSIFY_MAP_SCHEMA.required.filter((f) => f !== "documentType") }
+      : CLASSIFY_MAP_SCHEMA;
     const prompt = [
       "You are looking at the first rows of a CSV or Excel export from a bank, credit card",
       "issuer, stockbroker, or mutual fund platform (a demat holdings export, a mutual fund",
-      "CAS, a bank statement, or a credit card statement). Identify what kind of document",
-      "this is, find the real header row (there may be title/summary rows above it), and",
-      "map each column to the fields in the schema using the EXACT header text as it",
-      "appears — do not paraphrase or guess a column that isn't actually present.",
+      "CAS, a bank statement, or a credit card statement).",
+      knownDocumentType
+        ? `This has already been identified as a '${knownDocumentType}' document - do not re-classify it. Just find the real header row (there may be title/summary rows above it), and map each column to the fields in the schema that are relevant for this type.`
+        : "Identify what kind of document this is, find the real header row (there may be title/summary rows above it), and map each column to the fields in the schema.",
+      "Use the EXACT header text as it appears — do not paraphrase or guess a column that isn't actually present.",
       "Also flag any sample row that is a section-divider or total/subtotal row rather than",
       "a real transaction/holding, so it isn't parsed as one.",
       "Only report a statementTotals value if it is explicitly printed somewhere in this",
@@ -6742,7 +6774,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify({
           contents: [{ role: "user", parts }],
-          generationConfig: { maxOutputTokens: 4000, responseMimeType: "application/json", responseSchema: CLASSIFY_MAP_SCHEMA },
+          generationConfig: { maxOutputTokens: 4000, responseMimeType: "application/json", responseSchema: schema },
         }),
       }
     );
@@ -6755,7 +6787,12 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       throw new Error(blockReason ? `No usable response (${blockReason}).` : "No text response from the model.");
     }
     let raw = textPart.text.replace(/```json|```/g, "").trim();
-    return JSON.parse(raw);
+    const result = JSON.parse(raw);
+    // documentType is always present on the returned result regardless of which path
+    // was taken, so every existing caller that reads result.documentType keeps working
+    // unchanged whether or not the AI was actually asked to determine it this time.
+    if (knownDocumentType) result.documentType = knownDocumentType;
+    return result;
   }
 
   const AI_MAX_PAGES = 5;
@@ -7023,6 +7060,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
           callClassifyAndMap={callClassifyAndMap}
           showToast={showToast}
           initialFile={investmentInitialFile} initialPassword={investmentInitialPassword}
+          initialDocumentType={investmentInitialDocumentType}
           effectiveTier={effectiveTier}
         />
       ) : source === "debt" ? (
@@ -7574,7 +7612,7 @@ const ASSET_LABEL_BY_DOC_TYPE = { nps_holding: "NPS", ulip_holding: "ULIP" };
  *  resolves or creates the account (respecting the Free-tier one-investment-account
  *  limit) and writes one new holdingSnapshots entry, the single data point every
  *  Investment Control and Net Worth computation later diffs against. */
-function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast, initialFile, initialPassword, effectiveTier }) {
+function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHoldingSnapshots, apiKey, aiModel, customModelId, callClassifyAndMap, showToast, initialFile, initialPassword, initialDocumentType, effectiveTier }) {
   const [file, setFile] = useState(null);
   const [fileName, setFileName] = useState("");
   const [rawRows, setRawRows] = useState(null);
@@ -7637,11 +7675,19 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
     required: ["documentType", "isComplete", "holdings"],
   };
 
-  async function callHoldingsPdfExtract(images) {
+  async function callHoldingsPdfExtract(images, knownDocumentType) {
     const effectiveModel = aiModel === "custom" ? customModelId.trim() : aiModel;
+    // When Stage 1 has already classified this file, drop documentType from the
+    // schema and required list entirely rather than asking again on largely the same
+    // page content - mirrors callClassifyAndMap's treatment for the CSV path.
+    const schema = knownDocumentType
+      ? { ...HOLDINGS_PDF_EXTRACT_SCHEMA, properties: { ...HOLDINGS_PDF_EXTRACT_SCHEMA.properties, documentType: undefined }, required: HOLDINGS_PDF_EXTRACT_SCHEMA.required.filter((f) => f !== "documentType") }
+      : HOLDINGS_PDF_EXTRACT_SCHEMA;
     const prompt = [
-      "You are looking at page images of an investment holdings statement — equity/demat, mutual fund, NPS, or",
-      "ULIP. Extract every individual holding row exactly as printed. Read each number directly from the image —",
+      knownDocumentType
+        ? `You are looking at page images of an investment holdings statement, already identified as '${knownDocumentType}' - do not re-classify it.`
+        : "You are looking at page images of an investment holdings statement — equity/demat, mutual fund, NPS, or ULIP.",
+      "Extract every individual holding row exactly as printed. Read each number directly from the image —",
       "never compute, estimate, or invent a value, even if two others would let you calculate it; that",
       "calculation happens separately, afterward, in code. For isin and folioNumber specifically: these must be",
       "unique to each individual holding — never fill them with an account-level number (a PRAN, a policy",
@@ -7672,7 +7718,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify({
           contents: [{ role: "user", parts }],
-          generationConfig: { maxOutputTokens: 32000, responseMimeType: "application/json", responseSchema: HOLDINGS_PDF_EXTRACT_SCHEMA },
+          generationConfig: { maxOutputTokens: 32000, responseMimeType: "application/json", responseSchema: schema },
         }),
       }
     );
@@ -7682,7 +7728,11 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
     if (!textPart) throw new Error("No usable response from the model.");
     let raw = textPart.text.replace(/```json|```/g, "").trim();
     try {
-      return JSON.parse(raw);
+      const result = JSON.parse(raw);
+      // documentType is always present on the returned result regardless of which
+      // path was taken, so every existing caller keeps working unchanged.
+      if (knownDocumentType) result.documentType = knownDocumentType;
+      return result;
     } catch {
       // A cut-off response is possible even with a generous token cap on a long
       // holdings list — salvage whatever complete holding rows exist before the
@@ -7695,7 +7745,11 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
         salvaged = rowMatches.map((m) => { try { return JSON.parse(m[0]); } catch { return null; } }).filter(Boolean);
       }
       if (salvaged.length === 0) throw new Error("The response got cut off before any usable holdings could be read — try again.");
-      return { documentType: "mutual_fund_holding", institution: null, asOfDate: null, totalInvestedValue: null, totalCurrentValue: null, isComplete: false, holdings: salvaged };
+      // Use the real known type when one exists, rather than always guessing
+      // mutual_fund_holding blindly - the guess remains only as a last resort when
+      // genuinely nothing else is known (documentType wasn't asked for, or wasn't
+      // reached before the response got cut off).
+      return { documentType: knownDocumentType || "mutual_fund_holding", institution: null, asOfDate: null, totalInvestedValue: null, totalCurrentValue: null, isComplete: false, holdings: salvaged };
     }
   }
 
@@ -7769,7 +7823,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
     try {
       const { images, truncated } = await renderPdfPagesAsImages(f, pwd || undefined);
       if (images.length === 0) { setError("Couldn't render any pages from that PDF."); return; }
-      const result = await callHoldingsPdfExtract(images);
+      const result = await callHoldingsPdfExtract(images, initialDocumentType);
       let { holdings, derivedCount } = processExtractedHoldings(result.holdings || []);
       if (holdings.length === 0) { setError("Couldn't find any holdings in that PDF."); return; }
       let proportionallyAllocated = false;
@@ -7822,7 +7876,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
       setRawRows(rows);
       const sample = buildSpreadsheetSample(rows, 30);
       const embeddedImages = await extractEmbeddedImages(f);
-      const result = await callClassifyAndMap(sample, f.name, embeddedImages);
+      const result = await callClassifyAndMap(sample, f.name, embeddedImages, initialDocumentType);
       setClassification(result);
       setInstitution(result.institution || "");
       if (result.statementTotals?.asOfDate) setAsOfDate(result.statementTotals.asOfDate);
