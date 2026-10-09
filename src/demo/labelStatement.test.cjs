@@ -1,0 +1,62 @@
+(async () => {
+  const assert = require("assert");
+  const { callEngine } = require("../../golden/load-engine.cjs");
+  const { labelStatement, labelStatementFull } = await import("./labelStatement.js");
+  const { rawAshaStatement } = await import("./ashaStatement.js");
+  const { sliceDemoJourney } = await import("./sliceDemo.js");
+  const { generateDemoData } = await import("./generateDemoData.js");
+  const memo = {}; const m = (fn) => (...a) => { const k = fn + JSON.stringify(a[0]).replace(/\d+/g, "#"); return k in memo ? memo[k] : (memo[k] = callEngine(fn, a)); };
+  const rules = callEngine("seedRules", []);
+  const engine = { matchRule: m("matchRule"), seedRules: () => rules, findLibraryEntry: m("findLibraryEntry"), normalizeMerchant: m("normalizeMerchant") };
+  const all = rawAshaStatement();
+  const win = (from, accts = ["acc_bank"]) => all.filter((r) => r.date >= from && accts.includes(r.accountId));
+  let pass = 0; const t = (n, f) => { f(); pass++; console.log("ok -", n); };
+  const one = labelStatement(win("2026-09-01"), engine, []);
+  const twelve = labelStatement(win("2025-10-01"), engine, [], { linked: { loan: true, card: false, demat: true } });
+  const find = (rows, s) => rows.filter((r) => r.description.includes(s));
+  t("same rows in, same count out; raw fields preserved", () => { assert.strictEqual(one.length, win("2026-09-01").length); one.forEach((r, i) => assert.strictEqual(r.description, win("2026-09-01")[i].description)); });
+  t("single-sighting rule at import: nothing is Recurring after one month", () => one.forEach((r) => assert.notStrictEqual(r.frequencyClass, "Recurring", r.description)));
+  t("...even for names the starter rules call recurring (Netflix, rent, salary)", () => ["NETFLIX", "RENT", "SALARY"].forEach((s) => assert.strictEqual(find(one, s)[0].frequencyClass, "One-Time")));
+  t("but a rule still sets category and control at first sight", () => { const n = find(one, "NETFLIX")[0]; assert.strictEqual(n.category, "Expense"); assert(n.control); assert.strictEqual(find(one, "SALARY")[0].category, "Income"); });
+  t("home-loan EMI is a debt payment, not an expense (rule said Expense)", () => { const e = find(one, "HOME LOAN EMI")[0]; assert.strictEqual(e.category, "Transfer"); assert.strictEqual(e.subCategory, "Debt Payment"); });
+  t("card bill is a debt payment (no rule matched it before)", () => assert.strictEqual(find(one, "CREDIT CARD PAYMENT")[0].category, "Transfer"));
+  t("links exist only for accounts the person added", () => { assert(!find(one, "HOME LOAN EMI")[0].linkedAccountId); assert.strictEqual(find(twelve, "HOME LOAN EMI")[0].linkedAccountId, "acc_loan"); assert(!find(twelve, "CREDIT CARD PAYMENT")[0].linkedAccountId); assert.strictEqual(find(twelve, "ZERODHA")[0].linkedAccountId, "acc_demat"); });
+  t("12 months: Netflix is Recurring / Monthly, and Personal (Sub Category 1, from the library)", () => { const n = find(twelve, "NETFLIX")[0]; assert.strictEqual(n.frequencyClass, "Recurring"); assert.strictEqual(n.frequency, "Monthly"); assert.strictEqual(n.subCategory, "Personal"); });
+  t("12 months: school fee is Semi-Annual, inferred from two sightings 6 months apart", () => { const f = find(twelve, "SCHOOL FEES")[0]; assert.strictEqual(f.frequencyClass, "Recurring"); assert.strictEqual(f.frequency, "Semi-Annual"); });
+  t("12 months: car insurance seen once stays One-Time until answered", () => assert.strictEqual(find(twelve, "GENERAL INSURANCE")[0].frequencyClass, "One-Time"));
+  t("Zepto is Household (Sub Category 1 is Household / Personal, never Fixed / Variable) and Irregular: many payments a month is spending, not a commitment", () => { const z = find(twelve, "ZEPTO")[0]; assert.strictEqual(z.frequencyClass, "Irregular"); assert(!z.frequency); assert.strictEqual(z.subCategory, "Household"); twelve.filter((x) => x.category === "Expense" && x.subCategory).forEach((x) => assert(["Household", "Personal"].includes(x.subCategory), x.subCategory)); });
+  t("Income carries its kind as Sub Category 1 (salary is Salary)", () => assert.strictEqual(find(twelve, "SALARY")[0].subCategory, "Salary"));
+  t("a card answer changes the label: R Sharma = Household help is Committed", () => { const key = m("normalizeMerchant")(find(one, "R SHARMA")[0].description); const r = labelStatement(win("2026-09-01"), engine, [{ key, label: "Household help" }]); assert.strictEqual(find(r, "R SHARMA")[0].control, "Committed"); assert.strictEqual(find(r, "R SHARMA")[0].subCategory, "Household"); });
+  const full12 = labelStatementFull(win("2025-10-01"), engine, []);
+  const alias = (name) => full12.merchantAliases.find((a) => a.canonical === name);
+  t("library groups are applied at import: Zepto and Blinkit land in Grocery together", () => { const g = alias("Grocery"); assert(g, "no Grocery group"); assert(g.variants.includes("Zepto") && g.variants.includes("Blinkit")); });
+  t("group variants are the merchant names the transactions carry (so Sub Category 2 resolves)", () => full12.merchantAliases.forEach((a) => a.variants.forEach((v) => assert(full12.transactions.some((x) => x.merchant === v), v))));
+  t("Eating Out groups Swiggy and Zomato; Electricity holds BESCOM", () => { const e = alias("Eating Out"); assert(e.variants.some((v) => /^Swiggy/.test(v)) && e.variants.includes("Zomato")); assert(alias("Electricity")); });
+  t("no Subscriptions group exists (library under revision); Netflix stays ungrouped", () => { assert(!full12.merchantAliases.some((a) => /subscri/i.test(a.canonical))); assert(!full12.merchantAliases.some((a) => a.variants.includes("Netflix"))); });
+  t("only Expense / Income merchants are grouped (Sub Category 2 does not exist for transfers)", () => full12.merchantAliases.forEach((a) => a.variants.forEach((v) => assert(["Expense", "Income"].includes(full12.transactions.find((x) => x.merchant === v).category)))));
+  t("a card answer saves a learned rule in the shape Review's bulk apply saves, and a group when the choice has one", () => {
+    const ate = labelStatementFull(win("2026-09-01"), engine, [{ key: "toit brewpub", label: "Eating out" }]);
+    const r = ate.rules[0]; assert(r && r.source === "learned" && r.pattern === "toit brewpub" && r.category === "Expense" && r.control === "Flexible" && r.subCategory === "Personal");
+    assert(ate.merchantAliases.find((a) => a.canonical === "Eating Out").variants.includes("Toit Brewpub"));
+  });
+  t("handles do not split a merchant: Zepto is one merchant, not 'zepto zepto axisbank'", () => assert(!full12.transactions.some((x) => /axisbank|hdfcbank/i.test(x.merchant))));
+  t("only one steady payment a month is Recurring: rent, EMI, Netflix, BESCOM are; Swiggy, Zepto, BigBasket, the maid are not", () => {
+    ["RENT", "NETFLIX", "BESCOM", "HOME LOAN"].forEach((k) => assert.strictEqual(find(twelve, k)[0].frequencyClass, "Recurring", k));
+    ["SWIGGY", "ZEPTO", "BIGBASKET", "R SHARMA"].forEach((k) => assert.strictEqual(find(twelve, k)[0].frequencyClass, "Irregular", k));
+  });
+  t("the bank account carries an opening balance worked back from the closing one (closing 1,86,000), so Cash Flow can show both", () => {
+    const sl = sliceDemoJourney(generateDemoData(), 3, {}, (rows, o) => labelStatementFull(rows, engine, [], o));
+    const bank = sl.accounts.find((a) => a.id === "acc_bank"); assert.strictEqual(bank.balanceHistory.length, 2);
+    const net = sl.transactions.filter((x) => x.accountId === "acc_bank").reduce((q, x) => q + (x.direction === "credit" ? x.amount : -x.amount), 0);
+    assert.strictEqual(Math.round(bank.balanceHistory[0].balance + net), 186000); assert(bank.balanceHistory[0].asOfDate < sl.transactions[0].date);
+  });
+  t("merchant names set by the engine are locked so a reload cannot undo the group match", () => twelve.forEach((x) => assert(x.merchantLocked)));
+  t("a group answer on a known merchant (Netflix has none) puts it in that group and clears its card", () => {
+    const grp = "Entertainment";
+    const base = labelStatementFull(win("2025-10-01"), engine, []);
+    assert(!base.merchantAliases.some((a) => a.variants.includes("Netflix")));
+    const ans = labelStatementFull(win("2025-10-01"), engine, [{ key: "netflix", label: grp, patch: { category: "Expense", sub1: "Personal", control: "Flexible", group: grp, groupType: "category" } }]);
+    const a = ans.merchantAliases.find((x) => x.canonical === grp); assert(a && a.variants.includes("Netflix"));
+  });
+  console.log("\n" + pass + " passed");
+})().catch((e) => { console.error("FAIL", e.message); process.exit(1); });

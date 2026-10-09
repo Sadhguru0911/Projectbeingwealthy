@@ -1,0 +1,21 @@
+const path = require("path");
+(async () => {
+  const { findConflicts } = await import(path.join(__dirname, "conflicts.js"));
+  const { overlappingRules } = await import(path.join(__dirname, "ruleStats.js"));
+  let fail = 0; const eq = (l, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); if (!ok) fail++; console.log((ok ? "[PASS] " : "[FAIL] ") + l, ok ? "" : JSON.stringify(a) + " != " + JSON.stringify(b)); };
+  const r = (id, m, category, subCategory, date = "2026-09-01") => ({ id, merchant: m, category, subCategory, date });
+  const deps = { merchantKey: (t) => t.merchant };
+  const c = findConflicts([r(1, "A", "Expense", "Household"), r(2, "A", "Expense", "Personal", "2026-09-05"), r(3, "A", "Expense", "Personal"), r(4, "B", "Expense", "Household"), r(5, "B", "Expense", null)], deps);
+  eq("only merchant A conflicts", c.map((x) => x.key), ["A"]);
+  eq("options are ordered by how many rows back them", c[0].options.map((o) => o.subCategory + ":" + o.count), ["Personal:2", "Household:1"]);
+  eq("an unfinished row (no Sub Category 1) is not a competing answer", findConflicts([r(1, "B", "Expense", "Household"), r(2, "B", "Expense", null)], deps), []);
+  eq("different categories do conflict", findConflicts([r(1, "C", "Expense", "Household"), r(2, "C", "Income", "Others")], deps).length, 1);
+  const norm = (s) => s.toLowerCase(); const test = (tx, rule) => tx.includes(rule.pattern);
+  const rules = [{ id: "x", pattern: "mamata adak", category: "Expense", subCategory: "Household" }, { id: "y", pattern: "communite", category: "Expense", subCategory: "Personal" }, { id: "z", pattern: "adak", category: "Expense", subCategory: "Household" }];
+  const ov = overlappingRules(rules, [{ description: "UPI MAMATA ADAK communite" }, { description: "UPI MAMATA ADAK rent" }], { norm, test });
+  eq("rules that collide on a row and disagree are reported; agreeing ones are not", ov.map((o) => o.a.id + o.b.id + ":" + o.rows), ["xy:1", "yz:1"]);
+  eq("the colliding transactions are listed", ov[0].ids, [undefined]);
+  const kept = overlappingRules(rules.map((x) => (x.id === "x" ? { ...x, keepBoth: ["y"] } : x)), [{ description: "UPI MAMATA ADAK communite" }], { norm, test });
+  eq("a pair the person chose to keep both of is no longer reported", kept.map((o) => o.a.id + o.b.id), ["yz"]);
+  process.exit(fail ? 1 : 0);
+})();

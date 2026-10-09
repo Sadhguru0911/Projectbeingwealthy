@@ -17,10 +17,42 @@ import {
   Check, ChevronDown, Wallet, AlertCircle, RefreshCw, X, Sparkles, ClipboardPaste,
   TrendingUp, TrendingDown, Minus, Target, Merge, Sun, Moon, ArrowRight, ArrowDown,
   Repeat, Lightbulb, Landmark, LineChart as LineChartIcon, Flag, ChevronRight, ChevronUp,
-  Download, LayoutDashboard, Bell, Circle,
+  Download, LayoutDashboard, Bell, Circle, Home,
 } from "lucide-react";
 import { storage } from "./storage.js";
 import { renderPdfPagesAsImages, PAGE_BREAK_MARKER } from "./pdfExtract.js";
+// Merchant Library v2 (backlog #47): the 171 entries reviewed and staged from the
+// expanded workbook (v2 of the source spreadsheet - superseded v1's 160 after review;
+// see merchantLibrary.v2.js for what changed between them). Imported rather than
+// retyped into this file, so there is exactly one place those entries are transcribed
+// from source data - copying them a second time here would risk a silent
+// transcription mismatch between the two copies.
+import { MERCHANT_LIBRARY_V2 } from "./inference/merchantLibrary.v2.js";
+import { MERCHANT_LIBRARY_ADDITIONS } from "./inference/merchantLibrary.additions.js";
+import { rawBankRows, ASHA_HISTORY_END } from "./demo/ashaStatement.js";
+import { labelStatementFull } from "./demo/labelStatement.js";
+import { balancesFromList, looksLikeCard } from "./intake/csvGuess.js";
+import { generateDemoData } from "./demo/generateDemoData.js";
+import { sliceDemoJourney } from "./demo/sliceDemo.js";
+import { computeOnboardingResult, patchForAnswer, stripHandle, REPEAT_CADENCE, displayName, fmtDate as fmtDay, fmtMoney as fmtRupees, COMMITTED_GROUPS } from "./inference/onboardingResult.js";
+import { suggestGroup } from "./inference/groupSuggest.js";
+import { healGroups } from "./inference/groupRules.js";
+import { findConflicts } from "./inference/conflicts.js";
+import { buildNeedsYouCards } from "./inference/needsYou.js";
+import { payeeKey, migrateMerchantIdentity } from "./inference/merchantIdentity.js";
+import { aiKeyFor, counterpartyOf, AI_MERCHANT_PROMPT } from "./inference/aiMerchant.js";
+import { remarkOf, remarkTheme, remarkKeyOf, remarkRuleHits } from "./inference/remark.js";
+import { healTransactions } from "./inference/healRows.js";
+import { ruleMatchCounts, repairDeadRule, overlappingRules } from "./inference/ruleStats.js";
+import { isDemoActive, enterDemoMode, exitDemoMode } from "./demo/demoStorage.js";
+import { detectMissingObjects } from "./inference/missingObjects.js";
+import { fromKnowledgeItem, cashDipCandidate, cardBillDueCandidate, goalShortfallCandidate, selectHomeFeed } from "./inference/homeTrafficControl.js";
+import {
+  emptyStore as emptyKnowledgeStore, reconcileMissingObjects, dismissKnowledgeItem, snoozeKnowledgeItem, addPendingAccount, baselinePending, pendingOffers, confirmPendingAccount, declinePendingAccount, acceptConflict, isConflictAccepted,
+  pruneKnowledgeStore, activeKnowledgeItems,
+} from "./inference/knowledgeStore.js";
+import HomeScreen from "./home/HomeScreen.jsx";
+import OnboardingFlow, { HOUSE, PRIO, ReviewDeck } from "./onboarding/OnboardingFlow.jsx";
 
 /* ---------------------------------------------------------------------- */
 /* Licensing — signed license keys, verified entirely client-side via the  */
@@ -223,6 +255,49 @@ const PURPOSES = ["Personal", "Business"];
 const FREQUENCY_CLASSES = ["Recurring", "Irregular", "One-Time"];
 const CONTROLS = ["Committed", "Flexible"];
 
+/** Plain-language translation layer for the three categorization axes, plus
+ *  confidence. One shared source, so every screen that needs to describe these
+ *  values in words a non-savvy person can read (Review, Recurring Commitments, any
+ *  future onboarding summary) calls the same function rather than inventing its own
+ *  wording. Falls back to the raw internal value for anything unmapped, so a future
+ *  value added to FREQUENCY_CLASSES/CONTROLS never silently breaks a description
+ *  into blank text - worst case it shows the technical word until this table is
+ *  updated to include it. */
+const FREQUENCY_CLASS_PLAIN = {
+  Recurring: "Happens regularly",
+  Irregular: "Comes up now and then",
+  "One-Time": "Happened once so far",
+};
+const CONTROL_PLAIN = {
+  Committed: "A commitment you're keeping",
+  Flexible: "Something you could cut back",
+};
+const AMOUNT_BEHAVIOR_PLAIN = {
+  Fixed: "Usually about the same amount",
+  Variable: "The amount tends to vary",
+};
+const CONFIDENCE_PLAIN = {
+  High: "Well-established pattern",
+  Medium: "Still learning this pattern",
+  Low: "Not enough history yet",
+};
+
+/** Composes the full plain-language sentence for a transaction/commitment's
+ *  categorization - e.g. "Happens regularly · A commitment you're keeping · Usually
+ *  about the same amount". One-Time is deliberately a special case: forcing Control
+ *  and Amount Behaviour into a sentence about something that's only happened once
+ *  would describe a pattern that doesn't exist yet, so it gets its own honest,
+ *  shorter statement instead. Returns null (not a broken sentence) when there's no
+ *  frequencyClass at all - i.e. nothing to describe yet. */
+function describeFrequencyPattern({ frequencyClass, control, amountBehavior }) {
+  if (!frequencyClass) return null;
+  if (frequencyClass === "One-Time") return "Happened once so far - no pattern to describe yet";
+  const parts = [FREQUENCY_CLASS_PLAIN[frequencyClass] || frequencyClass];
+  if (control) parts.push(CONTROL_PLAIN[control] || control);
+  if (amountBehavior) parts.push(AMOUNT_BEHAVIOR_PLAIN[amountBehavior] || amountBehavior);
+  return parts.join(" \u00b7 ");
+}
+
 /** The valid subcategory options for a given top-level category, used to populate
  *  every subcategory dropdown in the app (Review tab, Rules tab, bulk actions) from
  *  one shared source rather than each UI surface hardcoding its own list. */
@@ -307,7 +382,7 @@ function migrateOne(t) {
  *  noise word to MERCHANT_STOPWORDS) retroactively corrects already-imported
  *  transactions' stored keys too, not just future imports. */
 function refreshMerchantKey(t) {
-  if (!t.description) return t;
+  if (!t.description || t.merchantLocked) return t; // a merchant name the engine set from the library / the person's answer must survive a reload, or its group stops matching
   const fresh = normalizeMerchant(t.description);
   return fresh === t.merchant ? t : { ...t, merchant: fresh };
 }
@@ -369,15 +444,43 @@ function linkableAccountTypesFor(category, subCategory) {
  *  transaction's category/subCategory/frequencyClass combination doesn't apply to
  *  (e.g. Control for Income, or Cadence for an Irregular expense) is never flagged for
  *  its absence - only fields that genuinely apply and are still empty count. */
-function isFullyCategorized(t) {
-  if (!t.category) return false;
-  if (subCategoryOptionsFor(t.category).length > 0 && !t.subCategory) return false;
-  if (!t.frequencyClass) return false;
-  if (isFrequencyEligible(t.frequencyClass) && !t.frequency) return false;
-  if (t.category === "Expense" && t.frequencyClass !== "One-Time" && !t.control) return false;
-  if (!t.purpose) return false;
-  if (linkableAccountTypesFor(t.category, t.subCategory).length > 0 && !t.linkedAccountId) return false;
-  return true;
+function missingFieldsOf(t, requireGroup) {
+  if (!t.category) return ["category"];
+  const m = [];
+  if (subCategoryOptionsFor(t.category).length > 0 && !t.subCategory) m.push("subCategory");
+  // Sub Category 2 (the merchant group): a merchant with no group is not finished, and nothing fills "Others" in for it. Only Expense and Income have one.
+  if (requireGroup && (t.category === "Expense" || t.category === "Income") && !t.group) m.push("group");
+  if (!t.frequencyClass) m.push("frequencyClass");
+  if (isFrequencyEligible(t.frequencyClass) && !t.frequency) m.push("frequency");
+  if (t.category === "Expense" && t.frequencyClass !== "One-Time" && !t.control) m.push("control");
+  if (!t.purpose) m.push("purpose");
+  if (linkableAccountTypesFor(t.category, t.subCategory).length > 0 && !t.linkedAccountId) m.push("linkedAccountId");
+  return m;
+}
+function isFullyCategorized(t, groupMap) {
+  return missingWithGroup(t, groupMap).length === 0;
+}
+/** variant (the merchant text a group holds) -> group name, for every group; the cheap way to ask "which group is this row in?". */
+function buildGroupMap(merchantAliases) {
+  const m = new Map();
+  (merchantAliases || []).forEach((g) => g.variants.forEach((v) => m.set(v, g.canonical)));
+  return m;
+}
+function groupOfRow(t, groupMap) { return groupMap ? groupMap.get(t.merchant || t.description) || null : null; }
+/** What is missing from a stored row, counting its merchant group. The demo is exempt (its own deck asks for groups by its own script). */
+function missingWithGroup(t, groupMap) { return missingFieldsOf({ ...t, group: groupOfRow(t, groupMap) }, !isDemoActive()); }
+/** The choices the review cards offer for one missing field, given what is already chosen for the merchant. */
+function needsYouOptions(field, sim, accounts, groupNames = []) {
+  const plain = (list, map) => list.map((v) => ({ value: v, label: (map && map[v]) || v }));
+  if (field === "category") return plain(CATEGORIES);
+  if (field === "subCategory") return plain(subCategoryOptionsFor(sim.category));
+  if (field === "group") { const names = groupNames.filter((g) => !/^others?$/i.test(g)); return plain([...names, "Others"]); }
+  if (field === "frequencyClass") return plain(FREQUENCY_CLASSES, FREQUENCY_CLASS_PLAIN);
+  if (field === "frequency") return plain(FREQUENCIES);
+  if (field === "control") return plain(CONTROLS, CONTROL_PLAIN);
+  if (field === "purpose") return plain(PURPOSES);
+  if (field === "linkedAccountId") { const types = linkableAccountTypesFor(sim.category, sim.subCategory); return accounts.filter((a) => types.includes(a.type)).map((a) => ({ value: a.id, label: a.nickname })); }
+  return [];
 }
 
 /** Concatenates every field worth searching on a transaction into one lowercase
@@ -520,14 +623,22 @@ function learnRecurringDay(dates, { domTolerance = 2, confidenceThreshold = 0.7 
  *  displayed together under a "Subscriptions" group; combining genuinely different
  *  things would fabricate a meaningless pattern from their unrelated dates. Shared
  *  by computeRecurringCommitments and computeAmountBehaviors so the two can never
- *  silently disagree about what counts as "the same commitment". */
+ *  silently disagree about what counts as "the same commitment". Category is
+ *  appended to every branch's key below - two transactions sharing a merchant name,
+ *  linked account, or matched rule are still only treated as the same commitment if
+ *  they ALSO agree on category. Without this, a merchant name shared across
+ *  different transaction kinds (a Zerodha brokerage fee categorized Expense, and a
+ *  Zerodha SIP debit categorized Investment) would silently blend into one
+ *  commitment: the displayed category would be whichever transaction happens to be
+ *  most recent, and the learned pattern would mix dates that don't actually belong
+ *  to the same real-world thing. */
 function commitmentGroupKey(t, merchantAliases = []) {
-  if (t.linkedAccountId) return `acct:${t.linkedAccountId}`;
+  if (t.linkedAccountId) return `acct:${t.linkedAccountId}:${t.category}`;
   const raw = t.merchant || t.description;
   const sameCommitmentGroup = merchantAliases.find((g) => g.type === "sameCommitment" && g.variants.includes(raw));
-  if (sameCommitmentGroup) return `group:${sameCommitmentGroup.id}`;
-  if (t.matchedRuleId) return `rule:${t.matchedRuleId}`;
-  return `merchant:${raw}`;
+  if (sameCommitmentGroup) return `group:${sameCommitmentGroup.id}:${t.category}`;
+  if (t.matchedRuleId) return `rule:${t.matchedRuleId}:${t.category}`;
+  return `merchant:${raw}:${t.category}`;
 }
 
 /** The Forecasting Engine's grouping key - deliberately coarser than
@@ -1738,6 +1849,13 @@ const DEBIT_ALIASES = ["debit", "withdrawal", "dr", "debit amount", "withdrawal 
 const CREDIT_ALIASES = ["credit", "deposit", "cr", "credit amount", "deposit amt"];
 const AMOUNT_ALIASES = ["amount", "transaction amount", "amt"];
 const TYPE_ALIASES = ["type", "dr/cr", "transaction type", "cr/dr"];
+const BALANCE_ALIASES = ["balance", "closing balance", "running balance", "available balance", "balance amt", "balance (inr)"];
+/** A bank name from a statement's file name (HDFC_Apr.csv -> HDFC Bank), for an account the statement itself does not name. */
+function guessInstitutionFromFile(name, isCard) {
+  const f = String(name || "").toLowerCase();
+  const hit = INSTITUTION_PRESETS.find((p) => { const w = p.toLowerCase().split(/[^a-z]+/).find((x) => x.length >= 3); return w && f.includes(w); });
+  return hit || (isCard ? "My credit card" : "My bank account");
+}
 
 const uid = (p = "id") => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -1766,6 +1884,23 @@ const shortDateLabel = (dateStr) => {
  *  "Transaction  Date" and "transaction date" match the same alias. */
 function normalizeHeader(h) {
   return (h || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Bug #48's fix, extended here after a systematic sweep for the same risk class:
+ *  short CSV-header aliases ("cr", "dr" - 2 characters, from CREDIT_ALIASES /
+ *  DEBIT_ALIASES) matched as a plain substring anywhere in a header cell.
+ *  "Description" contains "cr" (des-CR-iption) - confirmed live before this fix:
+ *  guessColumn(headers, CREDIT_ALIASES) would suggest a "Description" column as the
+ *  credit-amount column whenever no header more literally says "credit"/"deposit".
+ *  normalizeHeader (above) is deliberately lighter than normalizeForMatch - it keeps
+ *  punctuation, isn't uppercased - so this reuses the same SHORT_PATTERN_LENGTH
+ *  threshold but via a regex word-boundary test rather than token-splitting, since a
+ *  header can legitimately contain punctuation immediately next to the alias (e.g.
+ *  "Debit Amt.") that a naive space-split wouldn't treat as a boundary. */
+function headerAliasMatches(normalizedHeader, alias) {
+  if (alias.length > SHORT_PATTERN_LENGTH) return normalizedHeader.includes(alias);
+  const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("\\b" + escaped + "\\b").test(normalizedHeader);
 }
 
 const ALL_ALIASES = [...DATE_ALIASES, ...DESC_ALIASES, ...DEBIT_ALIASES, ...CREDIT_ALIASES, ...AMOUNT_ALIASES, ...TYPE_ALIASES];
@@ -1854,7 +1989,7 @@ function detectHeaderRow(rawRows, maxScan = 20) {
     let score = 0;
     cells.forEach((c) => {
       if (!c) return;
-      if (ALL_ALIASES.some((a) => c === a || c.includes(a))) score += 2;
+      if (ALL_ALIASES.some((a) => c === a || headerAliasMatches(c, a))) score += 2;
     });
     // a real header row also tends to have several non-empty, mostly short cells
     const nonEmpty = cells.filter(Boolean).length;
@@ -1883,7 +2018,7 @@ function guessColumn(headers, aliases) {
     if (idx !== -1) return headers[idx];
   }
   for (const alias of aliases) {
-    const idx = norm.findIndex((h) => h.includes(alias));
+    const idx = norm.findIndex((h) => headerAliasMatches(h, alias));
     if (idx !== -1) return headers[idx];
   }
   return "";
@@ -1946,6 +2081,14 @@ function parseDateStr(v) {
   return s;
 }
 
+/** One-time move of stored merchant names to the payee identity (rows and merchant groups together). */
+function migrateIdentity(txs, aliases) {
+  return migrateMerchantIdentity(txs, aliases, {
+    legacyKey: legacyNormalizeMerchant, newKey: payeeKey,
+    legacyName: (d) => displayName(legacyNormalizeMerchant(stripHandle(d))), newName: (d) => displayName(normalizeMerchant(stripHandle(d))),
+  });
+}
+
 /** Collapses a transaction description down to a short, mergeable "merchant key" -
  *  the first three MEANINGFUL cleaned-up words (digits and punctuation already
  *  stripped by normalizeForMatch), e.g. "UPI/SWIGGY/419803038/BILL" becomes "SWIGGY".
@@ -1959,6 +2102,10 @@ function parseDateStr(v) {
  *  together in the Review tab and merchant-based reports, rather than every
  *  transaction reference number producing its own unique, ungroupable row. */
 function normalizeMerchant(desc) {
+  return payeeKey(desc) || legacyNormalizeMerchant(desc); // a line that marks its payee is identified by the payee (backlog #126); anything else keeps the older way
+}
+/** The "first three meaningful words" key used before payee identity existed, still used for lines whose payee is not marked. */
+function legacyNormalizeMerchant(desc) {
   const cleaned = normalizeForMatch(desc);
   const tokens = cleaned.split(" ").filter(Boolean).filter((t) => !MERCHANT_STOPWORDS.has(t));
   const meaningful = tokens.length ? tokens : cleaned.split(" ").filter(Boolean);
@@ -1968,6 +2115,59 @@ function normalizeMerchant(desc) {
 // Same cleanup as normalizeMerchant (strip digits/punctuation, collapse whitespace) but
 // without truncating to 3 words — used for rule matching, where the pattern needs to be
 // tested against the FULL description, not just its first few tokens.
+/** Common Indian card issuer names, matched against a Debt Payment transaction's own
+ *  raw text when no account is linked - the middle tier of the three described
+ *  below. Deliberately not exhaustive; anything unmatched correctly falls through to
+ *  the honest generic label rather than a wrong guess. */
+const CARD_ISSUER_PATTERNS = [
+  { pattern: "SBI CARD", name: "SBI Card" },
+  { pattern: "HDFC", name: "HDFC" },
+  { pattern: "ICICI", name: "ICICI" },
+  { pattern: "AXIS", name: "Axis" },
+  { pattern: "AMERICAN EXPRESS", name: "Amex" },
+  { pattern: "AMEX", name: "Amex" },
+  { pattern: "KOTAK", name: "Kotak" },
+  { pattern: "SCAPIA", name: "Scapia" },
+  { pattern: "RBL", name: "RBL" },
+  { pattern: "IDFC", name: "IDFC" },
+  { pattern: "YES BANK", name: "Yes Bank" },
+  { pattern: "INDUSIND", name: "IndusInd" },
+  { pattern: "STANDARD CHARTERED", name: "Standard Chartered" },
+  { pattern: "CITI", name: "Citi" },
+  // CRED is a PAYMENT APP that can settle any card, not a card issuer itself -
+  // flagged `isIntermediary` so missing-object detection (backlog #60) never
+  // claims "you appear to have a CRED account" (there is no such real,
+  // addable account) and instead asks the honest, generic question: a
+  // recurring card-like payment exists, but which card can't be confidently
+  // named from this evidence alone.
+  { pattern: "CRED", name: "CRED", isIntermediary: true },
+  { pattern: "ONECARD", name: "OneCard" },
+  { pattern: "SLICE", name: "Slice" },
+];
+
+/** Three-tier Debt Payment label, per the confirmed spec: (1) linked account - use
+ *  its own nickname, fully trustworthy; (2) no link, but the transaction's own text
+ *  names a known issuer - surfaced as an unconfirmed guess (caller should style this
+ *  with the existing "suggested" dashed treatment, not presented with tier-1
+ *  confidence); (3) nothing specific - the honest, accurate generic label, never a
+ *  guessed-at wrong issuer. Computed fresh from current state every call, never
+ *  stored - linkedAccountId can be added long after a transaction already exists,
+ *  same principle as merchantSubcategory. */
+function describeDebtPayment({ linkedAccountId, description, name }, getAccountName) {
+  if (linkedAccountId) {
+    const nickname = getAccountName ? getAccountName(linkedAccountId) : null;
+    if (nickname && nickname !== "—") return { label: `${nickname} Payment`, confirmed: true };
+  }
+  const text = normalizeForMatch(description || name || "");
+  // Bug #48's fix (see normalizedPatternMatches above): several of these patterns are
+  // short enough (RBL, CITI, AXIS, HDFC, AMEX, IDFC - all <= 4 chars) to risk the
+  // same false-positive-substring problem - e.g. "CITI" plainly matching inside
+  // "CITIZEN" under the old plain-substring approach.
+  const match = CARD_ISSUER_PATTERNS.find((p) => normalizedPatternMatches(text, normalizeForMatch(p.pattern)));
+  if (match) return { label: `${match.name}${match.name.includes("Card") ? "" : " Card"} Payment`, confirmed: false };
+  return { label: "Debt Payment", confirmed: false };
+}
+
 function normalizeForMatch(desc) {
   return (desc || "")
     .toUpperCase()
@@ -1975,6 +2175,43 @@ function normalizeForMatch(desc) {
     .replace(/[^A-Z& ]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Bug #48, found by the inference engine's accuracy measurement (src/inference/
+ *  measureAccuracy.cjs), confirmed live before this fix: matchRule and
+ *  findLibraryEntry both matched a pattern as a plain substring anywhere in the
+ *  normalized text, with no word-boundary awareness. A fictional "RAMESH TIFFIN
+ *  SERVICE" was misidentified as a Vodafone Idea bill, because "SERVICE" contains
+ *  the library's 2-character short pattern "VI" (ser-VI-ce). 13 patterns in the live
+ *  library are <=4 characters and share this risk (NPS, LIC, MGL, IGL, OLA, JIO, VI,
+ *  1MG, PW, MMT, OYO, KFC, H&M) - LIC plausibly matches inside "PUBLIC" by the same
+ *  mechanism, PW inside "PASSWORD"/"POWER", and so on.
+ *
+ *  The fix is deliberately narrow, not a blanket change to matching behaviour: only
+ *  SHORT patterns (<= SHORT_PATTERN_LENGTH characters) require a whole-token match;
+ *  every longer pattern keeps the exact substring behaviour it already had. This
+ *  matters because normalizeForMatch already strips every digit to a space before
+ *  matching (see above) - so what's left is purely space-separated letter tokens,
+ *  and a 6+ letter pattern essentially never collides with an unrelated word by
+ *  accident, while a 2-3 letter one routinely does. Applying whole-token matching
+ *  everywhere would risk silently breaking currently-correct matches for longer
+ *  patterns in ways that are hard to fully enumerate; applying it only where the
+ *  actual, confirmed risk lives keeps the fix's blast radius matched to its cause.
+ *  Regression-verified against every pattern in the live library and every rule
+ *  before this shipped - see the change log / commit for that verification. */
+const SHORT_PATTERN_LENGTH = 4;
+function normalizedPatternMatches(normalizedText, normalizedPattern) {
+  if (!normalizedPattern) return false;
+  if (normalizedPattern.length > SHORT_PATTERN_LENGTH || normalizedPattern.includes(" ")) {
+    // Long, or already a multi-word phrase (space-containing patterns are never in
+    // the short/risky set in practice, and a phrase match is its own natural
+    // boundary) - unchanged substring behaviour.
+    return normalizedText.includes(normalizedPattern);
+  }
+  // Short single-word pattern: require it to match a WHOLE token (space-delimited,
+  // since normalizeForMatch never leaves anything else), not just appear inside one.
+  const tokens = normalizedText.split(" ");
+  return tokens.includes(normalizedPattern);
 }
 
 /** Standard median of a numeric array - used instead of the average for suggested
@@ -3229,7 +3466,7 @@ async function callPersonaAnalysis(apiKey, aiModel, persona, resolvedQuestion, d
   const schema = persona === "cfo" ? CFO_RESPONSE_SCHEMA : ANALYST_RESPONSE_SCHEMA;
   const preamble = persona === "cfo"
     ? [
-        "You are the user's Personal CFO — decision-support, not an autonomous decision-maker.",
+        "You are the user's Money Coach (CFO-level insight, in plain language) — decision-support, not an autonomous decision-maker.",
         "Base every number in your answer STRICTLY on the data provided below. Never compute, estimate, or",
         "invent a number yourself — every figure you cite must come directly from that data.",
         "Present trade-offs and options rather than a directive verdict. Distinguish affordability from",
@@ -3365,16 +3602,110 @@ function resolveMerchant(rawKey, aliases) {
  *  its other uses, like top-merchant lists), this specifically returns "Other" when
  *  a transaction's merchant doesn't belong to any group yet. "Other" is permanently
  *  reserved - no group can ever be named it (enforced in Merchant Groups' own
- *  creation/rename UI), so this fallback can never collide with a real group. */
+ *  creation/rename UI), so this fallback can never collide with a real group.
+ *  Only matches for Expense/Income transactions - the same boundary the group-
+ *  creation picker already enforces (Investment and Transfer transactions are never
+ *  offered as group candidates in the first place, since their identity is meant to
+ *  be tracked via linkedAccountId, not merchant text). Without this check, a
+ *  transaction later recategorized away from Expense/Income would keep showing a
+ *  stale group label indefinitely, since group membership is matched by raw text
+ *  alone with no per-transaction expiry or re-check. */
 function merchantSubcategory(t, merchantAliases) {
   const rawKey = t.merchant || t.description;
   if (!rawKey) return "Other";
+  if (t.category !== "Expense" && t.category !== "Income") return "Other";
   const group = (merchantAliases || []).find((g) => g.variants.includes(rawKey));
   return group ? group.canonical : "Other";
 }
 
 /** Cluster not-yet-grouped merchant strings that share the same "core" signature once
  *  generic banking noise words (UPI, TECHNOLOGY, LTD, ...) are stripped out. */
+/** Brand-knowledge library: raw bank/UPI text patterns -> a suggested Category, Sub
+ *  Category 1, and merchant group, drawn from general knowledge of common Indian
+ *  merchants rather than anything learned from any person's own data. Deliberately
+ *  Expense-only (no Investment/Transfer entries) - Investment's "same real thing,
+ *  inconsistent text" case is better solved via rules, which already work
+ *  category-agnostically, than by extending merchant grouping into territory it
+ *  wasn't built for (see the Zomato/Grocery vs. Zerodha/Investment discussion this
+ *  library grew out of). Genuinely ambiguous bare brand names (Amazon, LIC) are
+ *  deliberately absent rather than guessed - same principle as the draft review
+ *  spreadsheet this was built from. Patterns are matched via normalizeForMatch
+ *  (uppercase, punctuation/digits stripped) against a transaction's raw text, the
+ *  same normalization rules already use. */
+const MERCHANT_LIBRARY = [
+  // A small number of original entries kept individually: every OTHER original
+  // entry's pattern+classification is now fully covered by the 171-entry set below
+  // (77 entries removed as pure duplication, verified: same category/sub/group, not
+  // just the same merchant name), but these 9 have at least one pattern - a shorter
+  // spelling, an alternate legal-entity name - that the new set does not include.
+  { patterns: ["SPENCERS RETAIL", "SPENCER"], merchantType: "Merchant", category: "Expense", sub: "Household", group: "Grocery", groupType: "category", identityConfidence: "High", classificationConfidence: "Medium" },
+  { patterns: ["TATA POWER", "TATAPOWER DDL"], merchantType: "Merchant", category: "Expense", sub: "Household", group: "Electricity", groupType: "category", identityConfidence: "High", classificationConfidence: "Medium" },
+  { patterns: ["EXCITEL"], merchantType: "Merchant", category: "Expense", sub: "Household", group: "Broadband/Internet", groupType: "category", identityConfidence: "High", classificationConfidence: "Medium" },
+  { patterns: ["OLACABS", "OLA CABS", "ANI TECHNOLOGIES"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Transport", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  { patterns: ["NYKAA", "FSN E COMMERCE"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Shopping", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  { patterns: ["TATA MG", "MG HEALTH"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Health & Pharmacy", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  { patterns: ["CULTFIT", "CURE FIT", "CULT FIT"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Fitness", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  { patterns: ["VISTARA", "TATA SIA"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Travel", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  { patterns: ["BOOKING COM"], merchantType: "Merchant", category: "Expense", sub: "Personal", group: "Travel", groupType: "category", identityConfidence: "High", classificationConfidence: "High" },
+  // The 171 reviewed entries from the expanded workbook (backlog #47) - see
+  // src/inference/merchantLibrary.v2.js for provenance and field meanings.
+  ...MERCHANT_LIBRARY_V2,
+  ...MERCHANT_LIBRARY_ADDITIONS,
+];
+
+/** Looks up a raw merchant/description string against the brand library, returning
+ *  its entry if a pattern matches, or null. Low-confidence entries are excluded
+ *  here entirely, not just at render time - a low-confidence guess should never
+ *  silently drive automatic grouping or pre-fill, only ever a person's own
+ *  deliberate choice. */
+/** Merchant Library v2 (backlog #47): entries now carry split identityConfidence /
+ *  classificationConfidence rather than one shared field. This function is used to
+ *  SUGGEST a category/sub/group - so it excludes exactly two cases where there is
+ *  nothing safe to suggest: classificationConfidence "Low" (matches the original,
+ *  pre-split behavior exactly - a low-confidence guess isn't worth offering), and
+ *  category === null (a handful of entries - LIC, general Amazon shopping,
+ *  Policybazaar - deliberately identify the merchant without guessing a category,
+ *  since the true answer depends on the specific transaction, not the brand; see
+ *  merchantLibrary.v2.js for why). A null-category entry is a genuinely different,
+ *  useful signal ("we know who this is, just not what it should be categorized as")
+ *  from "no match at all" - but no caller of this function yet does anything with an
+ *  identity-only match, so returning null for it here is the honest choice today,
+ *  not a data limitation. Revisit if/when a caller is built that can use it. */
+function findLibraryEntry(rawText) {
+  const norm = normalizeForMatch(rawText);
+  if (!norm) return null;
+  return MERCHANT_LIBRARY.find((entry) =>
+    entry.category != null && entry.classificationConfidence !== "Low" &&
+    entry.patterns.some((p) => normalizedPatternMatches(norm, normalizeForMatch(p)))
+  ) || null;
+}
+
+/** Library-aware companion to computeSuggestedMerchantClusters below - catches the
+ *  case plain text-matching structurally cannot: merchants that share zero text in
+ *  common (Zepto and Blinkit) but are known, from brand knowledge, to belong to the
+ *  same real-world group. Only ever surfaces a cluster the person can accept or
+ *  ignore - never creates or applies anything on its own. Already-grouped merchants
+ *  are skipped, same as the text-based version. */
+function computeLibrarySuggestedClusters(transactions, aliases) {
+  const alreadyGrouped = new Set();
+  (aliases || []).forEach((g) => g.variants.forEach((v) => alreadyGrouped.add(v)));
+
+  const byGroup = {};
+  transactions.forEach((t) => {
+    if (t.category !== "Expense" && t.category !== "Income") return;
+    const key = t.merchant || t.description;
+    if (!key || alreadyGrouped.has(key)) return;
+    const entry = findLibraryEntry(key);
+    if (!entry || !entry.group) return;
+    if (!byGroup[entry.group]) byGroup[entry.group] = { group: entry.group, groupType: entry.groupType, seenKeys: new Set(), variants: [] };
+    if (byGroup[entry.group].seenKeys.has(key)) return;
+    byGroup[entry.group].seenKeys.add(key);
+    byGroup[entry.group].variants.push({ key });
+  });
+
+  return Object.values(byGroup).filter((g) => g.variants.length > 1);
+}
+
 function computeSuggestedMerchantClusters(transactions, aliases) {
   const alreadyGrouped = new Set();
   (aliases || []).forEach((g) => g.variants.forEach((v) => alreadyGrouped.add(v)));
@@ -3410,90 +3741,13 @@ function computeSuggestedMerchantClusters(transactions, aliases) {
     .sort((a, b) => b.variants.length - a.variants.length);
 }
 
-/** The starter categorization rules every new install begins with - common merchant/
- *  keyword patterns mapped to a sensible default category, so a first import isn't
- *  entirely uncategorized. These are "system" source rules, lowest priority tier
- *  (priority = pattern length, same as any other rule) - a user-added or learned rule
- *  with the same or a more specific pattern always wins a tie via matchRule's sort. */
+/** There are no starter rules any more: the merchant library covers merchants, and what a person teaches the app (their own and learned rules)
+ *  is all that is left. Kept as a function because the engine and the restore paths still ask for "the rules to begin with". */
 function seedRules() {
-  // [pattern, category, subCategory, tag, frequencyClass, control]
-  const seed = [
-    ["salary", "Income", null, null, "Recurring", null],
-    ["interest cr", "Income", "Interest", null, "Recurring", null],
-    ["dividend", "Income", null, null, "Recurring", null],
-    ["refund", "Income", null, null, "Irregular", null],
-    ["sip", "Investment", "Add", null, "Recurring", null],
-    ["mutual fund", "Investment", "Add", null, "Recurring", null],
-    ["zerodha", "Investment", "Add", null, "Recurring", null],
-    ["groww", "Investment", "Add", null, "Recurring", null],
-    ["coin ", "Investment", "Add", null, "Recurring", null],
-    ["nps", "Investment", "Add", null, "Recurring", null],
-    ["rd installment", "Investment", "Add", null, "Recurring", null],
-    ["fd deposit", "Investment", "Add", null, "One-Time", null],
-    // Fixed/Variable no longer exist as an Expense subCategory - that meaning now
-    // lives in frequencyClass (Recurring/Irregular). Expense keeps only tag
-    // (Household/Personal); subCategory stays null for every Expense row here.
-    ["rent", "Expense", null, "Household", "Recurring", "Committed"],
-    ["emi", "Expense", null, "Personal", "Recurring", "Committed"],
-    ["loan", "Expense", null, "Personal", "Recurring", "Committed"],
-    ["insurance", "Expense", null, "Personal", "Recurring", "Committed"],
-    ["premium", "Expense", null, "Personal", "Recurring", "Committed"],
-    ["electricity", "Expense", null, "Household", "Recurring", "Committed"],
-    ["water bill", "Expense", null, "Household", "Recurring", "Committed"],
-    ["gas bill", "Expense", null, "Household", "Recurring", "Committed"],
-    ["broadband", "Expense", null, "Household", "Recurring", "Committed"],
-    ["wifi", "Expense", null, "Household", "Recurring", "Committed"],
-    ["netflix", "Expense", null, "Personal", "Recurring", "Flexible"],
-    ["spotify", "Expense", null, "Personal", "Recurring", "Flexible"],
-    ["prime video", "Expense", null, "Personal", "Recurring", "Flexible"],
-    ["hotstar", "Expense", null, "Personal", "Recurring", "Flexible"],
-    ["subscription", "Expense", null, "Personal", "Recurring", "Flexible"],
-    ["swiggy", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["zomato", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["restaurant", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["bigbasket", "Expense", null, "Household", "Irregular", "Flexible"],
-    ["dmart", "Expense", null, "Household", "Irregular", "Flexible"],
-    ["grocery", "Expense", null, "Household", "Irregular", "Flexible"],
-    ["supermarket", "Expense", null, "Household", "Irregular", "Flexible"],
-    ["amazon", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["flipkart", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["myntra", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["uber", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["ola", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["petrol", "Expense", null, "Personal", "Irregular", "Flexible"],
-    ["fuel", "Expense", null, "Personal", "Irregular", "Flexible"],
-    // "Credit card payment" is no longer its own subCategory - it's the same
-    // "Debt Payment" a loan EMI uses, distinguished by which account (a
-    // creditCard-type account vs a debt-type one) it links to, not by subCategory.
-    ["credit card payment", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
-    ["cc payment", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
-    // These specifically catch the payment-received line that appears ON a credit
-    // card's OWN statement (reducing what's owed) — the same real-world payment
-    // already captured as a debit on the bank side. Tagging it as Transfer here (never
-    // Expense) matters: if it were miscategorized as Expense, its credit direction
-    // would silently subtract from that statement's reported total, understating actual
-    // spending. It's already excluded from every calculation regardless of subcategory
-    // (transactions on a card account never count toward the equation's Transfer total,
-    // and only Expense-tagged rows count toward a statement's spend total) — this just
-    // keeps it out of Uncategorized and away from ever being tagged Expense by mistake.
-    ["payment received", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
-    ["payment recvd", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
-    ["autopay", "Transfer", "Debt Payment", null, "Recurring", "Committed"],
-    ["self transfer", "Transfer", "Self", null, "Irregular", null],
-    ["own account", "Transfer", "Self", null, "Irregular", null],
-  ];
-  return seed.map(([pattern, category, subCategory, tag, frequencyClass, control]) => ({
-    id: uid("rule"),
-    pattern,
-    category,
-    subCategory,
-    tag,
-    frequencyClass,
-    control,
-    source: "system",
-    priority: pattern.length,
-  }));
+  return [];
 }
+/** Rules saved by older versions include the starter set (source "system"); they are dropped wherever rules are loaded or restored. */
+const withoutStarterRules = (rs) => (rs || []).filter((r) => r.source !== "system");
 
 /** Finds the best-matching categorization rule for a transaction description, or null
  *  if nothing matches. "Best" means highest priority among all rules whose pattern
@@ -3509,7 +3763,11 @@ function matchRule(description, rules) {
   // any already-stored rule.
   const d = normalizeForMatch(description);
   const sorted = [...rules].sort((a, b) => b.priority - a.priority);
-  return sorted.find((r) => d.includes(normalizeForMatch(r.pattern))) || null;
+  return sorted.find((r) => ruleTest(d, r, description)) || null;
+}
+/** One rule against one line: a remark rule reads only the remark's words (#166); every other rule is the pattern against the whole normalised line. */
+function ruleTest(normalizedText, rule, rawDescription) {
+  return rule.scope === "remark" ? remarkRuleHits(rule, rawDescription) : normalizedPatternMatches(normalizedText, normalizeForMatch(rule.pattern));
 }
 
 const TRANSFER_MATCH_WINDOW_DAYS = 3; // real-world posting delay between two sides of a transfer
@@ -3588,6 +3846,10 @@ function pillClass(category, subCategory, frequencyClass) {
 /* Storage helpers — genuinely local, browser localStorage on this device */
 /* ---------------------------------------------------------------------- */
 
+// Migration-plan Phase 0 (backlog #45). Bumped only when a real, intentional migration
+// is added that needs to run once and then be skippable — not on every unrelated change.
+const CURRENT_SCHEMA_VERSION = 1;
+
 async function loadState(key, fallback) {
   try {
     const res = await storage.get(key);
@@ -3656,319 +3918,29 @@ async function clearBackupFolderHandle() {
 /* progress) — nothing here is an invented metric.                        */
 /* ---------------------------------------------------------------------- */
 
-/** The marketing landing page shown before the person enters the app proper - static
- *  content and its own scoped CSS (the lp- prefix keeps every style local to this
- *  page, so nothing here can leak into or collide with the main app's own styling).
- *  onGetStarted is the single action: dismiss this page and move into the real app. */
-function LandingPage({ onGetStarted }) {
-  return (
-    <div className="lp-root">
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
-        .lp-root {
-          --lp-paper: #ECE7DA; --lp-card: #F9F7F1; --lp-ink: #21262B; --lp-ink-soft: #55606B;
-          --lp-line: #CBC2AC; --lp-teal: #2E6659; --lp-rust: #9C4A34;
-          background: var(--lp-paper);
-          background-image: repeating-linear-gradient(to bottom, rgba(85,96,107,0.05) 0px, rgba(85,96,107,0.05) 1px, transparent 1px, transparent 34px);
-          color: var(--lp-ink); font-family: 'IBM Plex Sans', sans-serif; -webkit-font-smoothing: antialiased;
-          min-height: 100vh;
-        }
-        .lp-shell { max-width: 900px; margin: 0 auto; padding: 0 24px; }
-        .lp-section { padding: 90px 0; }
-        .lp-hr { border: none; border-top: 1px solid var(--lp-line); margin: 0; }
-        .lp-hero { text-align: center; padding: 80px 0 60px; }
-        .lp-wordmark { font-family: 'Fraunces', serif; font-weight: 600; font-size: 22px; letter-spacing: -0.01em; color: var(--lp-ink-soft); margin-bottom: 40px; }
-        .lp-wordmark em { font-style: italic; color: var(--lp-teal); font-weight: 500; }
-        .lp-hero h1 { font-family: 'Fraunces', serif; font-weight: 500; font-size: 54px; line-height: 1.15; margin: 0 0 24px; letter-spacing: -0.015em; }
-        .lp-hero .lp-sub { font-size: 16.5px; color: var(--lp-ink-soft); max-width: 480px; margin: 0 auto 34px; line-height: 1.6; }
-        .lp-cta {
-          font-family: 'IBM Plex Sans', sans-serif; font-size: 14.5px; font-weight: 600; padding: 13px 30px; border-radius: 4px;
-          border: 1px solid var(--lp-ink); background: var(--lp-ink); color: var(--lp-card); cursor: pointer; display: inline-block;
-          text-decoration: none; transition: background 0.15s, border-color 0.15s;
-        }
-        .lp-cta:hover { background: var(--lp-teal); border-color: var(--lp-teal); }
-        .lp-privacy-line { font-size: 12px; color: var(--lp-ink-soft); margin-top: 16px; letter-spacing: 0.01em; }
-        .lp-path-strip {
-          display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin: 44px 0 8px;
-          font-family: 'IBM Plex Mono', monospace; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--lp-ink-soft);
-        }
-        .lp-path-strip .lp-step { padding: 5px 2px; }
-        .lp-path-strip .lp-step.lp-final { color: var(--lp-teal); font-weight: 600; }
-        .lp-path-strip .lp-arrow { color: var(--lp-line); font-size: 13px; }
-        .lp-mockup-frame { margin-top: 56px; }
-        .lp-mockup-card { background: var(--lp-card); border: 1px solid var(--lp-line); border-radius: 8px; padding: 24px 26px; text-align: left; max-width: 560px; margin: 0 auto; }
-        .lp-mockup-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-ink-soft); margin-bottom: 14px; }
-        .lp-mockup-hr { border: none; border-top: 1px solid var(--lp-line); margin: 16px 0; }
-        .lp-row { display: flex; justify-content: space-between; align-items: baseline; padding: 7px 0; font-size: 13.5px; }
-        .lp-row .lp-k { color: var(--lp-ink-soft); }
-        .lp-row .lp-v { font-family: 'IBM Plex Mono', monospace; font-weight: 500; }
-        .lp-rate-tag { font-size: 11px; color: var(--lp-ink-soft); margin-left: 8px; }
-        .lp-nw-headline { text-align: center; padding: 6px 0 18px; }
-        .lp-nw-headline .lp-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-ink-soft); }
-        .lp-nw-headline .lp-value { font-family: 'IBM Plex Mono', monospace; font-size: 34px; font-weight: 600; margin-top: 4px; }
-        .lp-story { text-align: center; }
-        .lp-story .lp-num { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--lp-ink-soft); letter-spacing: 0.04em; margin-bottom: 14px; }
-        .lp-story h2 { font-family: 'Fraunces', serif; font-weight: 500; font-size: 30px; margin: 0 0 16px; line-height: 1.3; max-width: 560px; margin-left: auto; margin-right: auto; }
-        .lp-story p { font-size: 15px; color: var(--lp-ink-soft); max-width: 480px; margin: 0 auto 14px; line-height: 1.65; }
-        .lp-story p:last-of-type { margin-bottom: 0; }
-        .lp-privacy-subhead { font-family: 'Fraunces', serif; font-style: italic; font-size: 16px; color: var(--lp-teal); margin: 0 0 20px; }
-        .lp-insight-line { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; font-size: 13px; text-align: left; border-bottom: 1px solid var(--lp-line); }
-        .lp-insight-line:last-child { border-bottom: none; }
-        .lp-insight-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; flex-shrink: 0; background: var(--lp-rust); }
-        .lp-cfo-q { font-family: 'Fraunces', serif; font-style: italic; font-size: 16px; color: var(--lp-ink); text-align: left; margin-bottom: 16px; }
-        .lp-cfo-a-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-teal); font-weight: 600; margin-bottom: 6px; text-align: left; }
-        .lp-cfo-a-text { font-size: 13.5px; text-align: left; line-height: 1.6; color: var(--lp-ink); }
-        .lp-flow { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 40px 0 20px; flex-wrap: wrap; }
-        .lp-flow-box { border: 1px solid var(--lp-line); border-radius: 6px; padding: 16px 22px; background: var(--lp-card); font-size: 13px; font-weight: 500; min-width: 140px; text-align: center; }
-        .lp-flow-arrow { color: var(--lp-ink-soft); font-size: 18px; }
-        .lp-flow-caption { text-align: center; font-size: 12px; color: var(--lp-ink-soft); margin-top: 4px; font-style: italic; }
-        .lp-howitworks-list { max-width: 560px; margin: 40px auto 0; text-align: left; }
-        .lp-howitworks-item { display: flex; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--lp-line); }
-        .lp-howitworks-item:last-child { border-bottom: none; }
-        .lp-howitworks-num {
-          font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--lp-teal); font-weight: 600;
-          width: 26px; flex-shrink: 0; padding-top: 2px;
-        }
-        .lp-howitworks-title { font-family: 'Fraunces', serif; font-weight: 600; font-size: 16px; margin-bottom: 4px; }
-        .lp-howitworks-desc { font-size: 13.5px; color: var(--lp-ink-soft); line-height: 1.6; }
-        .lp-pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 44px; text-align: left; }
-        .lp-pricing-card { border: 1px solid var(--lp-line); border-radius: 8px; padding: 24px 20px; background: var(--lp-card); }
-        .lp-pricing-card.featured { background: var(--lp-ink); border-color: var(--lp-teal); }
-        .lp-pricing-badge { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--lp-teal); font-weight: 600; margin-bottom: 10px; }
-        .lp-pricing-name { font-family: 'Fraunces', serif; font-weight: 600; font-size: 17px; color: var(--lp-ink); margin-bottom: 6px; }
-        .lp-pricing-card.featured .lp-pricing-name { color: var(--lp-card); }
-        .lp-pricing-price { font-family: 'Fraunces', serif; font-weight: 600; font-size: 28px; color: var(--lp-teal); margin-bottom: 2px; }
-        .lp-pricing-sub { font-size: 11.5px; font-style: italic; color: var(--lp-ink-soft); margin-bottom: 16px; }
-        .lp-pricing-card.featured .lp-pricing-sub { color: #9AA0A6; }
-        .lp-pricing-item { font-size: 12.5px; color: var(--lp-ink-soft); padding: 7px 0; border-bottom: 1px solid var(--lp-line); }
-        .lp-pricing-card.featured .lp-pricing-item { color: #C8CCD0; border-bottom-color: #3A424B; }
-        .lp-pricing-item:last-child { border-bottom: none; }
-        .lp-pricing-note { font-size: 11.5px; color: var(--lp-ink-soft); font-style: italic; margin-top: 18px; }
-        @media (max-width: 700px) { .lp-pricing-grid { grid-template-columns: 1fr; } }
-        .lp-footer { text-align: center; padding: 70px 0 90px; }
-        .lp-footer .lp-wordmark { margin-bottom: 10px; }
-        .lp-footer .lp-tagline { font-family: 'Fraunces', serif; font-style: italic; font-size: 15px; color: var(--lp-ink-soft); }
-        @media (max-width: 600px) {
-          .lp-hero h1 { font-size: 36px; }
-          .lp-story h2 { font-size: 24px; }
-          .lp-section { padding: 60px 0; }
-          .lp-flow { flex-direction: column; }
-          .lp-flow-arrow { transform: rotate(90deg); }
-        }
-      `}</style>
-
-      <div className="lp-shell">
-        <div className="lp-hero">
-          <div className="lp-wordmark">Being <em>Wealthy</em></div>
-          <h1>See your money clearly.</h1>
-          <p className="lp-sub">Your personal financial operating system — turning your cash flow, investments, debt, and net worth into one clear picture, so you always know what to do next.</p>
-          <button className="lp-cta" onClick={onGetStarted}>Get Started</button>
-          <div className="lp-privacy-line">Private by design · Local-first</div>
-
-          <div className="lp-path-strip">
-            <span className="lp-step">See</span><span className="lp-arrow">→</span>
-            <span className="lp-step">Understand</span><span className="lp-arrow">→</span>
-            <span className="lp-step">Decide</span><span className="lp-arrow">→</span>
-            <span className="lp-step lp-final">Wealth</span>
-          </div>
-
-          <div className="lp-mockup-frame">
-            <div className="lp-mockup-card">
-              <div className="lp-nw-headline">
-                <div className="lp-label">Net Worth</div>
-                <div className="lp-value">₹1.24 Cr</div>
-              </div>
-              <hr className="lp-mockup-hr" />
-              <div className="lp-mockup-label">Cash Flow · This Month</div>
-              <div className="lp-row"><span className="lp-k">Income</span><span className="lp-v">₹4.20L</span></div>
-              <div className="lp-row"><span className="lp-k">Expenses</span><span className="lp-v">₹1.85L</span></div>
-              <div className="lp-row"><span className="lp-k">Savings</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>₹2.35L <span className="lp-rate-tag">56% of income</span></span></div>
-              <hr className="lp-mockup-hr" />
-              <div className="lp-row"><span className="lp-k">Investments</span><span className="lp-v">₹38.4L</span></div>
-            </div>
-          </div>
-        </div>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <div className="lp-num">01 — See</div>
-          <h2>Everything you own.<br/>Everything you owe. One picture.</h2>
-          <p>Bank accounts, credit cards, investments, loans, and goals come together into one financial picture — always current, no spreadsheet upkeep.</p>
-          <div className="lp-mockup-frame">
-            <div className="lp-mockup-card">
-              <div className="lp-mockup-label">Net Worth</div>
-              <div className="lp-row"><span className="lp-k">Bank balances</span><span className="lp-v">₹6.10L</span></div>
-              <div className="lp-row"><span className="lp-k">Market-tracked investments</span><span className="lp-v">₹32.8L</span></div>
-              <div className="lp-row"><span className="lp-k">Other investments (PF, Gold, Property)</span><span className="lp-v">₹94.2L</span></div>
-              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Total assets</span><span className="lp-v">₹1.33 Cr</span></div>
-              <hr className="lp-mockup-hr" />
-              <div className="lp-row"><span className="lp-k">Credit cards owed</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹0.42L</span></div>
-              <div className="lp-row"><span className="lp-k">Loans outstanding</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹8.60L</span></div>
-              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Total liabilities</span><span className="lp-v" style={{ color: "var(--lp-rust)" }}>₹9.02L</span></div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <div className="lp-num">02 — Understand</div>
-          <h2>Don't just track your money.<br/>Understand it.</h2>
-          <p>Instead of endless transactions, Being Wealthy explains what's actually happening — grounded only in numbers you've entered, never a guess dressed up as an answer.</p>
-          <div className="lp-mockup-frame">
-            <div className="lp-mockup-card" style={{ textAlign: "left" }}>
-              <div className="lp-mockup-label">Insights · This Month</div>
-              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Savings rate dropped 8 points vs last month — 44% now vs 52%.</div>
-              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Household spend is up 32% vs last month — ₹18,400 vs ₹13,900.</div>
-              <div className="lp-insight-line"><span className="lp-insight-dot"></span>Investment rate is negative this month — you redeemed ₹20,000 more than you invested.</div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <div className="lp-num">03 — Decide</div>
-          <h2>The question isn't "what happened."<br/>It's "what should I do."</h2>
-          <p>Ask your Personal CFO the real question — afford this, invest or repay, which goal comes first — and get an answer traced back to your own numbers.</p>
-          <div className="lp-mockup-frame">
-            <div className="lp-mockup-card">
-              <div className="lp-cfo-q">"Can I afford a ₹6L car this year?"</div>
-              <div className="lp-cfo-a-label">Recommendation</div>
-              <div className="lp-cfo-a-text">Yes, comfortably. Based on your ₹2.35L average monthly savings and ₹8.4L in unallocated investments, a ₹6L purchase leaves your Emergency Fund and other goals untouched.</div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <div className="lp-num">04 — Wealth</div>
-          <h2>Then, watch it build.</h2>
-          <p>Every decision compounds. Track goals to completion, debt to zero, and net worth as it actually moves — not a projection, your real numbers, month after month.</p>
-          <div className="lp-mockup-frame">
-            <div className="lp-mockup-card" style={{ textAlign: "left" }}>
-              <div className="lp-mockup-label">Goals</div>
-              <div className="lp-row"><span className="lp-k">Emergency Fund</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>100% funded</span></div>
-              <div className="lp-row"><span className="lp-k">House Down Payment</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>62% funded</span></div>
-              <div className="lp-row"><span className="lp-k">Retirement</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>On track</span></div>
-              <hr className="lp-mockup-hr" />
-              <div className="lp-row"><span className="lp-k">Net Worth, 12 months ago</span><span className="lp-v">₹94.6L</span></div>
-              <div className="lp-row" style={{ fontWeight: 600 }}><span className="lp-k">Net Worth, today</span><span className="lp-v" style={{ color: "var(--lp-teal)" }}>₹1.24 Cr</span></div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <h2>How Being Wealthy works.</h2>
-          <p>No manual entry, no spreadsheets to maintain — four steps, and the rest keeps itself current.</p>
-          <div className="lp-howitworks-list">
-            <div className="lp-howitworks-item">
-              <div className="lp-howitworks-num">01</div>
-              <div>
-                <div className="lp-howitworks-title">Bring in your data</div>
-                <div className="lp-howitworks-desc">Upload a bank statement, investment holdings, or a loan schedule — PDF, CSV, or Excel. Being Wealthy figures out what it is and reads it for you.</div>
-              </div>
-            </div>
-            <div className="lp-howitworks-item">
-              <div className="lp-howitworks-num">02</div>
-              <div>
-                <div className="lp-howitworks-title">Make sure it's right</div>
-                <div className="lp-howitworks-desc">Review what got categorized, correct anything that's off, and it remembers your corrections as rules — so next month needs far less review.</div>
-              </div>
-            </div>
-            <div className="lp-howitworks-item">
-              <div className="lp-howitworks-num">03</div>
-              <div>
-                <div className="lp-howitworks-title">Build your financial picture</div>
-                <div className="lp-howitworks-desc">Cash Flow, Net Worth, Investments, Debt, and Goals update automatically from what you've imported — always current, nothing to maintain by hand.</div>
-              </div>
-            </div>
-            <div className="lp-howitworks-item">
-              <div className="lp-howitworks-num">04</div>
-              <div>
-                <div className="lp-howitworks-title">Understand what to do next</div>
-                <div className="lp-howitworks-desc">Ask the Analyst what changed, or the Personal CFO what you should do — both answer only from your own real numbers.</div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <h2>Priced for what BYOK actually changes.</h2>
-          <p>No server to run, no AI markup to charge for — the fee pays for the software, not a tax on someone else's model.</p>
-          <div className="lp-pricing-grid">
-            <div className="lp-pricing-card">
-              <div className="lp-pricing-name">Free</div>
-              <div className="lp-pricing-price">₹0</div>
-              <div className="lp-pricing-sub">forever</div>
-              <div className="lp-pricing-item">1 Bank account + 1 Credit Card account</div>
-              <div className="lp-pricing-item">1 Debt account · 1 Investment account</div>
-              <div className="lp-pricing-item">3 Goals, near-term or long-term</div>
-              <div className="lp-pricing-item">Full Analyst & Personal CFO — built-in prompts</div>
-              <div className="lp-pricing-item">Your own Gemini key, always</div>
-            </div>
-            <div className="lp-pricing-card featured">
-              <div className="lp-pricing-badge">Most Popular</div>
-              <div className="lp-pricing-name">Licensed</div>
-              <div className="lp-pricing-price">₹499</div>
-              <div className="lp-pricing-sub">/yr — illustrative, TBC</div>
-              <div className="lp-pricing-item">Unlimited accounts, every screen</div>
-              <div className="lp-pricing-item">Save your own custom AI prompts</div>
-              <div className="lp-pricing-item">Continued feature enhancements</div>
-              <div className="lp-pricing-item">Priority support</div>
-              <div className="lp-pricing-item">Your own Gemini key — never marked up</div>
-            </div>
-            <div className="lp-pricing-card">
-              <div className="lp-pricing-name">Managed AI</div>
-              <div className="lp-pricing-price" style={{ fontSize: 20 }}>Coming Soon</div>
-              <div className="lp-pricing-sub">for heavy users</div>
-              <div className="lp-pricing-item">No API key to set up or manage</div>
-              <div className="lp-pricing-item">We handle the AI relationship</div>
-              <div className="lp-pricing-item">Usage-based, built for power users</div>
-              <div className="lp-pricing-item">Everything in Licensed, included</div>
-            </div>
-          </div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <section className="lp-story lp-section">
-          <h2>Your money. Your data. Your device.</h2>
-          <div className="lp-privacy-subhead">Privacy by design. Local-first by default.</div>
-          <p>Your financial life stays on your device. Being Wealthy doesn't need a central database of your financial information, and we don't sell your data.</p>
-          <p>When you choose to use AI, your browser connects directly to the AI provider using your own API key.</p>
-          <div className="lp-flow">
-            <div className="lp-flow-box">Your Device</div>
-            <div className="lp-flow-arrow">→</div>
-            <div className="lp-flow-box">AI Provider</div>
-          </div>
-          <div className="lp-flow-caption">Your data stays local. You stay in control.</div>
-        </section>
-
-        <hr className="lp-hr" />
-
-        <div className="lp-footer">
-          <div className="lp-wordmark">Being <em>Wealthy</em></div>
-          <div className="lp-tagline">See your money clearly.</div>
-          <button className="lp-cta" style={{ marginTop: 26 }} onClick={onGetStarted}>Get Started</button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 /* ---------------------------------------------------------------------- */
 /* Main component                                                         */
 /* ---------------------------------------------------------------------- */
 
+// Where the demo journey's numbers and review cards come from (backlog #79): Asha's RAW statement, run through this
+// app's own starter rules and library by the engine - the same functions a real upload goes through.
+const DEMO_JOURNEY_SOURCE = { rows: rawBankRows, historyEnd: ASHA_HISTORY_END, engine: { matchRule, seedRules, findLibraryEntry, normalizeMerchant },
+  // The Payoff / stepper cash forecast for a history length: the SAME functions Home uses, on the same labelled rows (backlog #81).
+  forecast: (h, feeAns, insAns) => {
+    const eng = { matchRule, seedRules, findLibraryEntry, normalizeMerchant };
+    const sliced = sliceDemoJourney(generateDemoData(), h, { feeAns, insAns }, (rows, o) => labelStatementFull(rows, eng, [], o));
+    const commitments = computeRecurringCommitments(sliced.transactions, sliced.accounts, seedRules(), sliced.merchantAliases);
+    const forecastStreams = computeForecastStreams(sliced.transactions, sliced.accounts, commitments, sliced.merchantAliases, ASHA_HISTORY_END.slice(0, 7));
+    const amountBehaviors = computeAmountBehaviors(sliced.transactions, sliced.merchantAliases);
+    const p = computeCashProjection(186000, ASHA_HISTORY_END, 3, { commitments, amountBehaviors, forecastStreams, accounts: sliced.accounts, cashBuffer: 0 });
+    return { states: p.dailyStates, low: p.projectedMinimumCash, lowDate: p.projectedMinimumCashDate };
+  } };
+
 export default function BeingWealthyLedger() {
+  // The welcome screen and a demo session both live in the "landing" view (backlog #70): a demo reload
+  // starts the Asha journey at "Meet Asha" inside it, rather than dropping the visitor on Home (#69's
+  // earlier fix) or looping them back to the welcome screen.
   const [view, setView] = useState("landing"); // landing | cashflow | networth | investments | goals | upload | review | rules
   const [transactions, setTransactions] = useState([]);
   const [rules, setRules] = useState([]);
@@ -3976,6 +3948,18 @@ export default function BeingWealthyLedger() {
   const [budgets, setBudgets] = useState({}); // { "Expense-Fixed": 15000, ... }
   const [cashBuffer, setCashBuffer] = useState(0); // Cash Flow Calendar's minimum-balance preference - a temporary home until a general settings screen exists
   const [merchantAliases, setMerchantAliases] = useState([]); // [{ id, canonical, variants: [rawMerchantKey, ...] }]
+  const [deckOpen, setDeckOpen] = useState(false); // the shared by-merchant review deck (backlog #79), opened from Home
+  // Own-statement journey (backlog #72): set right after a person's FIRST import, so the same reading -> sorted -> cards -> payoff
+  // screens the demo shows run on their data. realAnswers = their review-card answers, kept so a sorted merchant stays sorted.
+  const [realJourney, setRealJourney] = useState(null); // { rows, historyEnd, h, accountId } | null
+  const [realAnswers, setRealAnswers] = useState([]);
+  // Onboarding intake (backlog #107): the statement picked on the welcome flow is read in place; no upload screen.
+  const [intake, setIntake] = useState(null); // { file, token }
+  const [intakeStatus, setIntakeStatus] = useState(null); // the latest { stage, label, ... } from the reader
+  const intakeControlRef = useRef(null);
+  const firstImportRef = useRef(false);
+  const intakeLogRef = useRef([]); // every status the reader reported for this file, so a fast read still shows each real step
+  useEffect(() => { (async () => { const a = await loadState("cardAnswers", []); if (Array.isArray(a) && a.length) { cardAnswersRef.current = a; setRealAnswers(a); } })(); }, []);
   // One entry per investment holding-statement import. Each is self-contained (asOfDate,
   // totals, full holdings list) — the SAME pattern as an uploadHistory batch for a bank
   // account, just for a fundamentally different kind of statement (a position snapshot,
@@ -3995,6 +3979,38 @@ export default function BeingWealthyLedger() {
   // supported for restructuring: a later import's periods take priority over an
   // earlier one's for any period both cover, computed live, never merged at write time.
   const [debtSchedules, setDebtSchedules] = useState([]);
+  // Onboarding's own two profile answers (backlog #38) - real profile data,
+  // persisted the same way everything else in this app is, not local UI
+  // state. `household.me` always true - everyone is at least themselves.
+  const [household, setHousehold] = useState({ me: true });
+  const [priority, setPriority] = useState(null); // the FIRST pick (what older code reads)
+  const [priorities, setPrioritiesState] = useState([]); // up to 3, in the order picked (backlog #107)
+  const [profileAt, setProfileAt] = useState({}); // when each profile answer was given
+  const setPriorities = (arr) => { const a = (arr || []).slice(0, 3); setPrioritiesState(a); setPriority(a[0] || null); setProfileAt((p) => ({ ...p, priorities: new Date().toISOString() })); };
+  // Distinguishes "never answered" from "genuinely confirmed just me" - the
+  // household object's own default state ({me:true}, nothing else) is
+  // otherwise indistinguishable from someone who deliberately confirmed they
+  // support no one else. Only set true on an actual "Continue" - a "Skip for
+  // now" deliberately leaves this false, so the question can resurface later
+  // (on Home, see below), matching "skip for now" rather than "skip forever."
+  const [householdAnswered, setHouseholdAnsweredRaw] = useState(false);
+  const setHouseholdAnswered = (v) => { setHouseholdAnsweredRaw(v); if (v) setProfileAt((p) => ({ ...p, household: new Date().toISOString() })); };
+  // A statement dropped on onboarding's drop zone, carried into the Upload view (backlog #70) - previously the
+  // drop opened Upload but the file itself was lost. Consumed once by UploadTab, then cleared.
+  const [droppedFile, setDroppedFile] = useState(null);
+  const [reviewMode, setReviewMode] = useState(null);
+  const [addFor, setAddFor] = useState(null); // set while a statement is being added from a Home next step: { title, why }
+  const addForRef = useRef(null);
+  const [reviewPreset, setReviewPreset] = useState(null); // a merchant name a Home card asked Review to show
+  const [demoAnswers, setDemoAnswers] = useState({}); // the demo journey's school-fee / insurance answers, reused when Asha's story re-slices (#74)
+  // Knowledge Store (backlog #56) - the first persisted, stateful piece of the
+  // inference engine. Holds derived conclusions only (Knowledge Items), never
+  // a copy of financial history - "don't snapshot the money," per the agreed
+  // V1 design. Reconciled against live detector output below, not read
+  // directly by Home - Home consumes activeKnowledgeItems(), never the raw
+  // detector output, per the agreed "Knowledge Store decides what we know,
+  // Home decides what to show" separation.
+  const [knowledgeStore, setKnowledgeStore] = useState(emptyKnowledgeStore());
   // Unified "Other Investments" (PF, Gold, Property, etc.) — one consistent shape
   // (units, cost-per-unit, current-per-unit, invested value, current value),
   // matching the same field names and derivation approach already used for
@@ -4039,6 +4055,27 @@ export default function BeingWealthyLedger() {
       setTheme(savedTheme === "dark" ? "dark" : "light");
     })();
   }, []);
+
+  // Migration-plan Phase 0 (backlog #45): the "experience" flag lets a person opt into
+  // the new onboarding/Home/Ask experience once it exists, without a big-bang switch for
+  // everyone. Defaults to "classic" — today's app, unchanged — and is currently inert:
+  // nothing yet reads this value to change what renders, since the new experience hasn't
+  // been built. It is loaded now so the stored value exists and survives across sessions
+  // once later phases start checking it.
+  const [experience, setExperience] = useState("classic"); // "classic" | "new"
+  useEffect(() => {
+    (async () => {
+      // Demo sessions default to the new Home experience (nothing is saved yet in
+      // the sandbox namespace); real sessions keep the existing "classic" default.
+      const saved = await loadState("experience", isDemoActive() ? "new" : "classic");
+      setExperience(saved === "new" ? "new" : "classic");
+    })();
+  }, []);
+  function setExperiencePreference(next) {
+    const value = next === "new" ? "new" : "classic";
+    setExperience(value);
+    saveState("experience", value);
+  }
   function toggleTheme() {
     setTheme((prev) => {
       const next = prev === "dark" ? "light" : "dark";
@@ -4051,21 +4088,41 @@ export default function BeingWealthyLedger() {
     (async () => {
       // one combined save going forward; fall back to the older separate keys once,
       // for anyone with data saved before this consolidation
+      // Migration-plan Phase 0 (backlog #45), resolving the previously-parked
+      // "consolidate migration guards" idea: schemaVersion is now recorded once
+      // migrations for this load have run, so a future migration can check it and skip
+      // work already known to be done, instead of every migration needing its own
+      // re-run guard. Deliberately NOT gating the three existing per-transaction
+      // migrations below on this version yet — they already safely no-op on already-
+      // migrated data (migrateOne checks `t.frequencyClass`; the other two only ever
+      // fill a gap or recompute a derived value) — so nothing about what runs today
+      // changes. This purely records that a load has happened at CURRENT_SCHEMA_VERSION,
+      // giving later, real schema changes something to check against.
+      const priorSchemaVersion = await loadState("schemaVersion", 0);
       const combined = await loadState("appData", null);
       if (combined) {
         // Taxonomy migration runs here, transparently, on every load - migrateOne is a
         // no-op for anything already migrated or created fresh, so this costs nothing
         // once a person's data has passed through it once.
-        setTransactions((combined.transactions || []).map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
-        setRules((combined.rules || seedRules()).map(migrateOne));
+        // Merchant identity is now the payee: rename what is stored under the older key, once, rows and groups together.
+        let loadedTxns = combined.transactions || [], loadedAliases = combined.merchantAliases || [];
+        if (!(await loadState("identityV2", false))) { const mig = migrateIdentity(loadedTxns, loadedAliases); loadedTxns = mig.transactions; loadedAliases = mig.aliases; saveState("identityV2", true); }
+        setTransactions(loadedTxns.map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
+        setRules(withoutStarterRules(combined.rules).map(migrateOne));
         setBudgets(combined.budgets || {});
         setCashBuffer(combined.cashBuffer || 0);
-        setMerchantAliases(combined.merchantAliases || []);
+        setMerchantAliases(loadedAliases);
         setHoldingSnapshots(combined.holdingSnapshots || []);
         setGoals(combined.goals || []);
         setDebtSchedules(combined.debtSchedules || []);
         setChatThreads(combined.chatThreads || []);
         setSavedPrompts(combined.savedPrompts || []);
+        setKnowledgeStore(combined.knowledgeStore || emptyKnowledgeStore());
+        setHousehold(combined.household || { me: true });
+        setPriority(combined.priority || null);
+        setPrioritiesState(Array.isArray(combined.priorities) ? combined.priorities : combined.priority ? [combined.priority] : []);
+        setProfileAt(combined.profileAt || {});
+        setHouseholdAnsweredRaw(combined.householdAnswered || false);
         if (combined.otherInvestments) {
           // Already migrated in a prior session — load as-is.
           setAccounts(combined.accounts || []);
@@ -4088,11 +4145,12 @@ export default function BeingWealthyLedger() {
           loadState("budgets", {}),
           loadState("merchantAliases", []),
         ]);
-        setTransactions(t.map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
-        setRules((r || seedRules()).map(migrateOne));
+        const legacyMig = migrateIdentity(t, ma || []); saveState("identityV2", true);
+        setTransactions(legacyMig.transactions.map(migrateOne).map(refreshMerchantKey).map(backfillMissingFrequency));
+        setRules(withoutStarterRules(r).map(migrateOne));
         setAccounts(a);
         setBudgets(b || {});
-        setMerchantAliases(ma || []);
+        setMerchantAliases(legacyMig.aliases);
         setHoldingSnapshots([]);
         setGoals([]);
         setDebtSchedules([]);
@@ -4100,6 +4158,12 @@ export default function BeingWealthyLedger() {
         setChatThreads([]);
         setSavedPrompts([]);
       }
+      // See the comment above priorSchemaVersion's read, further up this effect: this
+      // records that a load has completed at CURRENT_SCHEMA_VERSION. priorSchemaVersion
+      // isn't branched on yet — nothing to gate until a real schema change needs one —
+      // but is already threaded through so the first real migration only has to add an
+      // `if (priorSchemaVersion < N)` check here, not build this plumbing from scratch.
+      if (priorSchemaVersion < CURRENT_SCHEMA_VERSION) saveState("schemaVersion", CURRENT_SCHEMA_VERSION);
       setHasSeenTutorial(await loadState("hasSeenTutorial", false));
       const storedLicenseKey = await loadState("licenseKey", null);
       if (storedLicenseKey) {
@@ -4121,6 +4185,48 @@ export default function BeingWealthyLedger() {
       setTutorialActive(true);
       setTutorialStep(0);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  // Rows already imported follow the rule book (backlog #124): after a rule is saved or edited, after an import, and once at load, every row the
+  // person has not edited by hand takes what the best-matching rule of theirs says.
+  useEffect(() => {
+    if (!ready || isDemoActive()) return;
+    const healed = healTransactions(transactions, rules, matchRule);
+    if (healed.changed > 0) { setTransactions(healed.transactions); showToast("Updated " + healed.changed + " transaction" + (healed.changed === 1 ? "" : "s") + " to match your rules."); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, rules, transactions.length]);
+
+  // A rule that names a group puts the merchants it matches into that group (the group is remembered on the rule; Merchant groups is where it is read).
+  useEffect(() => {
+    if (!ready || isDemoActive()) return;
+    const g = healGroups(transactions, rules, merchantAliases, matchRule);
+    if (g.changed > 0) setMerchantAliases(g.aliases);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, rules, transactions.length]);
+
+  // Payments waiting for an account the person had not added. When a new account arrives they come back as ordinary review cards: the note whose
+  // name matches first, then the others one at a time, each with that account pre-selected. A "not this account" brings the next one; when all
+  // say no they keep waiting until another account is added.
+  // Waiting notes made before accounts were recorded on them: the accounts that exist now count as already answered.
+  useEffect(() => {
+    if (!ready || isDemoActive()) return;
+    setKnowledgeStore((prev) => baselinePending(prev, accounts.map((x) => x.id)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  const accountOffers = useMemo(() => {
+    if (isDemoActive()) return [];
+    const byId = new Map(transactions.map((t) => [t.id, t]));
+    const typesOf = (note) => { const t = note.rowIds.map((id) => byId.get(id)).find((x) => x && !x.linkedAccountId); return t ? linkableAccountTypesFor(t.category, t.subCategory) : []; };
+    return pendingOffers(knowledgeStore, accounts, typesOf);
+  }, [knowledgeStore, accounts, transactions]);
+
+  // Opening the app with data already saved goes straight to Home (not the welcome screen, which only offers adding a statement).
+  useEffect(() => {
+    if (!ready || isDemoActive() || intake) return;
+    if (transactions.length === 0 && accounts.length === 0) return;
+    (async () => { const exp = await loadState("experience", "classic"); setView((v) => (v === "landing" ? (exp === "new" ? "home" : "dashboard") : v)); })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready]);
 
@@ -4217,7 +4323,7 @@ export default function BeingWealthyLedger() {
     if (!ready) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveState("appData", { transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts });
+      saveState("appData", { transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, knowledgeStore, household, priority, priorities, profileAt, householdAnswered });
       // Same trigger as the regular save — if a folder is actively connected, write a
       // fresh backup there too, throttled to at most once every 5 minutes so rapid
       // edits don't hammer the disk with a new file on every keystroke.
@@ -4227,7 +4333,7 @@ export default function BeingWealthyLedger() {
       }
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, ready]);
+  }, [transactions, rules, accounts, budgets, cashBuffer, merchantAliases, holdingSnapshots, goals, debtSchedules, otherInvestments, chatThreads, savedPrompts, knowledgeStore, household, priority, priorities, profileAt, householdAnswered, ready]);
 
   function showToast(msg) {
     setToast(msg);
@@ -4378,11 +4484,12 @@ export default function BeingWealthyLedger() {
    *  should never leave the app in a half-populated, broken state. */
   function confirmImport() {
     const d = pendingImportFile.data || {};
-    setTransactions(d.transactions || []);
-    setRules(d.rules || seedRules());
+    const restored = migrateIdentity(d.transactions || [], d.merchantAliases || []); // a backup made before payee identity carries the older keys
+    setTransactions(restored.transactions);
+    setRules(withoutStarterRules(d.rules));
     setBudgets(d.budgets || {});
     setCashBuffer(d.cashBuffer || 0);
-    setMerchantAliases(d.merchantAliases || []);
+    setMerchantAliases(restored.aliases);
     setHoldingSnapshots(d.holdingSnapshots || []);
     setGoals(d.goals || []);
     setDebtSchedules(d.debtSchedules || []);
@@ -4425,10 +4532,728 @@ export default function BeingWealthyLedger() {
     showToast(`Re-applied rules: ${changed} transaction${changed === 1 ? "" : "s"} updated, ${protectedCount} manual ${protectedCount === 1 ? "entry" : "entries"} left untouched.`);
   }
 
-  const uncategorizedCount = transactions.filter((t) => !t.category).length;
+  // Fixed: was checking category alone (!t.category), while Review's own real
+  // "needs review" definition (isFullyCategorized, already used by Review
+  // itself) also checks subcategory, frequency, control, purpose, and linked
+  // account where relevant - found directly from a real screenshot: Home said
+  // "everything is categorized" while Review's own banner correctly showed 34
+  // transactions still missing a linked account. Reusing the SAME function
+  // Review already uses, not a second, narrower definition of the same thing.
+  const groupMap = useMemo(() => buildGroupMap(merchantAliases), [merchantAliases]);
+  const uncategorizedCount = transactions.filter((t) => !isFullyCategorized(t, groupMap)).length;
 
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // Home's data (backlog #41/#45, computed here in App.jsx - which already has
+  // every real function these need in scope - and passed down as plain props, so
+  // HomeScreen.jsx stays pure/presentational with zero App.jsx imports, avoiding
+  // any circular-import risk between the two files).
+  const bankAccountsForHome = useMemo(() => accounts.filter((a) => a.type === "bank"), [accounts]);
+  const cashToday = useMemo(
+    () => computeAggregateCashBalance(bankAccountsForHome, transactions, todayStr),
+    [bankAccountsForHome, transactions, todayStr]
+  );
+  const netWorthForHome = useMemo(
+    () => computeNetWorthSummary(accounts, holdingSnapshots, otherInvestments, debtSchedules),
+    [accounts, holdingSnapshots, otherInvestments, debtSchedules]
+  );
+  const debtSummaryForHome = useMemo(() => computeDebtSummary(debtSchedules, todayStr), [debtSchedules, todayStr]);
+
+  // The real cash-flow forecast (backlog #41/#45). Originally deferred - building
+  // Home first surfaced what looked like a forecasting bug (school fees projected
+  // monthly instead of semi-annually), logged as #49. On closer inspection, prompted
+  // by a direct question rather than left unchecked, that "bug" turned out to be a
+  // gap in the DEMO DATA generator (a missing `frequency: "Semi-Annual"` field),
+  // not the forecasting engine - App.jsx's own FREQUENCY_STEP_MONTHS mechanism
+  // already handles cadence correctly and has since an earlier session. #49 is
+  // retracted (see BACKLOG.md's correction) and the forecast card now ships.
+  const currentMonthKeyForHome = todayStr.slice(0, 7);
+  const commitmentsForHome = useMemo(
+    () => computeRecurringCommitments(transactions, accounts, rules, merchantAliases),
+    [transactions, accounts, rules, merchantAliases]
+  );
+  const forecastStreamsForHome = useMemo(
+    () => computeForecastStreams(transactions, accounts, commitmentsForHome, merchantAliases, currentMonthKeyForHome),
+    [transactions, accounts, commitmentsForHome, merchantAliases, currentMonthKeyForHome]
+  );
+  const amountBehaviorsForHome = useMemo(() => computeAmountBehaviors(transactions, merchantAliases), [transactions, merchantAliases]);
+  // The review deck: every merchant the engine cannot fully settle, from the SAME function onboarding uses (demo only until #72).
+  // The engine for the person's own data: the same functions, but with the rules the person actually has (their own, learned, and the starter set)
+  // in place of the starter set alone - so import, the review cards and the Review screen all work from one rule book.
+  const liveEngine = useMemo(() => ({ ...DEMO_JOURNEY_SOURCE.engine, seedRules: () => rules }), [rules]);
+  const groupNames = useMemo(() => [...new Set(merchantAliases.filter((g) => (g.type || "category") === "category").map((g) => g.canonical))], [merchantAliases]);
+  const deckForHome = useMemo(() => {
+    if (!transactions.length) return null;
+    const live = !isDemoActive();
+    if (live) {
+      // ONE definition of "needs you" (backlog #125): a card per merchant with at least one stored row that is not fully categorised.
+      const offerByRow = new Map(); accountOffers.forEach((o) => o.note.rowIds.forEach((id) => offerByRow.set(id, o)));
+      const cardRows = offerByRow.size ? transactions.map((t) => { const o = offerByRow.get(t.id); return o && !t.linkedAccountId ? { ...t, noLinkedAccount: false, __offer: o.account.id } : t; }) : transactions;
+      const cards = buildNeedsYouCards(cardRows, {
+        missing: (t) => missingFieldsOf(t, true), groupOf: (t) => groupOfRow(t, groupMap), fmtDate: fmtDay, fmtMoney: fmtRupees,
+        merchantKey: (t) => merchantCore(t.merchant || normalizeMerchant(t.description) || t.description || "") || "\u2014",
+        remarkOf: (t) => remarkOf(t.description),
+        // Payments to different people that carry the same remark are ONE card (#166) - unless the library knows the payee, the AI says it is a merchant, or a rule for that payee already decides the row.
+        cardKey: (t) => { const rk = remarkOf(t.description); if (!rk || t.counterpartyType === "merchant" || findLibraryEntry(t.aiKey || t.description)) return null; const mr = t.matchedRuleId ? rules.find((x) => x.id === t.matchedRuleId) : null; if (mr && mr.scope !== "remark") return null; return "remark:" + remarkKeyOf(rk); },
+        suggest: (t) => { const lib = findLibraryEntry(t.aiKey || t.description); const sg = suggestGroup(t, merchantAliases.filter((g) => (g.type || "category") === "category"), lib); const rk = !lib && t.counterpartyType !== "merchant" ? remarkTheme(remarkOf(t.description)) : null; /* a person's remark only SUGGESTS a group, and only where the library knows nothing (#165) */ const grp = { ...(sg ? { group: sg.group } : rk ? { group: rk.group } : {}), ...(rk && !sg ? { remarkHint: { group: rk.group, label: rk.label, also: rk.also } } : {}), ...(t.__offer ? { linkedAccountId: t.__offer } : {}) }; return lib ? { ...grp, category: lib.category, subCategory: lib.category === "Expense" ? lib.sub : undefined, control: lib.category === "Expense" ? (COMMITTED_GROUPS.has(lib.group) ? "Committed" : "Flexible") : undefined } : grp; },
+      }).map((c) => { const o = c.txnIds.map((id) => offerByRow.get(id)).find(Boolean); return { ...c, ...(o ? { offer: { noteKey: o.note.key, accountId: o.account.id, accountName: o.account.nickname } } : {}), spec: { missing: (x) => missingFieldsOf(x, true), options: (field, sim) => needsYouOptions(field, sim, accounts, groupNames) } }; });
+      // "Does this repeat?": a large one-off payment nothing recognises as a bill, over a long enough history. Not asked when the person already
+      // marked that merchant Recurring. Sits at the end of the deck and is not counted as something that "needs you".
+      let repeats = [];
+      try {
+        const bankIdSet = new Set(accounts.filter((a) => a.type === "bank" || a.type === "creditCard").map((a) => a.id));
+        const rr = computeOnboardingResult(transactions.filter((t) => bankIdSet.has(t.accountId)), liveEngine, realAnswers, null);
+        repeats = rr.repeatCards.filter((c) => { const ids = new Set((c.samples || []).map((x) => x.id)); return !transactions.some((t) => ids.has(t.id) && t.frequencyClass === "Recurring"); });
+      } catch (e) { repeats = []; }
+      return { cards: [...cards, ...repeats], needs: cards.length, repeats: repeats.length, merchants: cards.length, sorted: 0 };
+    }
+    const bankIds = new Set(accounts.filter((a) => a.type === "bank" || a.type === "creditCard").map((a) => a.id));
+    const r = computeOnboardingResult(live ? transactions.filter((t) => bankIds.has(t.accountId)) : transactions, live ? liveEngine : DEMO_JOURNEY_SOURCE.engine, live ? realAnswers : (demoAnswers && demoAnswers.cardAnswers) || [], null);
+    const answeredRepeat = (c) => !!(demoAnswers && demoAnswers[/school/i.test(c.name) ? "feeAns" : "insAns"]);
+    return { cards: [...r.deck, ...r.repeatCards.filter((c) => !answeredRepeat(c))], merchants: r.merchants, sorted: r.sorted };
+  }, [transactions, accounts, demoAnswers, realAnswers, liveEngine, groupMap, groupNames, merchantAliases, accountOffers]);
+  const projectionForHome = useMemo(() => {
+    if (cashToday === null) return null;
+    return computeCashProjection(cashToday, todayStr, 3, {
+      commitments: commitmentsForHome, amountBehaviors: amountBehaviorsForHome,
+      forecastStreams: forecastStreamsForHome, accounts, cashBuffer,
+    });
+  }, [cashToday, todayStr, commitmentsForHome, amountBehaviorsForHome, forecastStreamsForHome, accounts, cashBuffer]);
+
+  // Months of real history - the ladder Home's "Your patterns" card is meant to
+  // show (Snapshot -> Emerging patterns -> Reliable patterns -> Stronger forecasts,
+  // per the agreed home-prototype-v1 design), not a raw confidence-count breakdown
+  // on its own. Distinct calendar months present in the transaction history.
+  const monthsOfHistoryForHome = useMemo(() => new Set(transactions.map((t) => t.date.slice(0, 7))).size, [transactions]);
+
+  const goalsTrackingForHome = useMemo(() => {
+    const invested = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1].totalInvested || 0 : 0;
+    const value = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1].totalCurrentValue || 0 : 0;
+    return computeGoalsTracking(goals, invested, value, todayStr);
+  }, [goals, holdingSnapshots, todayStr]);
+
+  // "Next step" and "Worth your attention" (backlog #41), ported faithfully from
+  // home-prototype-v1.html's own nextStep()/attention() logic - the priority
+  // sequence (months -> card -> loan -> investments -> goal -> more months) and
+  // the attention triggers (a dip below 70% of today's cash, a card bill due
+  // soon, a goal running short) are the AGREED content, not a reinterpretation
+  // of it. Only computed from real account/data checks, never fabricated -
+  // "spending ran above usual" (the prototype's 4th, filler attention trigger)
+  // is deliberately left out rather than faked, since nothing here computes a
+  // real per-category normal-spend baseline yet.
+  function daysBetweenForHome(a, b) { return Math.round((new Date(b) - new Date(a)) / 86400000); }
+  const hasCreditCard = accounts.some((a) => a.type === "creditCard"); // still used by the card-bill-due attention check below, which is about ANY tracked card, not per-issuer
+  const hasLoan = accounts.some((a) => a.type === "debt");
+  const hasInvestments = accounts.some((a) => a.type === "demat") || holdingSnapshots.length > 0;
+  const hasGoalSet = goals.length > 0;
+  // PER-ENTITY tracking for missing-object detection specifically (distinct
+  // from the blanket hasCreditCard/hasInvestments above, which other, unrelated
+  // checks still correctly use). Found and fixed after direct feedback: a
+  // blanket "do you have ANY card account" check meant that once one card was
+  // tracked, every other real, different, untracked card went undetected
+  // forever (the reported case: SBI Card and CRED both showing real recurring
+  // evidence, neither ever suggested, because some other card already
+  // existed). Built by running each tracked account's OWN nickname through
+  // the EXACT SAME matching functions used to detect new evidence - "already
+  // tracked" and "newly detected" must use one shared definition of what a
+  // name means, never two.
+  const trackedCardIssuerNames = useMemo(() => accounts
+    .filter((a) => a.type === "creditCard")
+    .map((a) => {
+      const r = describeDebtPayment({ description: a.nickname || a.institution || "" }, null);
+      return r.confirmed === false && r.label !== "Debt Payment" ? r.label.replace(" Card Payment", "").replace(" Payment", "") : (a.institution || a.nickname);
+    })
+    .filter(Boolean), [accounts]);
+  // Fixed: was checking `demat`-type accounts only - an investment tracked
+  // under `otherInvestment` (this app's statement-based/manual investment
+  // type) was invisible to this check entirely, so a real, already-tracked
+  // holding could still be wrongly suggested as missing. Found directly: a
+  // real Axis Mutual Fund REDEMPTION (evidence the relationship already
+  // exists) was suggested as a missing account, with no check for whether it
+  // was already represented under a different account type.
+  const trackedInvestmentPlatformNames = useMemo(() => accounts
+    .filter((a) => a.type === "demat" || a.type === "mutualFund" || a.type === "otherInvestment")
+    .map((a) => {
+      const entry = findLibraryEntry(a.nickname || a.institution || "");
+      return entry && entry.merchantType === "Investment Platform" ? entry.merchant : (a.institution || a.nickname);
+    })
+    .filter(Boolean), [accounts]);
+
+  // Generalized missing-financial-object detection (core product philosophy,
+  // shared directly - the SBI Card example: "these transactions reveal the
+  // probable existence of a financial object missing from the user's model").
+  // Supersedes the narrower card/loan-only check this replaced: that version
+  // used a blind account-existence check for loans with no real evidence
+  // requirement at all, which was itself a direct correction after feedback
+  // (backlog #52) - this pass generalizes properly rather than stopping at
+  // "technically evidence-based for two object types." Investment-platform and
+  // insurance detection are genuinely NEW here, using Merchant Library data
+  // (merchantType "Investment Platform", 20 real entries; insurance-premium
+  // entries, 10 real entries) that already existed but was never used for this
+  // purpose until now. See src/inference/missingObjects.js for the full
+  // reasoning, including why insurance is surfaced without an action (no real
+  // insurance/protection object type exists anywhere in this app yet -
+  // recorded as its own named gap, backlog #53, not papered over).
+  // Direct CARD_ISSUER_PATTERNS matcher, bypassing describeDebtPayment's own
+  // label-formatting wrapper (which drops `isIntermediary` - needed here,
+  // not there) - returns the real matched pattern object as-is.
+  const matchCardIssuerDirect = (text) => {
+    const norm = normalizeForMatch(text || "");
+    if (!norm) return null;
+    const m = CARD_ISSUER_PATTERNS.find((p) => normalizedPatternMatches(norm, normalizeForMatch(p.pattern)));
+    return m ? { name: m.name, isIntermediary: !!m.isIntermediary } : null;
+  };
+  const missingObjectsForHome = useMemo(() => detectMissingObjects({
+    transactions, commitments: commitmentsForHome,
+    accountFlags: { trackedCardIssuers: trackedCardIssuerNames, hasLoan, trackedInvestmentPlatforms: trackedInvestmentPlatformNames },
+    matchCardIssuer: matchCardIssuerDirect,
+    matchLibraryEntry: findLibraryEntry,
+  }), [transactions, commitmentsForHome, trackedCardIssuerNames, hasLoan, trackedInvestmentPlatformNames]);
+
+  // Reconcile live detector output into the Knowledge Store (backlog #56).
+  // A real state update (not a useMemo) because this is where the "don't
+  // duplicate, update the same item" guarantee and auto-resolution actually
+  // happen and need to persist. Guarded by `ready` the same way the autosave
+  // effect is, so this never runs against the default empty state before the
+  // real saved store has loaded (which would wipe it with a fresh, wrong
+  // reconciliation before the real data even arrives).
+  useEffect(() => {
+    if (!ready) return;
+    setKnowledgeStore((prev) => {
+      const reconciled = reconcileMissingObjects(prev, missingObjectsForHome, new Date().toISOString());
+      return pruneKnowledgeStore(reconciled, new Date().toISOString());
+    });
+    // missingObjectsForHome is a new array identity every render (useMemo
+    // notwithstanding, since its own deps - transactions, accounts - change
+    // often) - depending on its CONTENTS via JSON would be more "correct" but
+    // reconcileMissingObjects is idempotent (re-running with identical
+    // findings produces the identical store, verified in knowledgeStore.test.cjs),
+    // so depending on the underlying real-data deps directly is simpler and
+    // equally safe, without needing a content-hash dependency trick.
+  }, [transactions, accounts, ready]);
+
+  const knowledgeItemsForHome = activeKnowledgeItems(knowledgeStore);
+  function snoozeHomeKnowledgeItem(idOrIds) {
+    const now = new Date(); const until = new Date(now.getTime() + 30 * 86400000);
+    const ids = Array.isArray(idOrIds) ? idOrIds : [idOrIds];
+    setKnowledgeStore((prev) => ids.reduce((st, id) => snoozeKnowledgeItem(st, id, until.toISOString(), now.toISOString()), prev));
+  }
+  // A next step that needs a statement opens the same "add a statement" screen the welcome flow uses, saying why, instead of the plain Upload tab.
+  function onNextStepAct(step) {
+    if (step.act === "addStatement") {
+      const f = step.items ? { title: "Add another account", why: step.items.map((i) => i.label + ": " + i.text).join(" ") } : { title: step.title, why: step.body };
+      addForRef.current = f; setAddFor(f); setIntake(null); setIntakeStatus(null);
+      setView("landing");
+    } else if (step.act === "conflicts") { setReviewMode("conflicts"); setView("review"); } else setView(step.act || "upload");
+  }
+  function dismissHomeKnowledgeItem(id) {
+    setKnowledgeStore((prev) => dismissKnowledgeItem(prev, id, new Date().toISOString()));
+  }
+
+  // THE CONTROL ROOM (backlog #57): every signal that could reach Home -
+  // Knowledge Store items and forecast-derived signals alike - is normalized
+  // into ONE shape and ranked together by src/inference/homeTrafficControl.js,
+  // rather than each kind of signal pushing itself into an array with its own
+  // ad hoc logic, which is what this file did before. App.jsx's only job now
+  // is to GATHER real candidates (it has the real data these need: accounts,
+  // projections, the Knowledge Store) and hand them to the one place that
+  // decides what's worth showing.
+  const homeCandidates = useMemo(() => {
+    const candidates = knowledgeItemsForHome.map(fromKnowledgeItem);
+    // Cash buffer as its own real signal (backlog #61), not silence: reported
+    // directly that clearing the cash buffer produced no prompt at all, even
+    // though the whole "Your future" card's dip framing (above/below cushion)
+    // depends entirely on it being set. An unset cushion isn't a missing
+    // object or a cash-flow risk - it's a missing INPUT this app needs to
+    // answer a question it's already trying to answer, which is its own kind
+    // of worth-knowing fact, not nothing.
+    // Onboarding's own profile questions, surfaced on Home (backlog #66) -
+    // NOT gated to brand-new users going through OnboardingFlow's sequential
+    // Q1/Q2. Anyone who hasn't answered - including someone who used this app
+    // before these questions existed, or chose "Skip for now" - sees them
+    // here instead, answered the same inline way as the cash cushion already
+    // is. One real question, asked from wherever the person actually is,
+    // not a one-time gate they either caught or didn't.
+    if (!householdAnswered && monthsOfHistoryForHome >= 1) {
+      candidates.push({
+        id: null, score: 0.65, action: { label: "Answer", act: null }, inlineType: "household",
+        title: "Who's part of your financial life?",
+        body: "Pick everyone you support or plan with. It helps put your numbers in context, and you can change it anytime.",
+        evidence: [],
+      });
+    }
+    if (!priority && monthsOfHistoryForHome >= 1) {
+      candidates.push({
+        id: null, score: 0.6, action: { label: "Answer", act: null }, inlineType: "priority",
+        title: "What matters most right now? Choose up to 3",
+        body: "We'll use your first pick to start you off with a first goal, and the others to shape what Home shows you.",
+        evidence: [],
+      });
+    }
+    if (!cashBuffer && monthsOfHistoryForHome >= 1) {
+      // Answered RIGHT HERE on Home (backlog #63), not by navigating away -
+      // direct feedback that sending someone to another screen for a single
+      // number defeats the purpose: this is exactly the "build the profile
+      // through questions answered in place" pattern already designed for
+      // onboarding's own quick-review cards (SCREENS.quick in the journey
+      // prototype - a guess/chip answered inline, never a screen change).
+      // `inlineType` tells HomeScreen to render the real inline answer UI
+      // instead of a navigate-away button; `action` stays set so the control
+      // room still correctly treats this as a real "thing to do," not a risk
+      // signal - the ACT value is never actually used for this item (there is
+      // no navigation), kept only so existing shape checks elsewhere don't
+      // need a special case for "has no action at all."
+      candidates.push({
+        id: null, score: 0.7, action: { label: "Set your cash cushion", act: null }, inlineType: "cashBuffer",
+        title: "We don't know your comfortable cash cushion",
+        body: "Without it, we can't tell you whether a dip in your projected cash is actually something to worry about.",
+        evidence: [],
+      });
+    }
+    // Forecast-dependent candidates genuinely need 3 months + a real
+    // projection to mean anything (a dip/cushion comparison, a bill-due
+    // lookup against projected events) - gated here, at the point each is
+    // built, not inside the control room itself (which has no concept of
+    // "months of history" - that's a fact about THIS data, not a ranking rule).
+    if (monthsOfHistoryForHome >= 3 && projectionForHome) {
+      const low = projectionForHome.projectedMinimumCash;
+      if (cashToday && low < cashToday * 0.7) {
+        candidates.push(cashDipCandidate({
+          date: projectionForHome.projectedMinimumCashDate, amount: inr(low),
+          cushionDelta: low >= cashBuffer ? inr(low - cashBuffer) + " above your cushion" : inr(cashBuffer - low) + " below your cushion",
+          evidence: [`Cash today: ${inr(cashToday)}`, `Projected committed bills and spending between now and ${projectionForHome.projectedMinimumCashDate}: ${inr(projectionForHome.cashDrawdown)}`, `Your cushion: ${inr(cashBuffer)}`],
+        }));
+      }
+      if (hasCreditCard) {
+        const cardAcc = accounts.find((a) => a.type === "creditCard");
+        const soon = (projectionForHome.events || []).find((e) => e.date && cardAcc && e.name && e.name.toLowerCase().includes((cardAcc.nickname || "card").toLowerCase().split(" ")[0].toLowerCase()) && daysBetweenForHome(todayStr, e.date) >= 0 && daysBetweenForHome(todayStr, e.date) <= 10);
+        if (soon) candidates.push(cardBillDueCandidate({
+          title: `${cardAcc.nickname} bill due ${soon.date}`,
+          body: `${inr(Math.abs(soon.amount))} leaves your account in ${daysBetweenForHome(todayStr, soon.date)} day${daysBetweenForHome(todayStr, soon.date) === 1 ? "" : "s"}.`,
+          evidence: [`Projected from your recurring ${cardAcc.nickname} settlement pattern`, `Amount: ${inr(Math.abs(soon.amount))}`, `Date: ${soon.date}`],
+        }));
+      }
+      const goalShort = Object.values(goalsTrackingForHome?.perGoal || {}).find((g) => g.sipShortfall > 0);
+      if (hasGoalSet && hasInvestments && goalShort) {
+        const g = goals.find((gg) => goalsTrackingForHome.perGoal[gg.id] === goalShort);
+        candidates.push(goalShortfallCandidate({
+          title: `${g ? g.name : "Your goal"} is a little short`,
+          body: `${inr(goalShort.sipShortfall)} behind its own plan so far, at your current pace.`,
+          evidence: [`Target SIP-to-date: ${inr(goalShort.sipTargetSoFar)}`, `Actually invested: ${inr(goalShort.trackedInvested)}`, `Current value: ${inr(goalShort.trackedCurrentValue)}`],
+        }));
+      }
+    }
+    return candidates;
+  }, [knowledgeItemsForHome, monthsOfHistoryForHome, projectionForHome, cashToday, cashBuffer, hasCreditCard, accounts, todayStr, hasGoalSet, hasInvestments, goalsTrackingForHome, goals]);
+
+  const homeFeed = useMemo(() => selectHomeFeed(homeCandidates), [homeCandidates]);
+
+  // REBUILT (backlog #62): Next Step is now a LIST, not a single slot -
+  // direct feedback, with real evidence (four genuine debt-payment
+  // commitments in the person's own data, only one or two ever reaching the
+  // screen), that a single-slot design was silently dropping real findings.
+  // The "data completeness ladder" (months -> goal -> more months -> all set)
+  // is a strict PRECEDENCE rule for an early product state - it only fills in
+  // when there are NO real, evidence-based next steps at all, never competing
+  // against them, and only ever contributes ONE fallback entry (there's
+  // nothing to rank it against).
+  const nextStepsBase = useMemo(() => {
+    if (monthsOfHistoryForHome < 3) return [{ title: "Add more months", body: "One month shows what happened. Two or three more let me tell which bills repeat and start forecasting.", cta: "Add more months", act: "addStatement" }];
+    let real = homeFeed.nextSteps.map((c) => ({ title: c.title, body: c.body, cta: c.action.label, act: c.action.act, evidence: c.evidence, id: c.id, inlineType: c.inlineType || null }));
+    // Every "add an account" finding (cards, loans, investments, other bank accounts) becomes ONE card with one button, as in the demo's "Want to make the picture richer?".
+    const isAcct = (r) => r.id && r.act === "addStatement" && knowledgeStore.items[r.id];
+    const acct = real.filter(isAcct);
+    if (acct.length) {
+      const LABEL = { creditCard: "Credit card", loan: "Loans", investment: "Investments", bankAccount: "Bank accounts" };
+      const by = {};
+      acct.forEach((r) => { const it = knowledgeStore.items[r.id]; const t = it.type; const g = by[t] || (by[t] = { n: 0, names: [] }); g.n += (it.evidence[0] && it.evidence[0].count) || 0; if (it.claim.title.startsWith(it.subject.name + ":")) g.names.push(it.subject.name); });
+      const TEXT = {
+        creditCard: (g) => "We noticed " + g.n + " card payment" + (g.n === 1 ? "" : "s") + (g.names.length ? " (" + [...new Set(g.names)].slice(0, 3).join(", ") + ")" : "") + ". Their statements would show what they paid for.",
+        loan: (g) => "We noticed a loan EMI (" + g.n + " payments). The loan schedule shows what you still owe.",
+        investment: (g) => "We noticed " + g.n + " payments to " + ([...new Set(g.names)].slice(0, 3).join(", ") || "investment platforms") + ". Your holdings show what they\u2019ve grown to.",
+        bankAccount: (g) => "We noticed " + g.n + " transfers to accounts that look like yours. Their statements make the transfers match up.",
+      };
+      const items = Object.keys(by).filter((t) => LABEL[t]).map((t) => ({ label: LABEL[t], text: TEXT[t](by[t]) }));
+      const first = real.findIndex(isAcct);
+      const grouped = { id: acct[0].id, ids: acct.map((r) => r.id), title: "Want to make the picture richer?", body: "", items, cta: "Add another account", act: "addStatement", evidence: [] };
+      real = real.filter((r) => !isAcct(r));
+      real.splice(Math.min(first, real.length), 0, grouped);
+    }
+    if (real.length > 0) return real;
+    if (!hasGoalSet) return [{ title: "Set a goal target", body: "A target lets me show whether you're on track, not just how much you've put in.", cta: "Set a target", act: "goals" }];
+    if (monthsOfHistoryForHome < 12) return [{ title: "Add earlier months", body: "A full year shows bills that come once or twice a year, and how spending changes with the seasons.", cta: "Add more months", act: "addStatement" }];
+    return [{ title: "You're all set", body: "Add each new statement when it arrives to keep everything fresh.", cta: null, act: null }];
+  }, [monthsOfHistoryForHome, homeFeed, hasGoalSet, knowledgeStore]);
+  // Merchants filed in more than one way: shown on Review as their own view; Home just points to it.
+  const conflicts = useMemo(() => (isDemoActive() ? [] : computeConflicts(transactions, rules, knowledgeStore)), [transactions, rules, knowledgeStore]);
+  const nextStepsForHome = useMemo(() => (conflicts.length ? [{ title: conflicts.length + " conflict" + (conflicts.length === 1 ? "" : "s") + " to check", body: conflicts.length + " merchant" + (conflicts.length === 1 ? " is" : "s are") + " filed in more than one way. Look at them together and keep the one that is right.", cta: "Check conflicts", act: "conflicts" }, ...nextStepsBase.filter((x) => !(x.act === null && x.title === "You're all set"))] : nextStepsBase), [conflicts, nextStepsBase]);
+
+  const attentionItemsForHome = useMemo(() => homeFeed.attention.map((c) => ({ title: c.title, body: c.body, id: c.id, evidence: c.evidence, why: c.why })), [homeFeed]);
+
+  const lastTransactionDate = transactions.length ? transactions.reduce((max, t) => (t.date > max ? t.date : max), transactions[0].date) : null;
+
+  // "Your patterns," show the proof (backlog #61): the real, well-established
+  // commitments behind the ladder - names and amounts, not an abstract count
+  // the person has no way to verify against their own knowledge of their
+  // finances, which was itself part of what went wrong with this whole card
+  // before this pass.
+  // Fixed: was silently capped at 8, hiding real, confirmed patterns with no
+  // indication anything was cut off - found directly (11 real patterns, only
+  // 8 shown, no "and N more"). This is specifically the "proof" the person
+  // asked to see - a silent truncation defeats the purpose. Shows all of them.
+  const establishedPatternsForHome = useMemo(() => commitmentsForHome
+    .filter((c) => c.pattern && (c.pattern.confidenceTier === "confirmed" || c.pattern.confidenceTier === "established"))
+    .sort((a, b) => b.occurrenceCount - a.occurrenceCount)
+    .map((c) => ({ name: c.name, occurrenceCount: c.occurrenceCount, lastAmount: c.lastAmount })), [commitmentsForHome]);
+
+  // REBUILT (backlog #61), after direct, specific feedback that this list
+  // was showing a count ("33 times") the person could not find in their own
+  // transactions, and was separately asking about an already-tracked Zerodha
+  // account as if it were unresolved. Root cause: this previously ran its OWN
+  // independent grouping (reviewStatus.js's own commitmentGroupKey pass),
+  // completely separate from commitmentsForHome - two different computations
+  // of "the same thing," free to disagree. Rebuilt on commitmentsForHome
+  // directly - the ONE real, authoritative source now shared by missing-
+  // object detection too, so there is only one place left to be wrong, not two.
+  //
+  // Reframed per the attached design document's correction: this is not
+  // "teach the app a random fact" (the old "Help me learn" framing) - it is
+  // "a real pattern exists; its MEANING isn't established yet." Gated
+  // correctly this time: a real pattern (occurrenceCount >= 2 - the single-
+  // sighting rule, enforced here too), no relationship already established
+  // (no linkedAccountId - an ALREADY-TRACKED Zerodha is not a question),
+  // genuinely still unclear (the underlying transaction isn't fully
+  // categorized), and not already asked elsewhere (a Transfer/Debt Payment
+  // commitment is missing-object detection's job, not this list's).
+  const helpMeUnderstandItemsForHome = useMemo(() => {
+    const txnById = {};
+    transactions.forEach((t) => { txnById[t.id] = t; });
+    return commitmentsForHome
+      .filter((c) => c.occurrenceCount >= 2)
+      .filter((c) => !c.linkedAccountId)
+      .filter((c) => !(c.category === "Transfer" && c.subCategory === "Debt Payment"))
+      .filter((c) => {
+        const latestId = c.transactionIds[c.transactionIds.length - 1];
+        const latest = txnById[latestId];
+        return latest && !isFullyCategorized(latest, groupMap);
+      })
+      .slice(0, 3)
+      .map((c) => {
+        const established = c.pattern && (c.pattern.confidenceTier === "confirmed" || c.pattern.confidenceTier === "established");
+        return {
+          title: c.name,
+          // "What did we notice -> what might it mean -> why are we asking" per
+          // the attached design document, not a raw occurrence count on its own.
+          body: `You've paid this ${c.occurrenceCount} times${established ? ", on a regular pattern" : ""}, but we haven't confirmed what role it plays in your financial life. Knowing this helps us build a more accurate picture.`,
+        };
+      });
+  }, [commitmentsForHome, transactions, groupMap]);
+
+  // Calculation-drawer evidence for the three hero numbers (backlog #41's
+  // "calculation drawer") - every one of these numbers already has a REAL
+  // breakdown already computed; this just carries it through to be shown on
+  // a click rather than asserted with nothing behind it.
+  // Fixed: accounts have no static `.balance` field - the real balance is
+  // resolved from transaction history, the SAME way computeAggregateCashBalance
+  // itself resolves it (resolveAccountBalanceForPeriod), not guessed at. The
+  // earlier version silently fell back to 0 for every account despite the
+  // correct TOTAL, because that field never existed - found directly from a
+  // real screenshot showing every account at Rs 0 while the total was right.
+  const cashTodayEvidence = useMemo(() => bankAccountsForHome.map((a) => {
+    const res = resolveAccountBalanceForPeriod(a, transactions, "2000-01-01", todayStr, "closing");
+    return `${a.nickname}: ${res.value === null ? "unverified" : inr(res.value)}`;
+  }), [bankAccountsForHome, transactions, todayStr]);
+  const netWorthEvidenceForHome = useMemo(() => [
+    `Bank cash: ${inr(netWorthForHome.bankTotal)}`,
+    `Investments tracked: ${inr(netWorthForHome.marketTrackedValue + netWorthForHome.otherInvestmentsValue)}`,
+    `Credit card owed: ${inr(netWorthForHome.creditCardOwed)}`,
+    `Other debt: ${inr(netWorthForHome.totalDebt - netWorthForHome.creditCardOwed)}`,
+  ], [netWorthForHome]);
+
+  // "Your dashboard is ready" (backlog #70). In the demo, Asha's chosen months of history (and the answers she
+  // gave about her once-seen bills) become what Home actually computes from: the REAL engine runs on that many
+  // months of her generated data, rather than a second, scripted set of numbers. See src/demo/sliceDemo.js.
+  async function finishJourney(info) {
+    if (info && info.demo) {
+      cardAnswersRef.current = info.answers || [];
+      setDemoAnswers({ feeAns: info.feeAns, insAns: info.insAns, cardAnswers: info.answers || [] });
+      const sliced = sliceDemoJourney(generateDemoData(), info.h, { feeAns: info.feeAns, insAns: info.insAns },
+        (rows, o) => labelStatementFull(rows, DEMO_JOURNEY_SOURCE.engine, info.answers || [], o));
+      setTransactions(sliced.transactions); setAccounts(sliced.accounts);
+      setHoldingSnapshots(sliced.holdingSnapshots); setDebtSchedules(sliced.debtSchedules);
+      setOtherInvestments(sliced.otherInvestments); setGoals(sliced.goals);
+      setMerchantAliases(sliced.merchantAliases || []); setRules((prev) => [...prev.filter((r) => !String(r.id).startsWith("rule_ans_")), ...(sliced.rules || [])]); // library groups + the rules behind card answers
+    }
+    if (info && !info.demo) { // own statement: the journey's answers become the person's rules and merchant groups
+      const all = info.answers || [];
+      cardAnswersRef.current = all; setRealAnswers(all); saveState("cardAnswers", all);
+      if (all.length) relabelLive(all, null);
+      setRealJourney(null); setExperiencePreference("new");
+    }
+    setView("home");
+  }
+
+  // Demo Home's "Asha's story" (backlog #74): add her history / accounts and watch Home recompute on the REAL
+  // engine. Current state is derived from the data itself, so it survives a reload of the demo sandbox.
+  const demoStory = isDemoActive() ? {
+    h: monthsOfHistoryForHome,
+    card: accounts.some((a) => a.id === "acc_card"), loan: accounts.some((a) => a.id === "acc_loan"),
+    inv: accounts.some((a) => a.id === "acc_demat"), goalSet: goals.length > 0,
+  } : null;
+  // Ask (backlog #75): the facts the Ask answers are built from - the SAME numbers Home shows, never a second set.
+  const askFacts = (() => {
+    if (!transactions.length) return null;
+    const monthKeys = transactions.map((t) => t.date.slice(0, 7)).sort();
+    const g = goals[0] || null, snap = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
+    let goal = null;
+    if (g) {
+      const start = new Date(g.createdAt), now = new Date(todayStr);
+      const elapsed = (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth());
+      const end = new Date(Date.UTC(start.getFullYear(), start.getMonth() + Math.round(g.yearsToGoal * 12), 1));
+      goal = { name: g.name, target: g.costToday, monthsLeft: Math.round(g.yearsToGoal * 12) - elapsed, sipPlannedMonthly: g.sipPlannedMonthly,
+        targetDate: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][end.getUTCMonth()] + " " + end.getUTCFullYear() };
+    }
+    return { aliases: merchantAliases, asOf: todayStr, cash: cashToday, cushion: cashBuffer, months: monthsOfHistoryForHome, firstMonth: monthKeys[0], lastMonth: monthKeys[monthKeys.length - 1],
+      lastTxnDate: lastTransactionDate, projection: projectionForHome, commitments: commitmentsForHome, transactions, accounts, goal, invested: snap ? snap.totalCurrentValue || 0 : 0 };
+  })();
+  // A card answered from the Home deck: the same answer shape the onboarding cards produce, kept in one list so every
+  // re-slice (Asha's story) re-labels with it. A "does this repeat?" card sets the school-fee / insurance answer instead.
+  const cardAnswersRef = useRef([]);
+  // The engine's merchant groups (Sub Category 2) and learned rules from a labelling run, merged into what the person already has.
+  function mergeLabelOutputs(lab) {
+    setMerchantAliases((prev) => { // the person's own groups win: a merchant already in a group is not put into a second one
+      const next = prev.map((a) => ({ ...a, variants: [...(a.variants || [])] })); const taken = new Set(next.flatMap((a) => a.variants));
+      (lab.merchantAliases || []).forEach((al) => { const fresh = (al.variants || []).filter((v) => !taken.has(v)); fresh.forEach((v) => taken.add(v)); if (!fresh.length) return;
+        const ex = next.find((a) => a.canonical === al.canonical); if (ex) ex.variants.push(...fresh); else next.push({ ...al, variants: fresh }); });
+      return next;
+    });
+    if ((lab.rules || []).length) setRules((prev) => [...prev.filter((r) => !lab.rules.some((x) => x.id === r.id)), ...lab.rules]);
+  }
+  // Own-statement path: re-label from the answers. `onlyKey` limits the rewrite to one merchant (a card answered from Home),
+  // so edits made elsewhere in Review are not undone; the end of the journey rewrites everything the journey itself labelled.
+  function relabelLive(answers, onlyKey) {
+    const bankIds = new Set(accounts.filter((a) => a.type === "bank" || a.type === "creditCard").map((a) => a.id));
+    const rows = transactions.filter((t) => bankIds.has(t.accountId)).map((t) => ({ id: t.id, accountId: t.accountId, date: t.date, description: t.description, amount: t.amount, direction: t.direction, ...(t.aiKey ? { aiKey: t.aiKey } : {}) }));
+    const lab = labelStatementFull(rows, liveEngine, answers, { linked: {}, cardAccounts: new Set(accounts.filter((a) => a.type === "creditCard").map((a) => a.id)) });
+    const byId = new Map(lab.transactions.map((t) => [t.id, t]));
+    const keyOf = (t) => t.aiKey || DEMO_JOURNEY_SOURCE.engine.normalizeMerchant(stripHandle(t.description));
+    setTransactions((prev) => prev.map((t) => { const l = byId.get(t.id); if (!l || (onlyKey && keyOf(t) !== onlyKey)) return t;
+      return { ...t, merchant: l.merchant, merchantLocked: true, labelSource: "engine", category: l.category, subCategory: l.subCategory, frequencyClass: l.frequencyClass, frequency: l.frequency || null, control: l.control }; }));
+    mergeLabelOutputs(lab);
+  }
+  // Label a fresh import with the SAME engine labeller the demo runs (backlog #72): library + starter rules + sightings + the person's
+  // earlier card answers. Earlier rows of the account are included so a merchant seen before keeps its pattern; only the new rows take labels.
+  function labelImport(accountId, imported, batchId, isCard) {
+    const rawOf = (t) => ({ id: t.id, accountId: t.accountId, date: t.date, description: t.description, amount: t.amount, direction: t.direction, ...(t.aiKey ? { aiKey: t.aiKey } : {}) });
+    const lab = labelStatementFull([...transactions.filter((t) => t.accountId === accountId).map(rawOf), ...imported.map(rawOf)], liveEngine, cardAnswersRef.current, { linked: {}, batchId, cardAccounts: new Set(isCard || accounts.some((a) => a.id === accountId && a.type === "creditCard") ? [accountId] : []) });
+    const byId = new Map(lab.transactions.map((t) => [t.id, t]));
+    mergeLabelOutputs(lab);
+    return imported.map((t) => { const l = byId.get(t.id); return !l ? t : { ...t, merchant: l.merchant, merchantLocked: true, labelSource: "engine", category: l.category, subCategory: l.subCategory, frequencyClass: l.frequencyClass, frequency: l.frequency || null, control: l.control, purpose: l.purpose }; });
+  }
+  // The first statement a person ever adds starts the same reading -> sorted -> cards -> payoff journey the demo shows, on their own data.
+  function onFirstImport({ imported, periodStart, periodEnd, accountName, isCard }) { // a card's payments and refunds are not income, so they stay out of the journey
+    if (isDemoActive() || transactions.length > 0) return;
+    const months = (Number(periodEnd.slice(0, 4)) - Number(periodStart.slice(0, 4))) * 12 + Number(periodEnd.slice(5, 7)) - Number(periodStart.slice(5, 7)) + 1;
+    const h = [12, 6, 3, 2, 1].find((x) => x <= months) || 1; // the journey screens read whole-month windows: the longest one the upload covers
+    firstImportRef.current = true;
+    setRealJourney({ rows: imported.filter((t) => !(isCard && t.direction === "credit")).map((t) => ({ id: t.id, accountId: t.accountId, date: t.date, description: t.description, amount: t.amount, direction: t.direction })), historyEnd: periodEnd, h, accountName });
+    setView("landing");
+  }
+  // A card answered from the stored rows (backlog #125): the answer fills what those rows lack, and becomes a rule on the payee so the
+  // rest of that payee - and next month - follow it. Rows the person had already filled keep their own values.
+  function applyMerchantAnswer(card, sim) {
+    const ids = new Set(card.txnIds);
+    const first = transactions.find((t) => ids.has(t.id));
+    if (!first) return;
+    const pattern = (first.aiKey || normalizeMerchant(first.description)).toLowerCase();
+    const subOptions = subCategoryOptionsFor(sim.category).length > 0, freqOk = isFrequencyEligible(sim.frequencyClass);
+    const filled = {
+      category: sim.category, subCategory: subOptions ? sim.subCategory || null : null, frequencyClass: sim.frequencyClass || null,
+      frequency: freqOk ? sim.frequency || "Monthly" : null,
+      control: sim.category === "Expense" && sim.frequencyClass !== "One-Time" ? sim.control || null : null,
+      purpose: sim.purpose || "Personal",
+      linkedAccountId: linkableAccountTypesFor(sim.category, sim.subCategory).length > 0 && sim.linkedAccountId !== "__none__" ? sim.linkedAccountId || null : null,
+    };
+    const noAccount = sim.linkedAccountId === "__none__" && linkableAccountTypesFor(sim.category, sim.subCategory).length > 0; // "an account I haven't added yet": not asked again; Next steps still offers it; linked on its own when that account is added
+    const offer = card.offer || null; // this card came back because an account was added
+    const pendingName = noAccount && !offer ? (sim.pendingAccountName || "").trim() || (first.merchant || "").trim() : "";
+    if (noAccount && pendingName) setKnowledgeStore((prev) => addPendingAccount(prev, { name: pendingName, rowIds: card.txnIds, knownAccountIds: accounts.map((a) => a.id) }, new Date().toISOString()));
+    if (offer && noAccount) setKnowledgeStore((prev) => declinePendingAccount(prev, offer.noteKey, offer.accountId)); // "not this account": the next waiting card is asked
+    if (offer && !noAccount && sim.linkedAccountId) setKnowledgeStore((prev) => confirmPendingAccount(prev, offer.noteKey, sim.linkedAccountId));
+    if (sim.group && (sim.category === "Expense" || sim.category === "Income")) {
+      const variants = [...new Set(transactions.filter((t) => ids.has(t.id)).map((t) => t.merchant || t.description))];
+      setMerchantAliases((prev) => {
+        const name = /^other$/i.test(sim.group) ? "Others" : sim.group;
+        const ex = prev.find((g) => g.canonical.toLowerCase() === name.toLowerCase() && (g.type || "category") === "category");
+        if (ex) return prev.map((g) => (g === ex ? { ...g, variants: [...new Set([...g.variants, ...variants])] } : g));
+        return [...prev, { id: uid("mg"), canonical: name, type: "category", variants }];
+      });
+    }
+    const isRemarkCard = !!card.remarkCard && !!card.remarkKey;
+    const existing = isRemarkCard ? rules.find((x) => x.scope === "remark" && x.remarkKey === card.remarkKey) : rules.find((x) => x.pattern.toLowerCase() === pattern);
+    const ruleId = existing ? existing.id : uid("rule");
+    if (isRemarkCard) setRules((prev) => [...prev.filter((x) => x.id !== ruleId), { ...(existing || {}), id: ruleId, pattern: String(card.searchName || "").toLowerCase(), scope: "remark", remarkKey: card.remarkKey, ...filled, ...(sim.group && (sim.category === "Expense" || sim.category === "Income") ? { group: /^other$/i.test(sim.group) ? "Others" : sim.group } : {}), source: "learned", priority: 500 }]); // below the rules for a payee (1000+), above the starter rules
+    else if (pattern) setRules((prev) => [...prev.filter((x) => x.id !== ruleId), { ...(existing || {}), id: ruleId, pattern, ...filled, ...(sim.group && (sim.category === "Expense" || sim.category === "Income") ? { group: /^other$/i.test(sim.group) ? "Others" : sim.group } : {}), source: "learned", priority: pattern.length + 1000 }]);
+    setTransactions((prev) => prev.map((t) => {
+      if (!ids.has(t.id)) return t;
+      const patch = {};
+      Object.keys(filled).forEach((f) => { if ((t[f] === null || t[f] === undefined || t[f] === "") && filled[f] !== null) patch[f] = filled[f]; });
+      return { ...t, ...patch, ...(noAccount && !t.linkedAccountId ? (offer ? { noLinkedAccount: true } : { noLinkedAccount: true, pendingAccountName: pendingName }) : {}), ...(!noAccount && filled.linkedAccountId ? { noLinkedAccount: false } : {}), matchedRuleId: t.matchedRuleId || (pattern ? ruleId : null) };
+    }));
+  }
+  function answerDeckCard(card, choice) {
+    if (!isDemoActive() && card.spec) { applyMerchantAnswer(card, choice); return; }
+    if (!isDemoActive()) {
+      const key = card.repeat ? "repeat:" + card.key : card.key;
+      const entry = card.repeat ? { key, label: choice, cadence: REPEAT_CADENCE[choice] || null } : { key, label: choice, patch: patchForAnswer(card, choice) };
+      const next = [...cardAnswersRef.current.filter((a) => a.key !== key), entry];
+      cardAnswersRef.current = next; setRealAnswers(next); saveState("cardAnswers", next);
+      relabelLive(next, card.key); return;
+    }
+    if (card.repeat) {
+      const code = { "Every 6 months": "6m", "Every year": "year", "One-off": "once", "Not sure": "unsure" }[choice] || "unsure";
+      const k = /school/i.test(card.name) ? "feeAns" : "insAns";
+      setDemoAnswers((d) => ({ ...d, [k]: code })); applyDemoStory({ [k]: code }); return;
+    }
+    cardAnswersRef.current = [...cardAnswersRef.current.filter((a) => a.key !== card.key), { key: card.key, label: choice, patch: patchForAnswer(card, choice) }];
+    setDemoAnswers((d) => ({ ...d, cardAnswers: cardAnswersRef.current }));
+    applyDemoStory({ cardAnswers: cardAnswersRef.current });
+  }
+  async function applyDemoStory(patch) {
+    const next = { ...demoStory, ...demoAnswers, ...patch };
+    const sliced = sliceDemoJourney(generateDemoData(), next.h, next,
+      (rows, o) => labelStatementFull(rows, DEMO_JOURNEY_SOURCE.engine, next.cardAnswers || [], o));
+    setTransactions(sliced.transactions); setAccounts(sliced.accounts);
+    setHoldingSnapshots(sliced.holdingSnapshots); setDebtSchedules(sliced.debtSchedules);
+    setOtherInvestments(sliced.otherInvestments); setGoals(sliced.goals);
+      setMerchantAliases(sliced.merchantAliases || []); setRules((prev) => [...prev.filter((r) => !String(r.id).startsWith("rule_ans_")), ...(sliced.rules || [])]); // library groups + the rules behind card answers
+  }
+
+  // One element for the whole welcome -> onboarding -> demo journey (backlog #70). In a demo session it
+  // starts at "Meet Asha"; otherwise at the welcome screen. Explore / Exit go through the same sandbox
+  // swap the rest of the app already uses (src/demo/demoStorage.js).
+  const pickStatement = (file) => { if (!file) return; firstImportRef.current = false; intakeLogRef.current = [{ stage: "opening", label: "Opening " + file.name }]; setIntakeStatus({ stage: "opening", label: "Opening " + file.name, log: intakeLogRef.current }); setIntake({ file, token: Date.now() }); };
+  const onIntakeStatus = (s) => {
+    intakeLogRef.current = [...intakeLogRef.current, s]; setIntakeStatus({ ...s, log: intakeLogRef.current });
+    if (s.stage === "handoff") { if (intake) setDroppedFile(intake.file); setIntake(null); setRealJourney(null); setView("upload"); return; } // holdings / loans: their own review screens
+    if (s.stage === "imported") { // a later statement goes to Home (after a moment, so the "Saved" line is seen); the first one continues into the journey
+      if (!firstImportRef.current) { const wait = addForRef.current ? 900 : 0; setTimeout(() => { addForRef.current = null; setAddFor(null); setView("home"); }, wait); }
+      firstImportRef.current = false;
+    } // a later statement goes straight to Home; the first one continues into the journey
+  };
+  const intakeProp = useMemo(() => (intake ? { file: intake.file, token: intake.token, onStatus: onIntakeStatus, controlRef: intakeControlRef } : null), [intake]); // eslint-disable-line react-hooks/exhaustive-deps
+  const realJourneySource = useMemo(() => {
+    if (!realJourney || isDemoActive()) return null;
+    const eng = DEMO_JOURNEY_SOURCE.engine, jr = realJourney;
+    const balanceKnown = accounts.some((a) => (a.type === "bank" || a.type === "creditCard") && ((a.balanceHistory || []).length > 0 || typeof a.lastKnownBalance === "number"));
+    // The closing balance a person gives for a complete statement also fixes its opening balance (closing minus the statement's net flow),
+    // dated the day before the first row - the same anchors an import with both balances would have recorded.
+    const onSetBalance = (amount) => setAccounts((prev) => prev.map((a) => {
+      if (!(a.type === "bank" && a.nickname === jr.accountName)) return a;
+      const first = jr.rows.reduce((m, r) => (r.date < m ? r.date : m), jr.rows[0].date);
+      const net = jr.rows.reduce((n, r) => n + (r.direction === "credit" ? r.amount : -r.amount), 0);
+      const d = new Date(first + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); const openDate = d.toISOString().slice(0, 10);
+      const keep = (a.balanceHistory || []).filter((h) => h.asOfDate !== jr.historyEnd && h.asOfDate !== openDate);
+      return { ...a, lastKnownBalance: amount, balanceHistory: [...keep, { asOfDate: openDate, balance: Math.round((amount - net) * 100) / 100 }, { asOfDate: jr.historyEnd, balance: amount }].sort((x, y) => x.asOfDate.localeCompare(y.asOfDate)) };
+    }));
+    return { live: true, rows: () => jr.rows, historyEnd: jr.historyEnd, engine: eng, h: jr.h, today: cashToday || 0, accountName: jr.accountName, balanceKnown, onSetBalance,
+      forecast: (h, fee, ins, answers) => {
+        const from = (() => { const [y, m] = jr.historyEnd.split("-").map(Number); return new Date(Date.UTC(y, m - 1 - (h - 1), 1)).toISOString().slice(0, 10); })();
+        const lab = labelStatementFull(jr.rows.filter((x) => x.date >= from), eng, answers || [], { linked: {} });
+        const accts = accounts.filter((a) => a.type === "bank");
+        const commitments = computeRecurringCommitments(lab.transactions, accts, seedRules(), lab.merchantAliases);
+        const streams = computeForecastStreams(lab.transactions, accts, commitments, lab.merchantAliases, jr.historyEnd.slice(0, 7));
+        const behaviours = computeAmountBehaviors(lab.transactions, lab.merchantAliases);
+        const p = computeCashProjection(cashToday || 0, jr.historyEnd, 3, { commitments, amountBehaviors: behaviours, forecastStreams: streams, accounts: accts, cashBuffer: 0 });
+        return { states: p.dailyStates, low: p.projectedMinimumCash, lowDate: p.projectedMinimumCashDate };
+      } };
+  }, [realJourney, accounts, cashToday]);
+  // A person who already has data is never held on the welcome flow: it opens on their Home, and every way back to the front page offers it.
+  const hasOwnData = !isDemoActive() && (transactions.length > 0 || accounts.length > 0);
+  const goHome = () => { addForRef.current = null; setAddFor(null); setView(experience === "new" ? "home" : "dashboard"); };
+  const onboardingElement = (
+    <OnboardingFlow
+      demo={isDemoActive()}
+      household={household} setHousehold={setHousehold}
+      priority={priority} setPriority={setPriority} priorities={priorities} setPriorities={setPriorities}
+      householdAnswered={householdAnswered} setHouseholdAnswered={setHouseholdAnswered}
+      intakeStatus={intakeStatus} intakeControlRef={intakeControlRef} onPickFile={pickStatement}
+      onStartUpload={(file) => { if (file) setDroppedFile(file); setRealJourney(null); setView("upload"); }}
+      onTryDemo={() => { enterDemoMode(); }}
+      onExitDemo={() => { exitDemoMode(); }}
+      onFinish={finishJourney}
+      journeySource={isDemoActive() ? DEMO_JOURNEY_SOURCE : realJourneySource}
+      startAt={realJourneySource ? "reading" : null}
+      onGoHome={hasOwnData && !realJourney ? goHome : null} addFor={addFor}
+    />
+  );
+
+  const homeScreenElement = (
+    <HomeScreen
+      cashToday={cashToday} netWorth={netWorthForHome} debtSummary={debtSummaryForHome}
+      goalsTracking={goalsTrackingForHome} goals={goals}
+      projection={projectionForHome}
+      lastTransactionDate={lastTransactionDate} todayStr={todayStr}
+      hasAnyData={transactions.length > 0 || accounts.length > 0}
+      uncategorizedCount={uncategorizedCount}
+      monthsOfHistory={monthsOfHistoryForHome}
+      cashBuffer={cashBuffer}
+      nextSteps={nextStepsForHome}
+      attentionItems={attentionItemsForHome}
+      helpMeUnderstandItems={helpMeUnderstandItemsForHome}
+      establishedPatterns={establishedPatternsForHome} priority={priority}
+      askFacts={askFacts} deck={deckForHome ? { count: deckForHome.needs ?? deckForHome.cards.length } : null} onOpenDeck={() => setDeckOpen(true)} demoStory={demoStory} onDemoStory={applyDemoStory} onDemoStartOver={() => enterDemoMode()}
+      hasGoalSet={hasGoalSet}
+      onDismissItem={dismissHomeKnowledgeItem} onSnoozeItem={snoozeHomeKnowledgeItem} onStepAct={onNextStepAct}
+      onSetCashBuffer={setCashBuffer}
+      household={household} onSetHousehold={setHousehold}
+      onConfirmHousehold={() => setHouseholdAnswered(true)}
+      onSetPriorities={setPriorities}
+      cashTodayEvidence={cashTodayEvidence}
+      netWorthEvidence={netWorthEvidenceForHome}
+      lastBackupAt={lastBackupAt}
+      autoBackupOn={!!autoBackupFolderName}
+      onBackupNow={exportBackup}
+      setView={setView}
+    />
+  );
+
+  // Backlog #59 fix: this early return MUST sit here, after every hook above
+  // has executed unconditionally, never earlier. It was previously placed
+  // before several useMemo calls (helpMeLearnItemsForHome, cashTodayEvidence,
+  // netWorthEvidenceForHome) - meaning those hooks were skipped entirely on
+  // the landing render but DID run on every other render, a direct violation
+  // of React's Rules of Hooks (hook call order and count must be IDENTICAL
+  // on every render of a given component, with no exceptions - "this hook
+  // only matters for non-landing views" is a reason to branch INSIDE the
+  // hook's own logic, never a reason to skip the hook call itself). Reported
+  // directly: "About page comes up fine, clicking Get Started shows blank" -
+  // exactly the signature of this bug, since the very first render (landing)
+  // hid the mismatch, and the first view change exposed it. This is also
+  // precisely the blind spot execute-component.cjs's own documentation
+  // already named ("NOT every view/state combination") - closed below.
+  // The welcome screen, onboarding questions and the demo journey are ONE chrome-free flow (no app nav),
+  // matching the prototype. A second early return is safe here for the same reason as before (#59): it
+  // sits after every hook in this component has already run.
   if (view === "landing") {
-    return <LandingPage onGetStarted={() => setView("cashflow")} />;
+    // The statement chosen on the welcome flow is read by the same upload engine, hosted out of sight: the person only ever
+    // sees the onboarding screens (real progress, password and key prompts, problems) - never the old Upload screen.
+    return (
+      <>
+        {onboardingElement}
+        {!isDemoActive() && (
+          <div style={{ display: "none" }} aria-hidden="true">
+            <UploadTab
+              accounts={accounts} setAccounts={setAccounts} rules={rules}
+              transactions={transactions} setTransactions={setTransactions} showToast={showToast}
+              holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
+              debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
+              effectiveTier={effectiveTier} labelImport={labelImport} onFirstImport={onFirstImport} intake={intakeProp}
+            />
+          </div>
+        )}
+      </>
+    );
   }
 
   return (
@@ -4446,6 +5271,25 @@ export default function BeingWealthyLedger() {
           --ochre: #A8703A;
           --rust: #9C4A34;
           --slate: #55606B;
+          /* Design tokens (migration plan Phase 1, backlog #43 / src/ui/tokens.js).
+           * Same values regardless of light/dark theme — only colours differ between
+           * themes, so these live once here rather than being repeated in .theme-dark.
+           * --label-size is a floor of 13px: several shell labels below were previously
+           * hardcoded at 10.5–11.5px, smaller than comfortably legible. Raising them via
+           * one named variable (rather than editing each occurrence by hand) is what
+           * makes this a token change, not a one-off tweak — every place that adopts
+           * --label-size moves together if this number is ever revisited. */
+          --label-size: 13px;
+          /* Compact-tier floor, distinct from --label-size: the widest real table in this
+           * app (Review's by-transaction view) has 16 columns, and 13px genuinely overflows
+           * it — "Remember" gets cut off past the shell's edge, verified with a real render
+           * of the actual column headers at the app's real max-width before picking this
+           * number. 12px is the largest size that does not overflow that table, confirmed
+           * the same way, and is still a real improvement over today's 10.5px. */
+          --label-size-compact: 12px;
+          --eyebrow-size: 13.5px;
+          --control-height: 40px;
+          --radius: 6px;
           font-family: 'IBM Plex Sans', sans-serif;
           background: var(--paper);
           color: var(--ink);
@@ -4470,7 +5314,7 @@ export default function BeingWealthyLedger() {
         .bw-theme-toggle {
           background: none; border: 1px solid var(--line); color: var(--ink-soft);
           padding: 6px 9px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; gap: 5px;
-          font-size: 11.5px;
+          font-size: var(--label-size);
         }
         .bw-theme-toggle:hover { border-color: var(--teal); color: var(--teal); }
         .bw-shell { max-width: 1080px; margin: 0 auto; }
@@ -4485,16 +5329,18 @@ export default function BeingWealthyLedger() {
         .bw-title em { font-style: italic; color: var(--teal); font-weight: 500; }
         .bw-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }
         .bw-screen-name { font-family: 'Fraunces', serif; font-weight: 600; font-size: 16px; color: var(--ink); margin: 18px 0 10px; }
+        .bw-screen-sub { font-family: 'IBM Plex Sans', sans-serif; font-weight: 400; font-size: 12.5px; color: var(--ink-soft); margin-left: 10px; }
+        .bw-screen-sub::before { content: '—'; margin-right: 10px; color: var(--line); }
         .bw-tagline { font-size: 13px; color: var(--ink-soft); margin-top: 3px; font-style: italic; }
         .bw-reset {
-          font-size: 11.5px; color: var(--ink-soft); background: none; border: 1px solid var(--line);
+          font-size: var(--label-size); color: var(--ink-soft); background: none; border: 1px solid var(--line);
           padding: 6px 10px; border-radius: 3px; cursor: pointer; display: flex; align-items: center; gap: 5px;
         }
         .bw-reset:hover { border-color: var(--rust); color: var(--rust); }
 
         .bw-tabs { display: flex; gap: 4px; margin-bottom: 20px; flex-wrap: wrap; }
         .bw-tab {
-          font-family: 'IBM Plex Mono', monospace; font-size: 12px; letter-spacing: 0.03em;
+          font-family: 'IBM Plex Mono', monospace; font-size: var(--label-size); letter-spacing: 0.03em;
           padding: 9px 14px 8px; background: var(--card); border: 1px solid var(--line);
           border-bottom: none; border-radius: 4px 4px 0 0; cursor: pointer; color: var(--ink-soft);
           display: flex; align-items: center; gap: 6px; position: relative; top: 1px;
@@ -4515,7 +5361,7 @@ export default function BeingWealthyLedger() {
         @media (max-width: 720px) { .bw-grid2 { grid-template-columns: 1fr; } }
 
         .bw-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
-        .bw-field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
+        .bw-field label { font-size: var(--label-size); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
         .bw-field select, .bw-field input[type=text] {
           font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; padding: 8px 9px; border: 1px solid var(--line);
           border-radius: 4px; background: var(--card); color: var(--ink);
@@ -4537,11 +5383,11 @@ export default function BeingWealthyLedger() {
         .bw-btn.ghost { background: transparent; color: var(--ink); }
         .bw-btn.ghost:hover { background: rgba(0,0,0,0.04); color: var(--ink); }
         .bw-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .bw-btn.small { padding: 5px 10px; font-size: 12px; }
+        .bw-btn.small { padding: 5px 10px; font-size: var(--label-size-compact); } /* was already 12px - this is a same-value rename to the now-evidence-based compact token, not a visual change */
 
         table.bw-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
         table.bw-table th {
-          text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+          text-align: left; font-size: var(--label-size-compact); text-transform: uppercase; letter-spacing: 0.04em;
           color: var(--ink-soft); border-bottom: 1px solid var(--ink); padding: 6px 8px; font-weight: 600;
         }
         table.bw-table td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
@@ -4560,7 +5406,7 @@ export default function BeingWealthyLedger() {
         .bw-summary-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 22px; }
         @media (max-width: 800px) { .bw-summary-row { grid-template-columns: repeat(2, 1fr); } }
         .bw-stat { border: 1px solid var(--line); border-radius: 6px; padding: 14px; background: var(--card); }
-        .bw-stat .label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
+        .bw-stat .label { font-size: var(--label-size); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
         .bw-stat .value { font-family: 'IBM Plex Mono', monospace; font-size: 21px; font-weight: 600; margin-top: 4px; }
 
         .bw-toast {
@@ -4585,12 +5431,79 @@ export default function BeingWealthyLedger() {
         .bw-zone-header p { font-size: 12px; color: var(--ink-soft); margin: 1px 0 0; }
         .bw-hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
 
+        /* ---- Merchant bulk-select + grouping bar (Review, By merchant mode) ---- */
+        .bw-bulk-bar {
+          display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap;
+          border: 1px solid var(--teal); background: rgba(46,102,89,0.07); border-radius: 6px;
+          padding: 0 14px; margin-bottom: 0;
+          max-height: 0; overflow: hidden; opacity: 0; transform: translateY(-6px);
+          transition: max-height 0.28s ease, opacity 0.22s ease, transform 0.22s ease, margin 0.22s ease, padding 0.22s ease;
+        }
+        .bw-bulk-bar.open { max-height: 260px; opacity: 1; transform: translateY(0); padding: 12px 14px; margin-bottom: 14px; }
+        .bw-bulk-count { font-weight: 600; font-size: 12.5px; white-space: nowrap; padding-top: 4px; }
+        .bw-bulk-field { display: flex; flex-direction: column; gap: 3px; }
+        .bw-bulk-field label { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+        .bw-bulk-divider { width: 1px; align-self: stretch; background: var(--line); margin-top: 4px; }
+        .bw-group-name-input {
+          font-family: 'IBM Plex Sans', sans-serif; font-size: 12.5px; padding: 6px 8px; border: 1px solid var(--line);
+          border-radius: 4px; background: var(--card); color: var(--ink); width: 180px;
+        }
+        .bw-type-row { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--ink-soft); }
+        .bw-type-row label { display: flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+        .bw-type-row input { accent-color: var(--teal); }
+
+        .bw-suggest-chip {
+          display: inline-flex; align-items: center; gap: 4px; font-size: 10px; margin-left: 8px;
+          padding: 2px 8px; border-radius: 20px; border: 1px solid var(--ochre); color: var(--ochre);
+          background: transparent; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif;
+        }
+        .bw-suggest-chip:hover { background: rgba(168,112,58,0.1); }
+
+        .bw-name-check { font-size: 11px; margin-top: 5px; padding: 6px 9px; border-radius: 5px; display: none; line-height: 1.4; max-width: 340px; }
+        .bw-name-check.exists { display: block; background: rgba(46,102,89,0.12); color: var(--teal); border: 1px solid var(--teal); }
+        .bw-name-check.conflict { display: block; background: rgba(156,74,52,0.10); color: var(--rust); border: 1px solid var(--rust); }
+
+        .bw-suggested-badge {
+          font-size: 9px; padding: 1px 6px; border-radius: 20px; border: 1px dashed var(--ochre); color: var(--ochre);
+          margin-left: 5px; white-space: nowrap;
+        }
+        select.bw-select-inline.suggested { border-style: dashed; border-color: var(--ochre); }
+
+        .bw-existing-group-note {
+          font-size: 10.5px; color: var(--ink-soft); margin-bottom: 12px; padding: 8px 10px;
+          border: 1px solid var(--line); border-radius: 5px; background: var(--paper);
+        }
+
+        /* ---- Info tooltip ("i" icon with a definition on hover/click) ---- */
+        .bw-info-wrap { position: relative; display: inline-flex; vertical-align: middle; margin-left: 4px; }
+        .bw-info-icon {
+          width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--ink-soft); color: var(--ink-soft);
+          font-size: 9.5px; font-family: 'IBM Plex Sans', sans-serif; display: inline-flex; align-items: center;
+          justify-content: center; cursor: help; background: none; padding: 0; line-height: 1;
+        }
+        .bw-info-icon:hover, .bw-info-icon:focus { border-color: var(--teal); color: var(--teal); outline: none; }
+        .bw-info-tooltip {
+          position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+          background: var(--ink); color: var(--card); font-size: 11px; line-height: 1.45;
+          padding: 8px 10px; border-radius: 5px; width: 220px; z-index: 20;
+          opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
+          font-family: 'IBM Plex Sans', sans-serif; font-weight: 400; text-transform: none; letter-spacing: normal;
+        }
+        .bw-info-wrap:hover .bw-info-tooltip, .bw-info-icon:focus + .bw-info-tooltip { opacity: 1; }
+
+        .bw-review-warning {
+          display: flex; align-items: flex-start; gap: 8px; font-size: 11.5px; color: var(--ochre);
+          background: rgba(168,112,58,0.08); border: 1px solid var(--ochre); border-radius: 6px;
+          padding: 9px 12px; margin-bottom: 14px; line-height: 1.5;
+        }
+
         .bw-insight-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 16px 0 22px; }
         .bw-insight-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
         .bw-insight-card.clickable { cursor: pointer; transition: border-color 0.15s; }
         .bw-insight-card.clickable:hover { border-color: var(--teal); }
         .bw-insight-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; }
         .bw-insight-title { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--ink); }
+        .bw-insight-desc { font-size: 11px; color: var(--ink-soft); line-height: 1.4; margin: 2px 0 6px; }
         .bw-insight-badge { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 20px; white-space: nowrap; }
         .bw-insight-value { font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 600; color: var(--ink); }
         .bw-insight-delta { font-size: 10.5px; margin: 3px 0 10px; }
@@ -4623,11 +5536,24 @@ export default function BeingWealthyLedger() {
         .bw-wf-arrow-h { display: none; }
         .bw-wf-arrow-v { display: none; }
 
+        .bw-demo-pill {
+          display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap;
+          background: var(--card); border: 1px solid var(--line); border-radius: 22px;
+          padding: 6px 8px 6px 16px; margin-bottom: 16px; font-size: var(--label-size);
+          color: var(--ink-soft); position: sticky; top: 8px; z-index: 30;
+        }
+        .bw-demo-pill span { display: flex; align-items: center; gap: 8px; }
+        .bw-demo-pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--ochre); display: inline-block; }
+        .bw-demo-pill button {
+          font-family: inherit; font-size: var(--label-size); color: var(--ink); background: none;
+          border: none; text-decoration: underline; cursor: pointer; padding: 6px 10px;
+        }
         .bw-pillars { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
         .bw-pillar {
-          font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; font-weight: 600; letter-spacing: 0.01em;
-          padding: 10px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+          font-family: 'IBM Plex Sans', sans-serif; font-size: var(--label-size); font-weight: 600; letter-spacing: 0.01em;
+          padding: 10px 16px; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
           cursor: pointer; color: var(--ink-soft); display: flex; align-items: center; gap: 7px;
+          min-height: var(--control-height);
         }
         .bw-pillar.active { color: var(--ink); border-color: var(--teal); box-shadow: 0 0 0 1px var(--teal) inset; }
         .bw-pillar.soon { opacity: 0.65; }
@@ -4637,7 +5563,7 @@ export default function BeingWealthyLedger() {
         }
         .bw-data-nav { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
         .bw-data-nav-label {
-          font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em;
+          font-family: 'IBM Plex Mono', monospace; font-size: var(--label-size); text-transform: uppercase; letter-spacing: 0.05em;
           color: var(--ink-soft); margin-right: 2px;
         }
         .bw-pillar-placeholder {
@@ -4648,9 +5574,15 @@ export default function BeingWealthyLedger() {
       `}</style>
 
       <div className="bw-shell">
+        {isDemoActive() && (
+          <div className="bw-demo-pill">
+            <span><i /> Demo &middot; sample data, not yours</span>
+            <button onClick={exitDemoMode}>Exit demo</button>
+          </div>
+        )}
         <div className="bw-head">
           <div>
-            <div className="bw-title" style={{ cursor: "pointer" }} onClick={() => setView("landing")} title="Back to the front page">
+            <div className="bw-title" style={{ cursor: "pointer" }} onClick={() => (hasOwnData ? goHome() : setView("landing"))} title={hasOwnData ? "Back to Home" : "Back to the front page"}>
               Being <em>Wealthy</em> <span style={{ fontSize: 11, fontWeight: 400, color: "var(--ink-soft)", verticalAlign: "middle" }}>v{__APP_VERSION__}</span>
             </div>
             <div className="bw-tagline">See your money clearly.</div>
@@ -4673,6 +5605,18 @@ export default function BeingWealthyLedger() {
             </button>
             <button className="bw-theme-toggle" onClick={toggleTheme} title="Toggle light/dark">
               {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />} {theme === "dark" ? "Light" : "Dark"}
+            </button>
+            {/* Migration plan (backlog #45): opt-in only, visible to everyone, changes
+             *  nothing for anyone who doesn't press it. This is the only place the
+             *  experience flag can actually change today - Phase 0 built the flag and
+             *  its setter, but nothing ever called it until this control existed. */}
+            <button className="bw-theme-toggle" onClick={() => {
+                const next = experience === "new" ? "classic" : "new";
+                setExperiencePreference(next);
+                setView(next === "new" ? "home" : "dashboard");
+              }}
+              title={experience === "new" ? "Switch back to the classic Dashboard" : "Try the new Home screen"}>
+              {experience === "new" ? "Classic view" : "Try new Home"}
             </button>
             <button className="bw-reset" onClick={exportBackup} title="Download everything as one file">
               <Download size={12} /> Backup
@@ -4749,27 +5693,32 @@ export default function BeingWealthyLedger() {
         )}
 
         <div className="bw-screen-name">
-          {{
-            dashboard: "Dashboard", cashflow: "Cash Flow", networth: "Net Worth", investments: "Investments", debt: "Debt", goals: "Goals",
-            analyst: "Analyst", cfo: "Personal CFO", upload: "Upload", review: "Review", rules: "Rules", accounts: "Accounts",
-          }[view] || ""}
+          {SCREEN_INFO[view] ? SCREEN_INFO[view].name : ""}
+          {SCREEN_INFO[view] && <span className="bw-screen-sub">{SCREEN_INFO[view].subtitle}</span>}
         </div>
 
         <div className="bw-pillars">
-          <PillarButton id="dashboard" icon={LayoutDashboard} label="Dashboard" view={view} setView={setView} />
+          {/* Opt-in only (backlog #45): the new Home replaces Dashboard in the SAME
+           *  nav slot only for someone who has explicitly switched experience -
+           *  everyone else sees exactly today's Dashboard, unchanged. */}
+          {experience === "new" ? (
+            <PillarButton id="home" icon={Home} label="Home" view={view} setView={setView} />
+          ) : (
+            <PillarButton id="dashboard" icon={LayoutDashboard} label="Dashboard" view={view} setView={setView} />
+          )}
           <PillarButton id="cashflow" icon={LineChartIcon} label="Cash Flow" view={view} setView={setView} />
           <PillarButton id="networth" icon={Landmark} label="Net Worth" view={view} setView={setView} />
           <PillarButton id="investments" icon={TrendingUp} label="Investments" view={view} setView={setView} />
           <PillarButton id="debt" icon={TrendingDown} label="Debt" view={view} setView={setView} />
           <PillarButton id="goals" icon={Flag} label="Goals" view={view} setView={setView} />
           <PillarButton id="analyst" icon={Lightbulb} label="Analyst" view={view} setView={setView} />
-          <PillarButton id="cfo" icon={Target} label="Personal CFO" view={view} setView={setView} />
+          <PillarButton id="cfo" icon={Target} label="Money Coach" view={view} setView={setView} />
         </div>
 
         <div className="bw-data-nav">
           <span className="bw-data-nav-label">Data</span>
           <TabButton id="upload" icon={Upload} label="Upload" tab={view} setTab={setView} />
-          <TabButton id="review" icon={ListChecks} label="Review" tab={view} setTab={setView} badge={uncategorizedCount || null} />
+          <TabButton id="review" icon={ListChecks} label="Review" tab={view} setTab={(v) => { if (v === "review" && deckForHome && (deckForHome.needs ?? deckForHome.cards.length) > 0) setDeckOpen(true); else setView(v); }} badge={(deckForHome && (deckForHome.needs ?? deckForHome.cards.length)) || uncategorizedCount || null} />
           <TabButton id="rules" icon={FileText} label="Rules" tab={view} setTab={setView} />
           <TabButton id="accounts" icon={Wallet} label="Accounts" tab={view} setTab={setView} />
           <TabButton id="recurring" icon={Repeat} label="Recurring" tab={view} setTab={setView} />
@@ -4785,6 +5734,8 @@ export default function BeingWealthyLedger() {
               holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots}
               debtSchedules={debtSchedules} setDebtSchedules={setDebtSchedules}
               effectiveTier={effectiveTier}
+              initialFile={droppedFile} onInitialFileConsumed={() => setDroppedFile(null)}
+              labelImport={labelImport} onFirstImport={onFirstImport}
             />
           )}
           {view === "review" && (
@@ -4792,11 +5743,15 @@ export default function BeingWealthyLedger() {
               transactions={transactions} setTransactions={setTransactions}
               rules={rules} setRules={setRules}
               accounts={accounts}
-              merchantAliases={merchantAliases}
+              merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases}
               showToast={showToast}
               onGoToUpload={() => setView("upload")}
+              deckCount={deckForHome ? (deckForHome.needs ?? deckForHome.cards.length) : 0} repeatCount={deckForHome ? deckForHome.repeats || 0 : 0} onOpenDeck={() => setDeckOpen(true)}
               holdingSnapshots={holdingSnapshots}
               debtSchedules={debtSchedules}
+              presetSearch={reviewPreset} onPresetUsed={() => setReviewPreset(null)}
+              conflicts={conflicts} onAcceptConflict={(key, sig) => setKnowledgeStore((p) => acceptConflict(p, key, sig))}
+              presetMode={reviewMode} onModeUsed={() => setReviewMode(null)}
             />
           )}
           {view === "rules" && (
@@ -4826,6 +5781,8 @@ export default function BeingWealthyLedger() {
               goals={goals} onGoToView={setView}
             />
           )}
+          {view === "home" && homeScreenElement}
+          {deckOpen && deckForHome && <ReviewDeck cards={deckForHome.cards} onAnswer={answerDeckCard} onClose={() => setDeckOpen(false)} onSeeAll={() => { setDeckOpen(false); setView("review"); }} onSeeMerchant={(c) => { setDeckOpen(false); setReviewPreset(c.searchName || c.name); setView("review"); }} />}
           {view === "cashflow" && (
             <CashFlowOverview
               transactions={transactions} setTransactions={setTransactions}
@@ -4952,9 +5909,28 @@ export default function BeingWealthyLedger() {
 /** One button in the main pillar navigation bar (Dashboard, Cash Flow, Net Worth,
  *  Investments, Debt, Goals, Analyst, Personal CFO). "soon" renders a badge for
  *  pillars not yet built, without disabling the click itself. */
-function PillarButton({ id, icon: Icon, label, view, setView, soon }) {
+/** One source for every screen's name and its plain-language descriptor - used by the
+ *  visible screen heading AND the nav buttons' hover tooltips, so the two can never
+ *  drift apart. */
+const SCREEN_INFO = {
+  dashboard: { name: "Dashboard", subtitle: "Your money, at a glance" },
+  cashflow: { name: "Cash Flow", subtitle: "Money in, money out, and what's coming" },
+  networth: { name: "Net Worth", subtitle: "Everything you own, minus everything you owe" },
+  investments: { name: "Investments", subtitle: "Where your money is growing" },
+  debt: { name: "Debt", subtitle: "Something you owe" },
+  goals: { name: "Goals", subtitle: "What you're saving toward" },
+  analyst: { name: "Analyst", subtitle: "Ask questions about your money" },
+  cfo: { name: "Money Coach", subtitle: "CFO-level insight, in plain language" },
+  upload: { name: "Upload", subtitle: "Add a bank or card statement" },
+  review: { name: "Review", subtitle: "Check what needs your attention" },
+  rules: { name: "Rules", subtitle: "How transactions get sorted automatically" },
+  accounts: { name: "Accounts", subtitle: "Your linked banks & cards" },
+  recurring: { name: "Recurring", subtitle: "Bills and income that repeat" },
+};
+
+function PillarButton({ id, icon: Icon, label, view, setView, soon, subtitle }) {
   return (
-    <button className={`bw-pillar ${view === id ? "active" : ""} ${soon ? "soon" : ""}`} onClick={() => setView(id)}>
+    <button className={`bw-pillar ${view === id ? "active" : ""} ${soon ? "soon" : ""}`} onClick={() => setView(id)} title={subtitle || (SCREEN_INFO[id] && SCREEN_INFO[id].subtitle)}>
       <Icon size={14} /> {label}
       {soon && <span className="soon-badge">Soon</span>}
     </button>
@@ -4985,7 +5961,7 @@ const TUTORIAL_STEPS = [
   { view: "investments", title: "Investments", body: "Stocks, mutual funds, PF, gold, and property — one place, real invested-vs-current growth." },
   { view: "debt", title: "Debt", body: "What you owe, what you've paid down, and what's coming next." },
   { view: "goals", title: "Goals", body: "Set a target, fund it from real holdings or your savings, and track genuine progress toward it." },
-  { view: "analyst", title: "Analyst & Personal CFO", body: "Ask what changed this month, or whether you can afford something — every answer is traced back to your own numbers, never invented." },
+  { view: "analyst", title: "Analyst & Money Coach", body: "Ask what changed this month, or whether you can afford something — every answer is traced back to your own numbers, never invented." },
   { view: null, title: "That's the whole picture", body: "Upload your first statement whenever you're ready. Retake this tour anytime from the \"Take a tour\" button, top right." },
 ];
 
@@ -5019,9 +5995,23 @@ function TutorialOverlay({ step, totalSteps, title, body, onNext, onBack, onSkip
 /** One button in a secondary (within-screen) tab row - e.g. Upload/Review/Rules/
  *  Accounts under Data, or a screen's own sub-tabs. Distinct from PillarButton, which
  *  is specifically the top-level app navigation. */
-function TabButton({ id, icon: Icon, label, tab, setTab, badge }) {
+/** A small "i" icon that reveals a plain-language definition on hover or keyboard
+ *  focus - for any field whose meaning isn't self-evident from its label alone
+ *  (Group Type, and others as they come up). Deliberately just text, not a modal or
+ *  a click-to-open popover - the definition should be a quick glance away, not an
+ *  extra interaction, since these sit inline in already-dense rows and forms. */
+function InfoTooltip({ text }) {
   return (
-    <button className={`bw-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
+    <span className="bw-info-wrap">
+      <button type="button" className="bw-info-icon" tabIndex={0} aria-label="More information">i</button>
+      <span className="bw-info-tooltip">{text}</span>
+    </span>
+  );
+}
+
+function TabButton({ id, icon: Icon, label, tab, setTab, badge, subtitle }) {
+  return (
+    <button className={`bw-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)} title={subtitle || (SCREEN_INFO[id] && SCREEN_INFO[id].subtitle)}>
       <Icon size={13} /> {label}
       {badge ? <span className="badge">{badge}</span> : null}
     </button>
@@ -5252,7 +6242,7 @@ function describeCommitmentPattern(pattern) {
   return `The ${ordinal} ${WEEKDAY_NAMES[pattern.expectedWeekday]} of the month`;
 }
 
-const CONFIDENCE_TIER_LABEL = { estimate: "Estimate", expected: "Expected", confirmed: "Confirmed" };
+const CONFIDENCE_TIER_LABEL = { estimate: "Not enough history yet", expected: "Still learning this pattern", confirmed: "Well-established pattern" };
 const CONFIDENCE_TIER_COLOR = { estimate: "var(--ochre)", expected: "#7A5C8C", confirmed: "var(--teal)" };
 
 /** Recurring Commitments - shows every group the learner attempted, including its
@@ -5262,6 +6252,7 @@ const CONFIDENCE_TIER_COLOR = { estimate: "var(--ochre)", expected: "#7A5C8C", c
  *  scattered history that never clustered into a predictable day - rather than
  *  being an invisible, undebuggable gap. */
 function RecurringCommitmentsPanel({ transactions, accounts, rules, merchantAliases }) {
+  const accountName = (id) => accounts.find((a) => a.id === id)?.nickname || "—";
   const commitments = useMemo(() => computeRecurringCommitments(transactions, accounts, rules, merchantAliases), [transactions, accounts, rules, merchantAliases]);
   // Amount Behaviour's home is the categorization screen (Review tab) - this panel
   // reads that same shared computation rather than computing its own, so the two can
@@ -5340,7 +6331,11 @@ function RecurringCommitmentsPanel({ transactions, accounts, rules, merchantAlia
   function renderCommitmentRow({ c, next }, indented) {
     return (
       <tr key={c.key} style={indented ? { background: "var(--paper)" } : undefined}>
-        <td style={indented ? { paddingLeft: 26 } : undefined}>{c.name}</td>
+        <td style={indented ? { paddingLeft: 26 } : undefined}>
+          {c.category === "Transfer" && c.subCategory === "Debt Payment"
+            ? describeDebtPayment({ linkedAccountId: c.linkedAccountId, description: c.rawMerchant, name: c.name }, accountName).label
+            : c.name}
+        </td>
         <td style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "'IBM Plex Mono', monospace" }}>{c.rawMerchant || "—"}</td>
         <td style={{ fontSize: 11.5 }}>{c.alias || <span style={{ color: "var(--line)" }}>—</span>}</td>
         <td>
@@ -5381,7 +6376,7 @@ function RecurringCommitmentsPanel({ transactions, accounts, rules, merchantAlia
       <table className="bw-table">
         <thead>
           <tr>
-            <th>Name</th><th>Raw merchant/description</th><th>Alias</th><th>Category</th><th style={{ textAlign: "right" }}>Amount</th><th>Amount Behaviour</th><th>Frequency</th>
+            <th>Name</th><th>In your statement</th><th>Grouped as</th><th>Category</th><th style={{ textAlign: "right" }}>Amount</th><th>Amount pattern</th><th>Repeats every</th>
             <th style={{ textAlign: "right" }}>Occurrences</th>
             <th>What we learned</th><th>Confidence</th><th>Next expected</th><th>Last seen</th>
           </tr>
@@ -5760,7 +6755,7 @@ function deleteHoldingSnapshot(accountId, snapshotId) {
  *  Whichever path a statement takes, it ends at the same shared finalize step:
  *  resolve which account it belongs to, dedupe against already-imported transactions,
  *  auto-categorize via existing rules, and commit. */
-function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules, effectiveTier }) {
+function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions, showToast, holdingSnapshots, setHoldingSnapshots, debtSchedules, setDebtSchedules, effectiveTier, initialFile, onInitialFileConsumed, labelImport, onFirstImport, intake }) {
   const [source, setSource] = useState("csv"); // csv | paste | llmpdf
   // Unified upload — one dropzone, Stage 1 classification routes to whichever flow
   // below actually handles the file. showManualTabs is the escape hatch: if
@@ -5955,13 +6950,17 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     // across separate imports — anything already in the store stays caught.
     const existingKeys = new Set(transactions.map((t) => `${t.accountId}|${t.date}|${t.description}|${t.amount}`));
     const imported = [];
-    validRows.forEach(({ date, description, amount, direction }) => {
+    // The AI name becomes the key only while EVERY transaction already held was read the same way (a new user, or data already migrated);
+    // otherwise it is recorded as the display name only and the existing keys, rules and groups are left alone (#160).
+    const useAiKeys = transactions.every((t) => t.aiRegime); // every row held so far was imported under this rule (aiRegime marks it)
+    validRows.forEach(({ date, description, amount, direction, aiMerchant, counterpartyType }) => {
+      const aiKey = useAiKeys && aiMerchant ? aiKeyFor(aiMerchant, description) : null;
       const key = `${account.id}|${date}|${description}|${amount}`;
       if (existingKeys.has(key)) return; // secondary safety net — the period check above is the primary gate
       const rule = matchRule(description, rules);
       imported.push({
         id: uid("txn"), accountId: account.id, importBatchId: batchId,
-        date, description, merchant: normalizeMerchant(description),
+        date, description, merchant: aiKey ? displayName(aiKey) : normalizeMerchant(description),
         amount, direction,
         category: rule ? rule.category : null,
         subCategory: rule ? rule.subCategory : null,
@@ -5970,10 +6969,15 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         frequency: rule ? (rule.frequency || null) : null,
         purpose: rule ? (rule.purpose || "Personal") : "Personal",
         matchedRuleId: rule ? rule.id : null,
+        ...(aiMerchant ? { aiMerchant } : {}), ...(aiKey ? { aiKey } : {}), ...(useAiKeys ? { aiRegime: true } : {}), ...(counterpartyType ? { counterpartyType } : {}),
       });
     });
     if (imported.length === 0) { showToast("No new transactions found in this batch."); return null; }
+    // The SAME engine labeller the demo runs (backlog #72); App owns the answers and the merchant groups it produces.
+    if (labelImport) imported.splice(0, imported.length, ...labelImport(account.id, imported, batchId, account.type === "creditCard"));
     setTransactions((prev) => [...prev, ...imported]);
+    if (onFirstImport) onFirstImport({ imported, periodStart, periodEnd, accountName: account.nickname, isCard: account.type === "creditCard" });
+    if (intake && intake.onStatus) intake.onStatus({ stage: "imported", count: imported.length, accountName: account.nickname });
 
     const hasClosing = typeof closingBalanceOverride === "number" && !Number.isNaN(closingBalanceOverride);
     const hasOpening = typeof openingBalanceOverride === "number" && !Number.isNaN(openingBalanceOverride);
@@ -6039,10 +7043,112 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
 
   const [aiSuggestion, setAiSuggestion] = useState(null); // from callClassifyAndMap, once it resolves — refines the heuristic below, never required for it to work
 
+  // ---- Onboarding intake (backlog #107): the SAME classify / extract / import code, driven with no upload screen. The host (App) shows
+  // real progress from `intake.onStatus` and answers password / key requests through `intake.controlRef`.
+  const [intakeStage, setIntakeStage] = useState(null); // null | csv-map | csv-import | csv-done | pdf-extract | pdf-reading | pdf-import | pdf-done
+  const [intakeAiDone, setIntakeAiDone] = useState(false);
+  const [extractTick, setExtractTick] = useState(0);
+  const [intakeRestart, setIntakeRestart] = useState(0);
+  const [intakeAccepted, setIntakeAccepted] = useState(false); // the person chose to import a statement that does not reconcile
+  const heldRef = useRef(false);
+  const emit = (stage, extra) => { if (intake && intake.onStatus) intake.onStatus({ stage, ...(extra || {}) }); };
+  const intakeFail = (message, extra) => { setIntakeStage(null); emit("error", { message, ...(extra || {}) }); };
+  function intakeRoute(category, file, pwd) {
+    if (category === "bank_statement" || category === "credit_card_statement") {
+      setAccountType(category === "credit_card_statement" ? "creditCard" : "bank"); setSource("llmpdf");
+      setLlmFile(file); setLlmFileName(file.name); setLlmError(null); setLlmRawResponse(null);
+      setNeedsPassword(false); setWrongPassword(false); setPdfPassword(pwd || "");
+      setClosingBalanceInput(""); setOpeningBalanceInput(""); setStatementBalances({ opening: null, closing: null });
+      setExtractedStatementPeriod({ start: null, end: null, statementDate: null }); setPastePreview(null);
+      setIntakeStage("pdf-extract"); setExtractTick((t) => t + 1);
+    } else if (["equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding", "debt_schedule"].includes(category)) {
+      // Holdings and loans have their own review screens; hand the file to them rather than refusing it.
+      emit("handoff", { category, label: "That\u2019s an investment or loan statement \u2014 opening the screen that reads it" });
+    } else if (category === "other_investment_statement") intakeFail("That looks like an investment statement I don\u2019t have a reader for yet (for example PF, gold or property). I can read bank and card statements, equity, mutual fund, NPS and ULIP holdings, and loan schedules.");
+    else intakeFail("I couldn\u2019t tell what that file is. Try the PDF or CSV statement from your bank.");
+  }
+  async function runIntake(file) {
+    heldRef.current = false; setIntakeAccepted(false);
+    setIntakeStage(null); setIntakeAiDone(false); setUnifiedError(null); setLlmError(null); setUnifiedNeedsPassword(false); setNeedsPassword(false);
+    emit("opening", { label: "Opening " + file.name });
+    if (/\.(csv|xlsx?)$/i.test(file.name)) {
+      let data; try { data = await readSpreadsheetFile(file); } catch (e) { intakeFail("I couldn\u2019t open that spreadsheet (" + (e && e.message ? e.message : "unreadable") + ")."); return; }
+      if (!data || data.length < 2) { intakeFail("That file looks empty. Try your bank\u2019s statement download."); return; }
+      emit("identifying", { label: "Finding the date, description and amount columns" });
+      setFileName(file.name); setHeaders(null); setAiSuggestion(null); setSource("csv");
+      setRawRows(data); setHeaderRowIdx(detectHeaderRow(data)); setIntakeStage("csv-map");
+    } else if (/\.pdf$/i.test(file.name)) {
+      if (!apiKey) { emit("needs_key", { label: "Reading a PDF needs your Gemini key" }); return; }
+      emit("identifying", { label: "Working out which kind of statement this is" });
+      handleUnifiedFile(file);
+    } else intakeFail("I can read PDF, CSV and Excel statements. That file is a different kind.");
+  }
+  useEffect(() => { if (intake && intake.file) runIntake(intake.file); }, [intake && intake.token]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (intakeRestart > 0 && intake && intake.file) runIntake(intake.file); }, [intakeRestart]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (intake && intake.controlRef) intake.controlRef.current = {
+    submitPassword: (pwd) => { if (unifiedNeedsPassword) handleUnifiedFile(unifiedPendingFile, pwd); else { setPdfPassword(pwd); setNeedsPassword(false); setWrongPassword(false); setIntakeStage("pdf-extract"); setExtractTick((t) => t + 1); } },
+    proceedAnyway: () => { setIntakeAccepted(true); setIntakeStage((st) => (st === "csv-hold" ? "csv-import" : st)); emit("importing", { label: "Saving the transactions on this device" }); },
+    submitKey: (key) => { const k = String(key || "").trim(); if (!k) return; setApiKey(k); saveState("geminiApiKey", k); setIntakeRestart((t) => t + 1); },
+  };
+  // Real progress and problems, straight from the state the upload code already keeps.
+  useEffect(() => { if (intake && unifiedNeedsPassword) emit("needs_password", { wrong: unifiedWrongPassword }); }, [unifiedNeedsPassword, unifiedWrongPassword]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (intake && needsPassword) emit("needs_password", { wrong: wrongPassword }); }, [needsPassword, wrongPassword]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (intake && unifiedError) intakeFail(/API key/i.test(unifiedError) ? "Reading a PDF needs your Gemini key." : unifiedError, /API key/i.test(unifiedError) ? { canAddKey: true } : null); }, [unifiedError]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (intake && llmError) intakeFail(llmError); }, [llmError]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (intake && llmProgress) emit("reading", { label: llmProgress }); }, [llmProgress]); // eslint-disable-line react-hooks/exhaustive-deps
+  // PDF: classified as a bank statement -> read it -> import what was read, with no review screen in between.
+  useEffect(() => { if (intake && intakeStage === "pdf-extract" && llmFile) { setIntakeStage("pdf-reading"); handleAiExtract(); } }, [intakeStage, extractTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (intake && intakeStage === "pdf-reading" && pastePreview && !llmBusy) { emit("found", { label: "Found " + pastePreview.length + " transactions", count: pastePreview.length }); setIntakeStage("pdf-import"); }
+  }, [intakeStage, pastePreview, llmBusy]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!intake || intakeStage !== "pdf-import" || !pastePreview) return;
+    if (!institution) { setInstitution(guessInstitutionFromFile(llmFileName, accountType === "creditCard")); return; } // the statement did not name its bank
+    // A statement whose opening balance plus the transactions read does not reach its closing balance may be missing or misreading a line: ask first.
+    if (reconciliation && reconciliation.diff !== null && Math.abs(reconciliation.diff) > 1 && !intakeAccepted) {
+      if (!heldRef.current) { heldRef.current = true; emit("unreconciled", { diff: reconciliation.diff, opening: reconciliation.opening, implied: reconciliation.impliedClosing, closing: reconciliation.closing, count: pastePreview.length, gaps: reconciliation.gaps.length, isCard: isCreditCard }); }
+      return;
+    }
+    setIntakeStage("pdf-done"); emit("importing", { label: "Saving " + pastePreview.length + " transactions on this device" });
+    intakeFinish(doPasteImport());
+  }, [intakeStage, pastePreview, institution, intakeAccepted]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Spreadsheet: columns guessed locally (no AI, no key); the AI reader only steps in when the headers are unfamiliar and a key exists.
+  useEffect(() => {
+    if (!intake || intakeStage !== "csv-map" || !headers || !rawRows) return;
+    const mapped = !!(dateCol && descCol && (amountMode === "split" ? (debitCol || creditCol) : amountCol));
+    if (mapped) {
+      const isCardSheet = looksLikeCard(headers, rawRows.slice(0, 6).map((r) => r.join(" ")).join(" "));
+      if (!institution) setInstitution(guessInstitutionFromFile(fileName, isCardSheet));
+      setAccountType(isCardSheet ? "creditCard" : "bank"); setIntakeStage("csv-import"); return;
+    }
+    if (apiKey && !aiSuggestion && !intakeAiDone) {
+      setIntakeAiDone(true); emit("identifying", { label: "Asking the AI reader to find the columns" });
+      callClassifyAndMap(buildSpreadsheetSample(rawRows, 30), fileName, [], "bank_statement").then(setAiSuggestion).catch(() => {});
+      return;
+    }
+    if (!apiKey || intakeAiDone) {
+      // Give an in-flight AI suggestion a moment to arrive before giving up on the columns.
+      const t = setTimeout(() => intakeFail("I couldn\u2019t tell which columns hold the date, description and amount.", apiKey ? null : { canAddKey: true }), apiKey ? 12000 : 0);
+      return () => clearTimeout(t);
+    }
+  }, [intakeStage, headers, rawRows, dateCol, descCol, amountMode, debitCol, creditCol, amountCol, aiSuggestion, institution]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!intake || intakeStage !== "csv-import") return;
+    const res = doImport(); // a running-balance column that does not chain pauses here for the person's decision
+    if (res && res.held) { setIntakeStage("csv-hold"); return; }
+    setIntakeStage("csv-done"); emit("importing", { label: "Saving " + rows.length + " transactions on this device" });
+    intakeFinish(res);
+  }, [intakeStage]); // eslint-disable-line react-hooks/exhaustive-deps
+  function intakeFinish(result) {
+    if (!result) intakeFail("I couldn\u2019t find new transactions in that file.");
+    else if (result.rejected) intakeFail(result.tierLimited ? "Your plan\u2019s account limit is reached, so I can\u2019t add another account." : "That statement is already imported (its dates overlap one you added before).");
+  }
+
   /** Routes a classified file to whichever existing, already-verified flow actually
    *  handles that document type. Nothing about extraction changes here — this only
    *  decides which flow gets the file. */
   function routeClassifiedFile(category, file, pwd) {
+    if (intake) { intakeRoute(category, file, pwd); return; }
     if (["equity_holding", "mutual_fund_holding", "nps_holding", "ulip_holding"].includes(category)) {
       // The specific sub-type is already known from Stage 1 - carried down as a prop
       // rather than asked again, since the investment flow's own former classifier
@@ -6096,6 +7202,12 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
    *  password-protected PDF surfaces as a distinct needsPassword state rather than a
    *  generic error, so the UI can prompt for it and retry with retryUnifiedWithPassword
    *  instead of making the person start over. */
+  // Consume a statement dropped on onboarding's drop zone exactly once, as if it had been chosen here.
+  useEffect(() => {
+    if (initialFile) { handleUnifiedFile(initialFile); if (onInitialFileConsumed) onInitialFileConsumed(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function handleUnifiedFile(file, pwd) {
     if (!file) return;
     setUnifiedClassifying(true);
@@ -6203,8 +7315,9 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     setRows(dataObjs);
     setDateCol(guessColumn(uniqueHdrs, DATE_ALIASES));
     setDescCol(guessColumn(uniqueHdrs, DESC_ALIASES));
-    const dCol = guessColumn(uniqueHdrs, DEBIT_ALIASES);
-    const cCol = guessColumn(uniqueHdrs, CREDIT_ALIASES);
+    const amountHdrs = uniqueHdrs.filter((h) => !/card\s*(no|num)/i.test(h)); // "Credit Card No" is not the Credit column
+    const dCol = guessColumn(amountHdrs, DEBIT_ALIASES);
+    const cCol = guessColumn(amountHdrs, CREDIT_ALIASES);
     if (dCol || cCol) {
       setAmountMode("split");
       setDebitCol(dCol);
@@ -6265,6 +7378,8 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
     if (amountMode === "single" && !amountCol) { showToast("Map the Amount column."); return; }
 
     const list = [];
+    const balCol = headers ? guessColumn(headers, BALANCE_ALIASES) : "";
+    const bals = [];
     rows.forEach((row) => {
       const rawDate = row[dateCol];
       const desc = (row[descCol] || "").toString().trim();
@@ -6282,14 +7397,20 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
         const typeVal = (row[typeCol] || "").toString().toLowerCase();
         if (typeVal.includes("cr")) { amount = Math.abs(raw); direction = "credit"; }
         else if (typeVal.includes("dr")) { amount = Math.abs(raw); direction = "debit"; }
-        else { direction = raw >= 0 ? "credit" : "debit"; amount = Math.abs(raw); }
+        else { direction = (raw >= 0) !== (accountType === "creditCard") ? "credit" : "debit"; amount = Math.abs(raw); } // on a card, a positive amount is a purchase
       }
       if (amount === 0) return;
       list.push({ date, description: desc, amount, direction });
+      bals.push(balCol && row[balCol] != null && String(row[balCol]).trim() !== "" ? parseAmountStr(row[balCol]) : null);
     });
 
-    const result = importTransactionList(list);
+    // A running Balance column, when it adds up row by row, gives the opening and closing balances with nobody typing them.
+    const fromBalances = balCol ? balancesFromList(list, bals) : null;
+    const trusted = fromBalances && fromBalances.trusted ? fromBalances : null;
+    if (intake && fromBalances && fromBalances.breaks > 0 && !intakeAccepted) { emit("unreconciled", { csv: true, breaks: fromBalances.breaks, count: list.length }); return { held: true }; }
+    const result = importTransactionList(list, trusted ? trusted.closing : undefined, trusted ? trusted.opening : undefined);
     if (result && !result.rejected) { resetImportForm(); resetAccountContextAfterImport(); checkPendingTransfersAfterImport(result); }
+    return result;
   }
 
   /* ---- Paste-from-PDF mode: heuristic parser + editable preview.
@@ -6491,7 +7612,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
   function doPasteImport() {
     const list = pastePreview
       .filter((r) => r.include)
-      .map((r) => ({ date: r.date, description: r.description.trim(), amount: parseAmountStr(r.amount), direction: r.direction }));
+      .map((r) => ({ date: r.date, description: r.description.trim(), amount: parseAmountStr(r.amount), direction: r.direction, aiMerchant: r.aiMerchant || null, counterpartyType: r.counterpartyType || null }));
     // Trust a value if it was explicitly provided (typed, or read from a clearly labeled
     // statement field) — regardless of whether reconciliation happens to check out,
     // since a mismatch there more likely means a missed/misread transaction than a wrong
@@ -6512,6 +7633,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       resetAccountContextAfterImport();
       checkPendingTransfersAfterImport(result);
     }
+    return result;
   }
 
   /* ---- Local decrypt + render, then AI structuring via YOUR OWN API key.
@@ -6556,6 +7678,7 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
       "letterhead (e.g. \"Standard Chartered Bank\", \"Scapia\"). This is the institution's name, not personal",
       "information, so it's fine to include even though account number/holder name/address are excluded below.",
       "Do not include the account number, account holder name, or address anywhere in your response.",
+      ...AI_MERCHANT_PROMPT,
     ];
     if (resumeAfter) {
       base.push(
@@ -6587,6 +7710,8 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
             amount: { type: "NUMBER", description: "Transaction amount, always positive." },
             direction: { type: "STRING", enum: ["debit", "credit"] },
             runningBalance: { type: "NUMBER", nullable: true, description: "Balance immediately after this transaction, if shown." },
+            aiMerchant: { type: "STRING", nullable: true, description: "Name of the business or person on the other side, copied from words printed in this row's description; the most specific name printed (e.g. 'Google Play', 'Google Cloud', never just 'Google'); null if no name follows the rules." },
+            counterpartyType: { type: "STRING", nullable: true, enum: ["merchant", "person", "unclear"], description: "merchant = shop, company, service, bank or platform; person = an individual; unclear = cannot tell." },
           },
           required: ["date", "description", "amount", "direction"],
         },
@@ -6863,6 +7988,8 @@ function UploadTab({ accounts, setAccounts, rules, transactions, setTransactions
             date: row.date, description: (row.description || "").toString(),
             amount: String(row.amount), direction: row.direction === "credit" ? "credit" : "debit",
             runningBalance: (row.runningBalance === null || row.runningBalance === undefined) ? null : Number(row.runningBalance),
+            aiMerchant: (row.aiMerchant || "").toString().trim() || null, // the AI's merchant name (#158/#160): checked against the line before it is trusted as a key
+            counterpartyType: counterpartyOf(row.counterpartyType),
           }))
           .filter((r) => isLikelyValidDate(r.date) && parseAmountStr(r.amount) > 0);
 
@@ -8185,7 +9312,7 @@ function InvestmentImportFlow({ accounts, setAccounts, holdingSnapshots, setHold
                 <div />
               </div>
 
-              <div className="bw-section-label" style={{ marginTop: 14 }}>Column mapping</div>
+              <div className="bw-section-label" style={{ marginTop: 14 }}>Match your file's columns</div>
               <p style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 10 }}>Confirm which column holds which field — edit any that look wrong.</p>
               <div className="bw-grid2">
                 {(MAPPING_FIELDS_BY_TYPE[classification.documentType] || []).map(([field, label]) => (
@@ -8742,7 +9869,7 @@ function DebtImportFlow({ accounts, setAccounts, debtSchedules, setDebtSchedules
             </div>
           )}
 
-          <div className="bw-section-label">Column mapping</div>
+          <div className="bw-section-label">Match your file's columns</div>
           <div className="bw-grid2">
             {["period", "openingBalance", "emi", "principal", "interest", "closingBalance"].map((field) => (
               <div className="bw-field" key={field}>
@@ -8954,7 +10081,7 @@ function DocumentClassifierTest({ apiKey, aiModel, customModelId }) {
           <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 10 }}>{fileName}</div>
           <div className="bw-summary-row">
             <Stat label="Document category" value={DOCUMENT_CATEGORY_LABELS[result.documentCategory] || result.documentCategory} color="var(--ink)" />
-            <Stat label="Confidence" value={result.confidence} color={result.confidence === "high" ? "var(--teal)" : result.confidence === "low" ? "var(--rust)" : "var(--ochre)"} />
+            <Stat label="How sure we are" value={{ high: "Fairly sure", medium: "Somewhat sure", low: "Not very sure" }[result.confidence] || result.confidence} color={result.confidence === "high" ? "var(--teal)" : result.confidence === "low" ? "var(--rust)" : "var(--ochre)"} />
             <Stat label="Institution" value={result.institution || "—"} color="var(--ink)" />
           </div>
           <p style={{ fontSize: 12.5, marginTop: 12 }}>{result.reasoning}</p>
@@ -9010,12 +10137,153 @@ function AmountBehaviorCell({ t, groupKey, frequencyClass, amountBehaviors, merc
   const detail = `${ab.observationCount} occurrence${ab.observationCount === 1 ? "" : "s"} · ${Math.round(ab.consistencyRatio * 100)}% within ±${Math.round(ab.deviationThreshold * 100)}% of median · ${ab.confidence} confidence`;
   return (
     <span title={detail} style={{ color: ab.amountBehavior === "Fixed" ? "var(--teal)" : "var(--ochre)", fontWeight: 500 }}>
-      {ab.amountBehavior}
+      {AMOUNT_BEHAVIOR_PLAIN[ab.amountBehavior] || ab.amountBehavior}
     </span>
   );
 }
 
-function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, merchantAliases, showToast, onGoToUpload, holdingSnapshots, debtSchedules }) {
+/** A short list of transactions, for "see what this is about" under a rule conflict. */
+function TxnPeek({ rows }) {
+  const shown = rows.slice(0, 8);
+  return (
+    <div data-testid="txn-peek" style={{ margin: "6px 0 2px", fontSize: 11.5, color: "var(--ink-soft)" }}>
+      {shown.map((t) => (
+        <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "2px 0", borderTop: "1px dashed var(--line)" }}>
+          <span style={{ minWidth: 0, whiteSpace: "normal", overflowWrap: "anywhere" }}>{t.date} {"\u00B7"} {String(t.description).replace(/\s+/g, " ")}</span>
+          <b style={{ fontFamily: "'IBM Plex Mono', monospace", whiteSpace: "nowrap" }}>{(t.direction === "credit" ? "+" : "\u2212") + "\u20B9" + Number(t.amount).toLocaleString("en-IN")}</b>
+        </div>
+      ))}
+      {rows.length > shown.length && <div>and {rows.length - shown.length} more</div>}
+    </div>
+  );
+}
+
+/** Edit one rule in place: pattern and everything it fills in. Only the fields that apply to the chosen category are shown. */
+function RuleEditor({ rule, onSave, onCancel }) {
+  const [v, setV] = useState({ pattern: rule.pattern, category: rule.category || "Expense", subCategory: rule.subCategory || "", frequencyClass: rule.frequencyClass || "", frequency: rule.frequency || "", control: rule.control || "", purpose: rule.purpose || "Personal", group: rule.group || "" });
+  const set = (k, x) => setV((c) => ({ ...c, [k]: x }));
+  const subs = subCategoryOptionsFor(v.category), freqOk = isFrequencyEligible(v.frequencyClass);
+  const valid = v.pattern.trim().length > 0;
+  const field = { padding: "5px 8px", borderRadius: 6, border: "1px solid var(--line)", font: "inherit", fontSize: 12.5 };
+  function save() {
+    const pattern = v.pattern.trim().toLowerCase();
+    onSave({ ...rule, pattern, category: v.category, subCategory: subs.length ? v.subCategory || null : null, frequencyClass: v.frequencyClass || null,
+      frequency: freqOk ? v.frequency || "Monthly" : null, control: v.category === "Expense" && v.frequencyClass !== "One-Time" ? v.control || null : null,
+      purpose: v.purpose, group: (v.category === "Expense" || v.category === "Income") && v.group.trim() ? v.group.trim() : null,
+      priority: (rule.source === "system" ? 0 : 1000) + pattern.length });
+  }
+  return (
+    <div data-testid="rule-editor" style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", padding: "6px 0" }}>
+      <input aria-label="Pattern" style={{ ...field, minWidth: 220, fontFamily: "'IBM Plex Mono', monospace" }} value={v.pattern} onChange={(e) => set("pattern", e.target.value)} />
+      <select aria-label="Category" style={field} value={v.category} onChange={(e) => setV((c) => ({ ...c, category: e.target.value, subCategory: "", group: "" }))}>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select>
+      {subs.length > 0 && <select aria-label="Sub category" style={field} value={v.subCategory} onChange={(e) => set("subCategory", e.target.value)}><option value="">{"\u2014"}</option>{subs.map((x) => <option key={x}>{x}</option>)}</select>}
+      <select aria-label="How often" style={field} value={v.frequencyClass} onChange={(e) => set("frequencyClass", e.target.value)}><option value="">{"\u2014"}</option>{FREQUENCY_CLASSES.map((x) => <option key={x}>{x}</option>)}</select>
+      {freqOk && <select aria-label="Repeats every" style={field} value={v.frequency} onChange={(e) => set("frequency", e.target.value)}><option value="">{"\u2014"}</option>{FREQUENCIES.map((x) => <option key={x}>{x}</option>)}</select>}
+      {v.category === "Expense" && v.frequencyClass !== "One-Time" && <select aria-label="Control" style={field} value={v.control} onChange={(e) => set("control", e.target.value)}><option value="">{"\u2014"}</option>{CONTROLS.map((x) => <option key={x}>{x}</option>)}</select>}
+      <select aria-label="Purpose" style={field} value={v.purpose} onChange={(e) => set("purpose", e.target.value)}>{PURPOSES.map((x) => <option key={x}>{x}</option>)}</select>
+      {(v.category === "Expense" || v.category === "Income") && <input aria-label="Group" placeholder="Group (optional)" style={{ ...field, width: 150 }} value={v.group} onChange={(e) => set("group", e.target.value)} />}
+      <button className="bw-btn small" disabled={!valid} onClick={save}>Save</button>
+      <button className="bw-btn ghost small" onClick={onCancel}>Cancel</button>
+    </div>
+  );
+}
+
+const RULE_DEPS = { norm: normalizeForMatch, test: ruleTest, merchantKey: normalizeMerchant };
+const mergeKey = (t) => merchantCore(t.merchant || normalizeMerchant(t.description) || t.description || "") || "\u2014";
+const conflictSignature = (c) => c.options.map((o) => o.category + "/" + (o.subCategory || "")).sort().join("|");
+
+/** Every conflict to check: (1) two rules that match the same transactions but file them differently - look-alike merchants carrying different
+ *  rules; (2) one merchant whose own transactions are filed more than one way. Merchant conflicts the person accepted stay quiet until a new
+ *  way of filing appears. Each has the transactions involved. Pure. */
+function computeConflicts(transactions, rules, store) {
+  const byId = new Map(transactions.map((t) => [t.id, t]));
+  const out = [];
+  overlappingRules(rules, transactions, RULE_DEPS).forEach((o) => out.push({ kind: "rules", id: "r:" + o.a.id + "|" + o.b.id, a: o.a, b: o.b, ids: o.ids }));
+  findConflicts(transactions, { merchantKey: mergeKey }).forEach((c) => {
+    if (isConflictAccepted(store, c.key, conflictSignature(c))) return;
+    const idsM = c.options.flatMap((o) => o.ids);
+    if (out.some((g) => g.kind === "rules" && idsM.every((id) => g.ids.includes(id)))) return; // already shown as a rule conflict
+    out.push({ kind: "merchant", id: "m:" + c.key, key: c.key, name: c.name, options: c.options, sig: conflictSignature(c), ids: c.options.flatMap((o) => o.ids) });
+  });
+  return out.map((g) => ({ ...g, rows: g.ids.map((id) => byId.get(id)).filter(Boolean) }));
+}
+
+/** One list of conflicts, each a group with its transactions directly below (editable). Choosing a rule is choosing it over the other. */
+function ConflictsView({ conflicts, setRules, setTransactions, onAccept, showToast }) {
+  const ruleLine = (r) => r.category + (r.subCategory ? " / " + r.subCategory : "");
+  function useRule(g, keep, drop) {
+    const ids = new Set(g.ids);
+    setRules((prev) => prev.filter((r) => r.id !== drop.id));
+    setTransactions((prev) => prev.map((t) => (ids.has(t.id) ? { ...t, category: keep.category, subCategory: keep.subCategory || null, frequencyClass: keep.frequencyClass || t.frequencyClass,
+      frequency: isFrequencyEligible(keep.frequencyClass || t.frequencyClass) ? keep.frequency || t.frequency || "Monthly" : null,
+      control: keep.category === "Expense" && (keep.frequencyClass || t.frequencyClass) !== "One-Time" ? keep.control || t.control || null : null, purpose: keep.purpose || t.purpose, handEdited: false, matchedRuleId: keep.id } : t)));
+    showToast("Using \u201C" + keep.pattern + "\u201D for these. The other rule was removed.");
+  }
+  function keepBoth(g) {
+    setRules((prev) => prev.map((x) => (x.id === g.a.id ? { ...x, keepBoth: [...new Set([...(x.keepBoth || []), g.b.id])] } : x.id === g.b.id ? { ...x, keepBoth: [...new Set([...(x.keepBoth || []), g.a.id])] } : x)));
+    showToast("Kept both rules: different merchants.");
+  }
+  function confirmMerchant(g, opt) {
+    const ex = opt.exemplar, pattern = (ex.aiKey || normalizeMerchant(ex.description)).toLowerCase(), ids = new Set(g.ids);
+    const oldIds = new Set(g.rows.map((t) => t.matchedRuleId).filter(Boolean));
+    const eligible = isFrequencyEligible(ex.frequencyClass);
+    const fields = { category: opt.category, subCategory: opt.subCategory, frequencyClass: ex.frequencyClass || null, frequency: eligible ? ex.frequency || "Monthly" : null,
+      control: opt.category === "Expense" && ex.frequencyClass !== "One-Time" ? ex.control || null : null, purpose: ex.purpose || "Personal", linkedAccountId: linkableAccountTypesFor(opt.category, opt.subCategory).length ? ex.linkedAccountId || null : null };
+    setRules((prev) => { const existing = prev.find((r) => r.pattern.toLowerCase() === pattern); const ruleId = existing ? existing.id : uid("rule");
+      return [...prev.filter((r) => r.id !== ruleId && !(oldIds.has(r.id) && r.source !== "system")), { ...(existing || {}), id: ruleId, pattern, ...fields, source: "learned", priority: pattern.length + 1000 }]; });
+    setTransactions((prev) => prev.map((t) => (ids.has(t.id) ? { ...t, category: fields.category, subCategory: fields.subCategory, handEdited: false,
+      control: fields.category === "Expense" ? t.control || fields.control : null, linkedAccountId: linkableAccountTypesFor(fields.category, fields.subCategory).length ? t.linkedAccountId || null : null } : t)));
+    showToast("Confirmed " + g.name + " \u2192 " + opt.category + (opt.subCategory ? " / " + opt.subCategory : "") + ".");
+  }
+  function editTxn(t, patch) {
+    setTransactions((prev) => prev.map((x) => (x.id === t.id ? { ...x, ...patch, handEdited: true, ...(patch.category && patch.category !== "Expense" ? { control: null } : {}) } : x)));
+  }
+  const sel = { padding: "2px 4px", borderRadius: 4, border: "1px solid var(--line)", font: "inherit", fontSize: 11.5 };
+  if (!conflicts.length) return <div className="bw-empty">No conflicts to check.</div>;
+  return (
+    <div data-testid="conflicts">
+      <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 12, maxWidth: 640 }}>
+        Look-alike merchants filed differently. If they are the same merchant, pick the answer that applies, or fix a transaction below. If they are different merchants, keep both.
+      </div>
+      {conflicts.map((g) => (
+        <div key={g.id} data-conflict={g.id} style={{ border: "1px solid var(--ochre)", borderRadius: 6, padding: "12px 14px", background: "var(--card)", marginBottom: 14 }}>
+          {g.kind === "rules" ? (
+            <>
+              <div style={{ fontWeight: 600, fontSize: 13.5, marginBottom: 8 }}>{"\u201C"}{g.a.pattern}{"\u201D"} and {"\u201C"}{g.b.pattern}{"\u201D"} file the same transactions differently</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+                <button className="bw-btn ghost small" onClick={() => useRule(g, g.a, g.b)}>{g.a.pattern} {"\u2192"} {ruleLine(g.a)}</button>
+                <button className="bw-btn ghost small" onClick={() => useRule(g, g.b, g.a)}>{g.b.pattern} {"\u2192"} {ruleLine(g.b)}</button>
+                <button className="bw-btn small" data-testid="keep-both" onClick={() => keepBoth(g)}>Different merchants {"\u2014"} keep both</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontWeight: 600, fontSize: 13.5, marginBottom: 8 }}>{g.name} is filed in more than one way</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+                {g.options.map((o) => <button key={o.category + o.subCategory} className="bw-btn ghost small" onClick={() => confirmMerchant(g, o)}>{o.category}{o.subCategory ? " / " + o.subCategory : ""} {"\u00B7"} {o.count}</button>)}
+                <button className="bw-btn small" data-testid="accept-conflict" onClick={() => { onAccept(g.key, g.sig); showToast("Accepted as it is."); }}>Accept as is</button>
+              </div>
+            </>
+          )}
+          <div data-testid="txn-peek" style={{ marginTop: 6, fontSize: 11.5 }}>
+            {g.rows.slice(0, 25).map((t) => (
+              <div key={t.id} style={{ display: "grid", gridTemplateColumns: "78px 1fr auto auto auto", gap: 8, alignItems: "start", padding: "3px 0", borderTop: "1px dashed var(--line)" }}>
+                <span style={{ color: "var(--ink-soft)" }}>{t.date}</span>
+                <span style={{ minWidth: 0, whiteSpace: "normal", overflowWrap: "anywhere", color: "var(--ink-soft)" }}>{String(t.description).replace(/\s+/g, " ")}</span>
+                <b style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{(t.direction === "credit" ? "+" : "\u2212") + "\u20B9" + Number(t.amount).toLocaleString("en-IN")}</b>
+                <select aria-label="Category" style={sel} value={t.category || ""} onChange={(e) => editTxn(t, { category: e.target.value, subCategory: null })}>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select>
+                {subCategoryOptionsFor(t.category).length > 0 ? <select aria-label="Sub category" style={sel} value={t.subCategory || ""} onChange={(e) => editTxn(t, { subCategory: e.target.value || null })}><option value="">{"\u2014"}</option>{subCategoryOptionsFor(t.category).map((x) => <option key={x}>{x}</option>)}</select> : <span />}
+              </div>
+            ))}
+            {g.rows.length > 25 && <div style={{ color: "var(--ink-soft)" }}>and {g.rows.length - 25} more</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, merchantAliases, setMerchantAliases, showToast, onGoToUpload, holdingSnapshots, debtSchedules, deckCount = 0, repeatCount = 0, onOpenDeck, presetSearch, onPresetUsed, conflicts = [], onAcceptConflict, presetMode, onModeUsed }) {
   const [mode, setMode] = useState("byMerchant"); // byMerchant | byTransaction | transfers | investmentsControl | debtControl
   const [showAll, setShowAll] = useState(false);
   const [rememberFor, setRememberFor] = useState({});
@@ -9024,6 +10292,16 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   const [showDismissedTransfers, setShowDismissedTransfers] = useState(false);
   const [manualLinkFor, setManualLinkFor] = useState(null); // txn id currently picking a manual match
   const [transferPeriod, setTransferPeriod] = useState("all"); // all | "YYYY-MM"
+  // By-merchant bulk-select + optional grouping (checkbox multi-select feeding the
+  // sliding bulk-apply bar) - selectedMerchantKeys holds merchantGroups' own `key`
+  // values (the resolved display name, already unique per row).
+  const [selectedMerchantKeys, setSelectedMerchantKeys] = useState(new Set());
+  const [groupNameInput, setGroupNameInput] = useState("");
+  const [groupTypeInput, setGroupTypeInput] = useState("category");
+  // Set only when applying would move a merchant out of a DIFFERENT existing group -
+  // holds { conflicts, apply } so the inline confirm step can re-run the exact same
+  // apply the person already configured, once they've explicitly confirmed the move.
+  const [pendingGroupConflict, setPendingGroupConflict] = useState(null);
 
   const uncategorized = useMemo(() => transactions.filter((t) => !t.category), [transactions]);
   // Separate from `uncategorized` above (which feeds the by-merchant bulk mode's
@@ -9031,7 +10309,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   // fields being overwritten) - this is specifically for the by-transaction mode's
   // "show uncategorized only" toggle, whose per-row form pre-fills existing values, so
   // surfacing a partial transaction here just lets the one missing field get filled in.
-  const needsReview = useMemo(() => transactions.filter((t) => !isFullyCategorized(t)), [transactions]);
+  const groupMap = useMemo(() => buildGroupMap(merchantAliases), [merchantAliases]);
+  const needsReview = useMemo(() => transactions.filter((t) => !isFullyCategorized(t, groupMap)), [transactions, groupMap]);
 
   // Amount Behaviour's one shared computation for this whole tab - both Review modes
   // (by-merchant and by-transaction) read from this same map by recomputing a
@@ -9127,6 +10406,20 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     return Object.values(map).sort((a, b) => b.count - a.count || b.total - a.total);
   }, [uncategorized, merchantAliases]);
 
+  // Powers the "✨ looks like N others" chip on By-merchant rows - the same
+  // algorithmic clustering already proven in the Merchant Groups panel, just
+  // surfaced here too so acting on it never requires leaving this screen.
+  const merchantSuggestions = useMemo(
+    () => computeSuggestedMerchantClusters(transactions, merchantAliases),
+    [transactions, merchantAliases]
+  );
+  // Catches what text-matching structurally cannot: merchants sharing zero text in
+  // common (Zepto, Blinkit) but known, from brand knowledge, to belong together.
+  const librarySuggestions = useMemo(
+    () => computeLibrarySuggestedClusters(transactions, merchantAliases),
+    [transactions, merchantAliases]
+  );
+
   function commitMerchantGroup(group, patch, remember) {
     const { category } = patch;
     if (!category) return;
@@ -9151,7 +10444,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           const rule = {
             id: ruleId, pattern, category, subCategory: finalSub,
             frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
-            source: "learned", priority: pattern.length,
+            source: "learned", priority: pattern.length + 1000, // matches the boost user-typed Rules-tab entries get - a person's own tagging must always outrank a system/library rule of equal or greater pattern length
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
         });
@@ -9165,13 +10458,54 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       return {
         ...t, category, subCategory: finalSub, frequency: finalFreq, purpose: finalPurpose,
         linkedAccountId: finalLinkedAccountId,
-        matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
+        matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null, handEdited: !remember,
       };
     }));
     const variantNote = rawKeys.length > 1 ? ` (${rawKeys.length} merchant variants)` : "";
     showToast(remember
       ? `Tagged ${group.count} transaction${group.count > 1 ? "s" : ""} from "${group.key}"${variantNote} and saved ${rawKeys.length > 1 ? `${rawKeys.length} rules` : "a rule"}. (Check "By transaction → Show all" to see it.)`
       : `Tagged ${group.count} transaction${group.count > 1 ? "s" : ""} from "${group.key}"${variantNote}. (Check "By transaction → Show all" to see it.)`);
+  }
+
+  /** Applies one categorization patch across every selected By-merchant row at once,
+   *  and - only when a group name was given - also creates or extends a Merchant
+   *  Group with all their raw variants combined. Works for a single selected
+   *  merchant too, not just 2+: a library-standardized name is worth applying even
+   *  before a second matching merchant shows up, ready for one to join it later.
+   *  `confirmedMove`, when true, means the person has already seen and accepted the
+   *  cross-group conflict warning for this exact apply; on first call it's always
+   *  false, and a real conflict short-circuits into setting pendingGroupConflict
+   *  instead of touching any state, so nothing moves until they explicitly confirm. */
+  function commitMultipleMerchantGroups(selectedGroups, patch, remember, groupName, groupType, confirmedMove) {
+    const trimmedName = (groupName || "").trim();
+    if (trimmedName && selectedGroups.length >= 1) {
+      const allRawKeys = [...new Set(selectedGroups.flatMap((g) => [...g.rawKeys]))];
+      const existingGroup = merchantAliases.find((a) => a.canonical.toLowerCase() === trimmedName.toLowerCase());
+      // A raw key already sitting in a DIFFERENT group than the one we're targeting -
+      // moving it needs an explicit yes, never a silent reassignment.
+      const conflicts = merchantAliases.filter((a) => a !== existingGroup && a.variants.some((v) => allRawKeys.includes(v)));
+      if (conflicts.length > 0 && !confirmedMove) {
+        setPendingGroupConflict({
+          conflicts, groupName: trimmedName,
+          apply: () => commitMultipleMerchantGroups(selectedGroups, patch, remember, groupName, groupType, true),
+        });
+        return;
+      }
+      setMerchantAliases((prev) => {
+        let next = prev.map((a) => (conflicts.includes(a) ? { ...a, variants: a.variants.filter((v) => !allRawKeys.includes(v)) } : a)).filter((a) => a.variants.length > 0);
+        const idx = next.findIndex((a) => a.canonical.toLowerCase() === trimmedName.toLowerCase());
+        if (idx !== -1) {
+          next[idx] = { ...next[idx], variants: [...new Set([...next[idx].variants, ...allRawKeys])] };
+        } else {
+          next = [...next, { id: uid("mg"), canonical: trimmedName, type: groupType, variants: allRawKeys }];
+        }
+        return next;
+      });
+    }
+    selectedGroups.forEach((g) => commitMerchantGroup(g, patch, remember));
+    setPendingGroupConflict(null);
+    setSelectedMerchantKeys(new Set());
+    setGroupNameInput("");
   }
 
   /* ---- per-transaction view: fine-grained cleanup / edge cases.
@@ -9186,6 +10520,8 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
   }, [transactions]);
   const [reviewPeriod, setReviewPeriod] = useState("all"); // all | "YYYY-MM"
   const [reviewSearch, setReviewSearch] = useState("");
+  useEffect(() => { if (presetMode) { setMode(presetMode); if (onModeUsed) onModeUsed(); } }, [presetMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (presetSearch) { setMode("byTransaction"); setShowAll(true); setReviewSearch(presetSearch); if (onPresetUsed) onPresetUsed(); } }, [presetSearch]); // eslint-disable-line react-hooks/exhaustive-deps
   const [reviewAccountFilter, setReviewAccountFilter] = useState("all"); // all | account id
   const [reviewCategoryFilter, setReviewCategoryFilter] = useState("all"); // all | Income | Expense | Investment | Transfer | uncategorized
 
@@ -9194,7 +10530,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     if (reviewPeriod !== "all") base = base.filter((t) => t.date.slice(0, 7) === reviewPeriod);
     if (reviewAccountFilter !== "all") base = base.filter((t) => t.accountId === reviewAccountFilter);
     if (reviewCategoryFilter !== "all") {
-      base = reviewCategoryFilter === "uncategorized" ? base.filter((t) => !isFullyCategorized(t)) : base.filter((t) => t.category === reviewCategoryFilter);
+      base = reviewCategoryFilter === "uncategorized" ? base.filter((t) => !isFullyCategorized(t, groupMap)) : base.filter((t) => t.category === reviewCategoryFilter);
     }
     if (reviewSearch.trim()) {
       const needle = reviewSearch.trim().toLowerCase();
@@ -9259,7 +10595,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     let pattern = null;
 
     if (shouldRemember && category) {
-      pattern = normalizeMerchant(txn.description).toLowerCase();
+      pattern = (txn.aiKey || normalizeMerchant(txn.description)).toLowerCase();
       if (pattern) {
         const existing = rules.find((r) => r.pattern.toLowerCase() === pattern);
         if (existing) {
@@ -9274,7 +10610,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           ruleId = uid("rule");
           setRules((prev) => [
             ...prev,
-            { id: ruleId, pattern, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, source: "learned", priority: pattern.length },
+            { id: ruleId, pattern, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, source: "learned", priority: pattern.length + 1000 }, // matches the boost user-typed Rules-tab entries get
           ]);
         }
       }
@@ -9286,8 +10622,14 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
     // down the rest by hand.
     let cascadedCount = 0;
     setTransactions((prev) => prev.map((t) => {
-      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
-      if (pattern && !t.category && t.description.toLowerCase().includes(pattern)) {
+      if (t.id === txn.id) return { ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId, handEdited: !ruleId };
+      // Bug #48's fix, extended here: this cascade is a SEPARATE match path from
+      // matchRule() (already fixed) - it applies instantly, in memory, to whatever is
+      // currently loaded, bypassing that fix entirely. `pattern` comes from
+      // normalizeMerchant(), which can legitimately reduce to a single short word
+      // (e.g. a transaction whose whole usable description is just "VI"), so this
+      // needed the same word-boundary protection, not just matchRule() itself.
+      if (pattern && !t.category && normalizedPatternMatches(normalizeForMatch(t.description), normalizeForMatch(pattern))) {
         cascadedCount += 1;
         return { ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId, matchedRuleId: ruleId };
       }
@@ -9327,7 +10669,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
           const rule = {
             id: ruleId, pattern, category, subCategory: finalSub,
             frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose, linkedAccountId: finalLinkedAccountId,
-            source: "learned", priority: pattern.length,
+            source: "learned", priority: pattern.length + 1000, // matches the boost user-typed Rules-tab entries get
           };
           if (idx !== -1) next[idx] = rule; else next.push(rule);
         });
@@ -9341,7 +10683,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       return {
         ...t, category, subCategory: finalSub, frequencyClass: finalFreqClass, frequency: finalFreq, control: finalControl, purpose: finalPurpose,
         linkedAccountId: finalLinkedAccountId,
-        matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null,
+        matchedRuleId: remember ? (ruleIdByRaw[raw] || null) : null, handEdited: !remember,
       };
     }));
 
@@ -9381,9 +10723,22 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
         <button className={`bw-tab ${mode === "debtControl" ? "active" : ""}`} onClick={() => setMode("debtControl")}>
           <TrendingDown size={13} /> Debt Control
         </button>
+        {conflicts.length > 0 ? (
+          <button className={`bw-tab ${mode === "conflicts" ? "active" : ""}`} data-testid="conflicts-tab" onClick={() => setMode("conflicts")}>
+            <Merge size={13} /> Conflicts<span className="badge">{conflicts.length}</span>
+          </button>
+        ) : null}
       </div>
 
-      {mode === "transfers" ? (
+      {conflicts.length > 0 && mode !== "conflicts" && (
+        <div data-testid="conflicts-banner" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", border: "1px solid var(--ochre)", borderRadius: 6, padding: "10px 14px", marginBottom: 14, background: "var(--card)", fontSize: 13 }}>
+          <span><b>{conflicts.length} merchant{conflicts.length === 1 ? " is" : "s are"} filed in more than one way.</b> Check which rule applies, or tell us they are different.</span>
+          <button className="bw-btn small" onClick={() => setMode("conflicts")}>Check conflicts</button>
+        </div>
+      )}
+      {mode === "conflicts" ? (
+        <ConflictsView conflicts={conflicts} setRules={setRules} setTransactions={setTransactions} onAccept={onAcceptConflict} showToast={showToast} />
+      ) : mode === "transfers" ? (
         <TransfersControlView
           transactions={transactions}
           accounts={accounts}
@@ -9398,24 +10753,81 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
       ) : mode === "byMerchant" ? (
         merchantGroups.length === 0 ? (
           <div className="bw-empty">
-            {transactions.length === 0 ? "No transactions imported yet — head to Upload." : "Nothing left to review. Every merchant is categorized."}
+            {transactions.length === 0 ? "No transactions imported yet — head to Upload." : deckCount > 0 ? deckCount + " merchant" + (deckCount === 1 ? " has" : "s have") + " transactions that still need an answer." : "Nothing left to review. Every merchant is categorized."}
+            {deckCount === 0 && repeatCount > 0 && onOpenDeck && <div style={{ marginTop: 12 }}><button className="bw-btn" data-testid="repeat-check" onClick={onOpenDeck}>{repeatCount} large payment{repeatCount === 1 ? "" : "s"} might repeat {"\u2014"} check {repeatCount === 1 ? "it" : "them"}</button></div>}
+            {deckCount > 0 && onOpenDeck && <div style={{ marginTop: 12 }}><button className="bw-btn" onClick={onOpenDeck}>Answer the {deckCount} that need you — one card per merchant</button></div>}
           </div>
         ) : (
           <>
             <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 10 }}>
               Sorted by how often each merchant appears — tagging the top few usually covers most of your transactions.
+              Check two or more to categorize — and optionally combine — them together.
             </div>
+
+            <div className="bw-review-warning">
+              <AlertCircle size={14} style={{ marginTop: 1, flexShrink: 0 }} />
+              <span>Tagging here applies to every matching transaction at once. If anything looks off, it's never final — refine or fix an individual transaction anytime in "By transaction."</span>
+            </div>
+
+            <MerchantBulkBar
+              selectedGroups={merchantGroups.filter((g) => selectedMerchantKeys.has(g.key))}
+              merchantAliases={merchantAliases}
+              groupNameInput={groupNameInput} setGroupNameInput={setGroupNameInput}
+              groupTypeInput={groupTypeInput} setGroupTypeInput={setGroupTypeInput}
+              onApply={(patch, remember, groupName, groupType) =>
+                commitMultipleMerchantGroups(merchantGroups.filter((g) => selectedMerchantKeys.has(g.key)), patch, remember, groupName, groupType, false)
+              }
+              pendingGroupConflict={pendingGroupConflict}
+              onConfirmConflict={() => pendingGroupConflict && pendingGroupConflict.apply()}
+              onCancelConflict={() => setPendingGroupConflict(null)}
+            />
+
             <table className="bw-table">
               <thead>
                 <tr>
-                  <th>Merchant</th><th style={{ textAlign: "right" }}>Count</th><th style={{ textAlign: "right" }}>Total</th>
-                  <th>Category</th><th>Sub</th><th>Class</th><th>Control</th><th>Freq</th><th>Purpose</th><th>Account</th><th></th>
+                  <th></th><th>Merchant</th><th style={{ textAlign: "right" }}>Count</th><th style={{ textAlign: "right" }}>Total</th>
+                  <th>Category</th><th>Sub</th><th>How often</th><th>Can you cut it?</th><th>Repeats every</th><th>Personal or business</th><th>Tied to account</th><th></th>
                 </tr>
               </thead>
               <tbody>
-                {merchantGroups.map((g) => (
-                  <MerchantRow key={g.key} group={g} onCommit={commitMerchantGroup} accounts={accounts} />
-                ))}
+                {merchantGroups.map((g) => {
+                  // Text-based near-duplicates (the person's own inconsistent bank
+                  // text) take priority - a stronger, more specific signal than a
+                  // generic brand match. Library-based catches what text-matching
+                  // structurally cannot: merchants sharing no text at all.
+                  const textCluster = merchantSuggestions.find((c) => c.variants.some((v) => v.key === g.key));
+                  const libCluster = !textCluster ? librarySuggestions.find((c) => c.variants.some((v) => v.key === g.key)) : null;
+                  const suggestion = textCluster
+                    ? { name: textCluster.suggestedName, type: "sameCommitment", variants: textCluster.variants }
+                    : libCluster
+                      ? { name: libCluster.group, type: libCluster.groupType, variants: libCluster.variants }
+                      : null;
+                  const chip = suggestion && !selectedMerchantKeys.has(g.key) ? (
+                    <button type="button" className="bw-suggest-chip" onClick={() => {
+                      const clusterKeys = new Set(suggestion.variants.map((v) => v.key));
+                      setSelectedMerchantKeys((prev) => new Set([...prev, ...merchantGroups.filter((mg) => clusterKeys.has(mg.key)).map((mg) => mg.key)]));
+                      setGroupNameInput(suggestion.name);
+                      setGroupTypeInput(suggestion.type);
+                    }}>
+                      ✨ looks like {suggestion.variants.length - 1} other{suggestion.variants.length - 1 === 1 ? "" : "s"}
+                    </button>
+                  ) : null;
+                  const librarySuggestion = findLibraryEntry(g.key);
+                  return (
+                    <MerchantRow
+                      key={g.key} group={g} accounts={accounts}
+                      onCommit={(grp, patch, remember, groupName, groupType) => commitMultipleMerchantGroups([grp], patch, remember, groupName, groupType, false)}
+                      checked={selectedMerchantKeys.has(g.key)}
+                      onToggle={() => setSelectedMerchantKeys((prev) => {
+                        const next = new Set(prev);
+                        next.has(g.key) ? next.delete(g.key) : next.add(g.key);
+                        return next;
+                      })}
+                      suggestChip={chip}
+                      librarySuggestion={librarySuggestion}
+                    />
+                  );
+                })}
               </tbody>
             </table>
           </>
@@ -9510,7 +10922,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                       />
                     </th>
                     <th>Date</th><th>Account</th><th>Description</th><th style={{ textAlign: "right" }}>Amount</th>
-                    <th>Category</th><th>Sub Category 1</th><th>Sub Category 2</th><th>Frequency</th><th>Cadence</th><th>Control</th><th>Amount Behaviour</th><th>Purpose</th><th>Linked account</th><th>Remember</th>
+                    <th>Category</th><th>Sub Category 1</th><th>Group</th><th>How often</th><th>Repeats every</th><th>Can you cut it?</th><th>Amount pattern</th><th>Personal or business</th><th>Tied to account</th><th>Remember</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -9540,7 +10952,16 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                           </td>
                           <td style={{ whiteSpace: "nowrap", fontSize: 11.5, color: "var(--ink-soft)" }}>{t.date}</td>
                           <td style={{ fontSize: 11.5 }}>{accountName(t.accountId)}</td>
-                          <td style={{ maxWidth: 260 }}>{t.description}</td>
+                          <td style={{ maxWidth: 260 }}>
+                            {(t.aiMerchant || t.counterpartyType) && (
+                              <div data-testid="display-name" style={{ fontWeight: 600, fontSize: 12 }}>
+                                {t.aiKey ? t.merchant : t.aiMerchant || t.merchant}
+                                {t.counterpartyType === "person" && <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 500, color: "var(--ink-soft)", border: "1px solid var(--line)", borderRadius: 8, padding: "0 5px" }}>person</span>}
+                              </div>
+                            )}
+                            {t.description}
+                            {remarkOf(t.description) && <div data-testid="txn-remark" style={{ fontSize: 11, color: "var(--ink-soft)", marginTop: 2 }}>Remark: <b>{remarkOf(t.description)}</b></div>}
+                          </td>
                           <td className={`bw-amt ${t.direction}`}>{t.direction === "credit" ? "+" : "−"}{inr(t.amount)}</td>
                           <td>
                             <select className="bw-select-inline" value={t.category || ""}
@@ -9558,13 +10979,13 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
-                          <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{merchantSubcategory(t, merchantAliases)}</td>
+                          <td style={{ fontSize: 11, color: "var(--ink-soft)" }}>{merchantSubcategory(t, merchantAliases) === "Other" ? "Not grouped" : merchantSubcategory(t, merchantAliases)}</td>
                           <td>
                             {t.category ? (
                               <select className="bw-select-inline" value={t.frequencyClass || ""}
                                 onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: e.target.value || null, control: t.control, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 <option value="">—</option>
-                                {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+                                {FREQUENCY_CLASSES.map((f) => <option key={f} value={f}>{FREQUENCY_CLASS_PLAIN[f] || f}</option>)}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
                           </td>
@@ -9581,7 +11002,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                               <select className="bw-select-inline" value={t.control || ""}
                                 onChange={(e) => commitCategory(t, { category: t.category, subCategory: t.subCategory, frequencyClass: t.frequencyClass, control: e.target.value || null, frequency: t.frequency, purpose: t.purpose, linkedAccountId: t.linkedAccountId })}>
                                 <option value="">—</option>
-                                {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+                                {CONTROLS.map((c) => <option key={c} value={c}>{CONTROL_PLAIN[c] || c}</option>)}
                               </select>
                             ) : t.category === "Expense" && t.frequencyClass === "One-Time" ? (
                               <span style={{ color: "var(--ink-soft)", fontSize: 10.5 }}>Not applicable</span>
@@ -9606,6 +11027,7 @@ function ReviewTab({ transactions, setTransactions, rules, setRules, accounts, m
                                 ))}
                               </select>
                             ) : <span style={{ color: "var(--line)" }}>—</span>}
+                            {t.noLinkedAccount && !t.linkedAccountId && t.pendingAccountName && <div style={{ fontSize: 10.5, color: "var(--ochre)" }}>waiting for {t.pendingAccountName}</div>}
                           </td>
                           <td>
                             <input type="checkbox"
@@ -9671,12 +11093,12 @@ function BulkActionBar({ count, onApply, onClear, accounts }) {
       )}
       {category && (
         <select className="bw-select-inline" value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
-          {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+          {FREQUENCY_CLASSES.map((f) => <option key={f} value={f}>{FREQUENCY_CLASS_PLAIN[f] || f}</option>)}
         </select>
       )}
       {category === "Expense" && frequencyClass !== "One-Time" && (
         <select className="bw-select-inline" value={control} onChange={(e) => setControl(e.target.value)}>
-          {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+          {CONTROLS.map((c) => <option key={c} value={c}>{CONTROL_PLAIN[c] || c}</option>)}
         </select>
       )}
       {category && isFrequencyEligible(frequencyClass) && (
@@ -10126,15 +11548,134 @@ function ManualLinkPicker({ txn, accountName, candidates, onPick, onCancel }) {
  *  way the per-transaction row does (subCategoryOptionsFor, isFrequencyEligible,
  *  linkableAccountTypesFor), so bulk-by-merchant tagging behaves identically to
  *  tagging one transaction at a time - just applied to the whole group on Apply. */
-function MerchantRow({ group, onCommit, accounts }) {
-  const [category, setCategory] = useState("");
-  const [subCategory, setSubCategory] = useState("");
+/** The sliding bulk-apply bar for By-merchant mode, shown once 2+ rows are checked.
+ *  Category/Sub are always applied; the group name field is optional - left blank,
+ *  this behaves exactly like today's plain bulk-categorize with no grouping forced.
+ *  Live existing-group and cross-group-conflict messages update as the person types,
+ *  mirroring the prototype exactly; the actual conflict block-and-confirm happens in
+ *  commitMultipleMerchantGroups itself (via pendingGroupConflict), not here - this
+ *  component only previews what will happen. */
+function MerchantBulkBar({ selectedGroups, merchantAliases, groupNameInput, setGroupNameInput, groupTypeInput, setGroupTypeInput, onApply, pendingGroupConflict, onConfirmConflict, onCancelConflict }) {
+  const [category, setCategory] = useState("Expense");
+  const [subCategory, setSubCategory] = useState("Household");
+  const [frequencyClass, setFrequencyClass] = useState("Recurring");
+  const [control, setControl] = useState("Committed");
+  const [purpose, setPurpose] = useState("Personal");
+  const [remember, setRemember] = useState(true);
+  const n = selectedGroups.length;
+  const trimmedName = groupNameInput.trim();
+  // Merchant Groups only ever apply to Expense/Income - the same boundary the
+  // creation picker and merchantSubcategory's own lookup already enforce. A group
+  // created while Category is Investment or Transfer would be silently inert.
+  const groupingEligible = category === "Expense" || category === "Income";
+
+  const allRawKeys = [...new Set(selectedGroups.flatMap((g) => [...g.rawKeys]))];
+  const existingGroup = trimmedName ? merchantAliases.find((a) => a.canonical.toLowerCase() === trimmedName.toLowerCase()) : null;
+  const conflicts = trimmedName ? merchantAliases.filter((a) => a !== existingGroup && a.variants.some((v) => allRawKeys.includes(v))) : [];
+
+  if (pendingGroupConflict) {
+    const c = pendingGroupConflict;
+    return (
+      <div className="bw-bulk-bar open" style={{ borderColor: "var(--rust)", background: "rgba(156,74,52,0.07)" }}>
+        <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+          <strong>{c.conflicts.map((g) => g.canonical).join(", ")}</strong> already {c.conflicts.length > 1 ? "contain" : "contains"} one
+          of the merchants you're moving into "{c.groupName}". Continue and move {c.conflicts.length > 1 ? "them" : "it"} out of{" "}
+          {c.conflicts.length > 1 ? "those groups" : "that group"}?
+        </div>
+        <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+          <button className="bw-btn small" onClick={onConfirmConflict}>Yes, move it</button>
+          <button className="bw-btn ghost small" onClick={onCancelConflict}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`bw-bulk-bar ${n >= 2 ? "open" : ""}`}>
+      <div className="bw-bulk-count">{n} selected</div>
+      <div className="bw-bulk-field">
+        <label>Category</label>
+        <select className="bw-select-inline" value={category} onChange={(e) => { setCategory(e.target.value); setSubCategory(subCategoryOptionsFor(e.target.value)[0] || ""); }}>
+          {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
+        </select>
+      </div>
+      {subCategoryOptionsFor(category).length > 0 && (
+        <div className="bw-bulk-field">
+          <label>Sub</label>
+          <select className="bw-select-inline" value={subCategory} onChange={(e) => setSubCategory(e.target.value)}>
+            {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </div>
+      )}
+      <div className="bw-bulk-field">
+        <label>How often</label>
+        <select className="bw-select-inline" value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
+          {FREQUENCY_CLASSES.map((f) => <option key={f} value={f}>{FREQUENCY_CLASS_PLAIN[f] || f}</option>)}
+        </select>
+      </div>
+      {category === "Expense" && frequencyClass !== "One-Time" && (
+        <div className="bw-bulk-field">
+          <label>Can you cut it?</label>
+          <select className="bw-select-inline" value={control} onChange={(e) => setControl(e.target.value)}>
+            {CONTROLS.map((c) => <option key={c} value={c}>{CONTROL_PLAIN[c] || c}</option>)}
+          </select>
+        </div>
+      )}
+      <div className="bw-bulk-field">
+        <label>Personal or business</label>
+        <select className="bw-select-inline" value={purpose} onChange={(e) => setPurpose(e.target.value)}>
+          {PURPOSES.map((p) => <option key={p}>{p}</option>)}
+        </select>
+      </div>
+      <div className="bw-bulk-divider" />
+      {groupingEligible ? (
+      <>
+      <div className="bw-bulk-field">
+        <label>Also group these as (optional)</label>
+        <input type="text" className="bw-group-name-input" value={groupNameInput} onChange={(e) => setGroupNameInput(e.target.value)} placeholder="e.g. Grocery" />
+        {trimmedName && existingGroup && (
+          <div className="bw-name-check exists">A group named "{existingGroup.canonical}" already exists ({existingGroup.variants.join(", ")}) — applying will add these merchants to it, not create a duplicate.</div>
+        )}
+        {trimmedName && !existingGroup && conflicts.length > 0 && (
+          <div className="bw-name-check conflict">{conflicts.map((c) => c.canonical).join(", ")} already {conflicts.length > 1 ? "contain" : "contains"} one of these merchants — applying will ask before moving it.</div>
+        )}
+      </div>
+      {trimmedName && n >= 2 && (
+        <div className="bw-bulk-field">
+          <label>Group type</label>
+          <MerchantGroupTypeSelectorCompact value={groupTypeInput} onChange={setGroupTypeInput} />
+        </div>
+      )}
+      </>
+      ) : (
+        <div style={{ fontSize: 11, color: "var(--ink-soft)", maxWidth: 220, paddingTop: 4 }}>
+          Merchant grouping applies to Expense and Income only.
+        </div>
+      )}
+      <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "var(--ink-soft)", paddingTop: 4 }}>
+        <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember (create rules)
+      </label>
+      <button className="bw-btn" style={{ marginLeft: "auto" }} disabled={n < 2}
+        onClick={() => onApply({ category, subCategory, frequencyClass, control, purpose }, remember, groupingEligible ? groupNameInput : "", groupTypeInput)}>
+        Apply to {n}
+      </button>
+    </div>
+  );
+}
+
+function MerchantRow({ group, onCommit, accounts, checked, onToggle, suggestChip, librarySuggestion }) {
+  const [category, setCategory] = useState(librarySuggestion ? librarySuggestion.category : "");
+  const [subCategory, setSubCategory] = useState(librarySuggestion ? librarySuggestion.sub : "");
   const [frequencyClass, setFrequencyClass] = useState("Recurring");
   const [control, setControl] = useState("Committed");
   const [frequency, setFrequency] = useState("Monthly");
   const [purpose, setPurpose] = useState("Personal");
   const [linkedAccountId, setLinkedAccountId] = useState("");
   const [remember, setRemember] = useState(true);
+  // Group suggestion, only ever present for a library match with a known group -
+  // pre-checked, but easy to decline without losing the categorization suggestion.
+  const [applyGroup, setApplyGroup] = useState(!!(librarySuggestion && librarySuggestion.group));
+  const isSuggestedCategory = !!librarySuggestion && category === librarySuggestion.category && subCategory === librarySuggestion.sub;
 
   function handleCategoryChange(v) {
     setCategory(v);
@@ -10147,7 +11688,10 @@ function MerchantRow({ group, onCommit, accounts }) {
   const linkableAccounts = linkableTypes.length > 0 ? accounts.filter((a) => linkableTypes.includes(a.type)) : [];
 
   return (
-    <tr>
+    <tr className={checked ? "checked" : undefined} style={checked ? { background: "rgba(46,102,89,0.06)" } : undefined}>
+      <td>
+        <input type="checkbox" className="bw-checkbox" checked={!!checked} onChange={onToggle} aria-label={`Select ${group.key}`} />
+      </td>
       <td style={{ maxWidth: 220 }}>
         <div>
           {group.key || "—"}
@@ -10156,20 +11700,28 @@ function MerchantRow({ group, onCommit, accounts }) {
               {group.rawKeys.size} variants
             </span>
           )}
+          {suggestChip}
         </div>
         <div style={{ fontSize: 10.5, color: "var(--ink-soft)" }}>{group.sample}</div>
+        {librarySuggestion && librarySuggestion.group && (
+          <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10.5, color: "var(--ochre)", marginTop: 4, cursor: "pointer" }}>
+            <input type="checkbox" checked={applyGroup} onChange={(e) => setApplyGroup(e.target.checked)} />
+            Also group as "{librarySuggestion.group}"
+          </label>
+        )}
       </td>
       <td style={{ textAlign: "right" }}>{group.count}</td>
       <td className="bw-amt debit">{inr(group.total)}</td>
       <td>
-        <select className="bw-select-inline" value={category} onChange={(e) => handleCategoryChange(e.target.value)}>
+        <select className={`bw-select-inline${isSuggestedCategory ? " suggested" : ""}`} value={category} onChange={(e) => handleCategoryChange(e.target.value)}>
           <option value="">—</option>
           {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
         </select>
+        {isSuggestedCategory && <span className="bw-suggested-badge">suggested</span>}
       </td>
       <td>
         {subCategoryOptionsFor(category).length > 0 ? (
-          <select className="bw-select-inline" value={subCategory} onChange={(e) => setSubCategory(e.target.value)}>
+          <select className={`bw-select-inline${isSuggestedCategory ? " suggested" : ""}`} value={subCategory} onChange={(e) => setSubCategory(e.target.value)}>
             {subCategoryOptionsFor(category).map((s) => <option key={s}>{s}</option>)}
           </select>
         ) : <span style={{ color: "var(--line)" }}>—</span>}
@@ -10177,14 +11729,14 @@ function MerchantRow({ group, onCommit, accounts }) {
       <td>
         {category ? (
           <select className="bw-select-inline" value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
-            {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+            {FREQUENCY_CLASSES.map((f) => <option key={f} value={f}>{FREQUENCY_CLASS_PLAIN[f] || f}</option>)}
           </select>
         ) : <span style={{ color: "var(--line)" }}>—</span>}
       </td>
       <td>
         {category === "Expense" && frequencyClass !== "One-Time" ? (
           <select className="bw-select-inline" value={control} onChange={(e) => setControl(e.target.value)}>
-            {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+            {CONTROLS.map((c) => <option key={c} value={c}>{CONTROL_PLAIN[c] || c}</option>)}
           </select>
         ) : category === "Expense" ? (
           <span style={{ color: "var(--ink-soft)", fontSize: 10.5 }}>Not applicable</span>
@@ -10212,7 +11764,11 @@ function MerchantRow({ group, onCommit, accounts }) {
       </td>
       <td>
         <button className="bw-btn small" disabled={!category}
-          onClick={() => onCommit(group, { category, subCategory, frequencyClass, control, frequency, purpose, linkedAccountId }, remember)}>
+          onClick={() => onCommit(
+            group, { category, subCategory, frequencyClass, control, frequency, purpose, linkedAccountId }, remember,
+            applyGroup && librarySuggestion ? librarySuggestion.group : "",
+            librarySuggestion ? librarySuggestion.groupType : "category",
+          )}>
           <Check size={12} /> Apply
         </button>
       </td>
@@ -10290,6 +11846,30 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
 
   const sorted = [...rules].sort((a, b) => b.priority - a.priority);
 
+  // How many transactions each rule matches; a rule that matches none is "dead" and is offered for repair below the table (backlog #123).
+  const ruleDeps = { norm: normalizeForMatch, test: ruleTest, merchantKey: normalizeMerchant };
+  const matchCounts = useMemo(() => ruleMatchCounts(rules, transactions, ruleDeps), [rules, transactions]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [editingId, setEditingId] = useState(null);
+  function saveRuleEdit(updated0) { const updated = updated0.scope === "remark" ? { ...updated0, remarkKey: remarkKeyOf(updated0.pattern) } : updated0; setRules((prev) => prev.map((x) => (x.id === updated.id ? updated : x))); setEditingId(null); showToast("Rule updated. Transactions you haven\u2019t edited by hand follow it."); }
+  const repairPlans = useMemo(() => new Map(rules.filter((x) => !(matchCounts.get(x.id) > 0) && transactions.length > 0).map((x) => [x.id, repairDeadRule(x, transactions, rules, ruleDeps)])), [rules, transactions, matchCounts]); // eslint-disable-line react-hooks/exhaustive-deps
+  const liveRules = sorted.filter((x) => matchCounts.get(x.id) > 0 || transactions.length === 0);
+  const deadRules = sorted.filter((x) => !(matchCounts.get(x.id) > 0) && transactions.length > 0);
+  function repairRules(list) {
+    let fixed = 0; const unfixable = [];
+    const plan = list.map((rule) => ({ rule, res: repairDeadRule(rule, transactions, rules, ruleDeps) }));
+    plan.forEach(({ rule, res }) => { if (res.ok) fixed++; else unfixable.push(rule.pattern); });
+    setRules((prev) => {
+      let next = [...prev];
+      plan.forEach(({ rule, res }) => {
+        if (!res.ok) return;
+        const taken = next.some((x) => x.id !== rule.id && x.pattern.toLowerCase() === res.pattern);
+        next = taken ? next.filter((x) => x.id !== rule.id) : next.map((x) => (x.id === rule.id ? { ...x, pattern: res.pattern, priority: res.pattern.length + 1000 } : x));
+      });
+      return next;
+    });
+    showToast(fixed ? "Repaired " + fixed + " rule" + (fixed === 1 ? "" : "s") + "." + (unfixable.length ? " " + unfixable.length + " could not be rebuilt." : "") : (list.length === 1 && plan[0] ? plan[0].res.reason : "None of these could be rebuilt. Edit or delete them."));
+  }
+
   return (
     <div>
       <div className="bw-tabs" style={{ marginBottom: 18 }}>
@@ -10302,7 +11882,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
       </div>
 
       {subTab === "merchants" ? (
-        <MerchantGroupsPanel transactions={transactions} merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} showToast={showToast} />
+        <MerchantGroupsPanel transactions={transactions} merchantAliases={merchantAliases} setMerchantAliases={setMerchantAliases} showToast={showToast} rules={rules} setRules={setRules} />
       ) : (
       <>
       <h2 className="bw-h2">Categorization rules</h2>
@@ -10344,7 +11924,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
         {!confirmingRulesReset ? (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
             <div style={{ fontSize: 12, color: "var(--ink-soft)", maxWidth: 480 }}>
-              Start over with just the built-in starter rules, discarding everything you've taught the app —
+              Start over with no rules, discarding everything you've taught the app —
               separate from "Reset local data," which clears transactions/accounts/budgets but leaves rules alone.
             </div>
             <button className="bw-btn ghost small" onClick={() => setConfirmingRulesReset(true)}>
@@ -10354,7 +11934,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
         ) : (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
             <div style={{ fontSize: 12, color: "var(--rust)" }}>
-              Discard all {sorted.length} rules and replace with the built-in starter set? This can't be undone.
+              Discard all {sorted.length} rules? This can't be undone.
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="bw-btn small" style={{ background: "var(--rust)", borderColor: "var(--rust)" }}
@@ -10389,30 +11969,30 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
       )}
       {category && (
         <div className="bw-field">
-          <label>Class</label>
+          <label>How often</label>
           <select value={frequencyClass} onChange={(e) => setFrequencyClass(e.target.value)}>
-            {FREQUENCY_CLASSES.map((f) => <option key={f}>{f}</option>)}
+            {FREQUENCY_CLASSES.map((f) => <option key={f} value={f}>{FREQUENCY_CLASS_PLAIN[f] || f}</option>)}
           </select>
         </div>
       )}
       {category === "Expense" && frequencyClass !== "One-Time" && (
         <div className="bw-field">
-          <label>Control</label>
+          <label>Can you cut it?</label>
           <select value={control} onChange={(e) => setControl(e.target.value)}>
-            {CONTROLS.map((c) => <option key={c}>{c}</option>)}
+            {CONTROLS.map((c) => <option key={c} value={c}>{CONTROL_PLAIN[c] || c}</option>)}
           </select>
         </div>
       )}
       {category && isFrequencyEligible(frequencyClass) && (
         <div className="bw-field" style={{ maxWidth: 220 }}>
-          <label>Frequency</label>
+          <label>Repeats every</label>
           <select value={frequency} onChange={(e) => setFrequency(e.target.value)}>
             {FREQUENCIES.map((f) => <option key={f}>{f}</option>)}
           </select>
         </div>
       )}
       <div className="bw-field" style={{ maxWidth: 220 }}>
-        <label>Purpose</label>
+        <label>Personal or business</label>
         <select value={purpose} onChange={(e) => setPurpose(e.target.value)}>
           {PURPOSES.map((p) => <option key={p}>{p}</option>)}
         </select>
@@ -10433,28 +12013,69 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
       <div className="bw-section-label">All rules ({sorted.length})</div>
       <table className="bw-table">
         <thead>
-          <tr><th>Pattern</th><th>Maps to</th><th>Source</th><th></th></tr>
+          <tr><th>Pattern</th><th>Maps to</th><th>Transactions</th><th>Source</th><th></th></tr>
         </thead>
         <tbody>
-          {sorted.map((r) => (
+          {liveRules.map((r) => editingId === r.id ? (
+            <tr key={r.id}><td colSpan={5}><RuleEditor rule={r} onSave={saveRuleEdit} onCancel={() => setEditingId(null)} /></td></tr>
+          ) : (
             <tr key={r.id}>
-              <td style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{r.pattern}</td>
+              <td style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{r.scope === "remark" ? <><span style={{ color: "var(--ink-soft)", fontFamily: "inherit" }}>Remark: </span>{r.pattern}</> : r.pattern}</td>
               <td>
                 <span className="bw-pill" style={{ background: PALETTE[pillClass(r.category, r.subCategory, r.frequencyClass)] || "#9C8F78" }}>
                   {r.category}{r.subCategory ? ` / ${r.subCategory}` : ""}{r.frequencyClass ? ` / ${r.frequencyClass}` : ""}{r.control ? ` / ${r.control}` : ""}{r.frequency ? ` / ${r.frequency}` : ""}
                 </span>
+                {r.group && <span style={{ fontSize: 10.5, color: "var(--ink-soft)", marginLeft: 6 }}>group: {r.group}</span>}
                 {r.purpose === "Business" && (
                   <span style={{ fontSize: 9.5, color: "var(--ochre)", border: "1px solid var(--ochre)", borderRadius: 20, padding: "1px 6px", marginLeft: 5 }}>
                     Business
                   </span>
                 )}
               </td>
+              <td style={{ fontSize: 12.5, fontFamily: "'IBM Plex Mono', monospace" }}>{matchCounts.get(r.id) || 0}</td>
               <td style={{ fontSize: 11.5, color: "var(--ink-soft)", textTransform: "capitalize" }}>{r.source}</td>
-              <td><button className="bw-btn ghost small" onClick={() => removeRule(r.id)}><Trash2 size={12} /></button></td>
+              <td style={{ whiteSpace: "nowrap" }}><button className="bw-btn ghost small" data-testid="edit-rule" onClick={() => setEditingId(r.id)}>Edit</button>{" "}<button className="bw-btn ghost small" onClick={() => removeRule(r.id)}><Trash2 size={12} /></button></td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      {deadRules.length > 0 && (
+        <div data-testid="dead-rules" style={{ marginTop: 22, border: "1px solid var(--ochre)", borderRadius: 6, padding: "12px 14px", background: "var(--card)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+            <div>
+              <div className="bw-section-label" style={{ margin: 0, color: "var(--ochre)" }}>Rules that match no transaction ({deadRules.length})</div>
+              <div style={{ fontSize: 12, color: "var(--ink-soft)", maxWidth: 560, marginTop: 4 }}>
+                These can never apply, usually because the pattern was built from a display name rather than the bank's text. Each one shows the transactions it was made for and the pattern that would match them. Apply, edit or delete each, or apply every proposal once you have looked through them.
+              </div>
+            </div>
+            <button className="bw-btn small" onClick={() => repairRules(deadRules)}><RefreshCw size={12} /> Apply all proposals</button>
+          </div>
+          {deadRules.map((r) => {
+            const plan = repairPlans.get(r.id) || { ok: false };
+            const rows = (plan.rowIds || []).map((id) => transactions.find((t) => t.id === id)).filter(Boolean);
+            return editingId === r.id ? (
+              <div key={r.id} style={{ borderTop: "1px dashed var(--line)", padding: "8px 0" }}><RuleEditor rule={r} onSave={saveRuleEdit} onCancel={() => setEditingId(null)} /></div>
+            ) : (
+              <div key={r.id} data-dead-rule={r.id} style={{ borderTop: "1px dashed var(--line)", padding: "8px 0" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                  <div>
+                    <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>{r.pattern}</span>
+                    {plan.ok && <span style={{ fontSize: 12.5 }}> {"\u2192"} <b style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{plan.pattern}</b>{plan.merge ? " (joins the rule that already has this pattern)" : ""}</span>}
+                    <div style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{r.category}{r.subCategory ? " / " + r.subCategory : ""} {"\u00B7"} {r.source}{!plan.ok && plan.reason ? " \u00B7 " + plan.reason : ""}</div>
+                  </div>
+                  <div style={{ whiteSpace: "nowrap" }}>
+                    {plan.ok && <button className="bw-btn ghost small" onClick={() => repairRules([r])}><RefreshCw size={12} /> Apply</button>}{" "}
+                    <button className="bw-btn ghost small" onClick={() => setEditingId(r.id)}>Edit</button>{" "}
+                    <button className="bw-btn ghost small" onClick={() => removeRule(r.id)}><Trash2 size={12} /></button>
+                  </div>
+                </div>
+                {rows.length > 0 && <TxnPeek rows={rows.slice(0, 3)} />}
+              </div>
+            );
+          })}
+        </div>
+      )}
       </>
       )}
     </div>
@@ -10471,7 +12092,7 @@ function RulesTab({ rules, setRules, transactions, onReapplyRules, merchantAlias
  *  so future imports keep working. Suggestions come from computeSuggestedMerchantClusters
  *  (algorithmic, based on shared "core" text after stripping banking noise words);
  *  groups can also be built or edited entirely by hand below. */
-function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases, showToast }) {
+function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases, showToast, rules = [], setRules }) {
   const suggestions = useMemo(
     () => computeSuggestedMerchantClusters(transactions, merchantAliases),
     [transactions, merchantAliases]
@@ -10513,13 +12134,10 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
     // "Other" is the permanent, reserved fallback Field B/Sub Category uses for any
     // merchant not (yet) in a group - a real group claiming that name would silently
     // collide with every still-ungrouped merchant, so it's never allowed.
-    if (finalName.toLowerCase() === "other") {
-      showToast?.("\"Other\" is reserved for ungrouped merchants — please choose a different name.");
-      return;
-    }
+    const groupName = finalName.toLowerCase() === "other" ? "Others" : finalName; // "Other" is the internal not-grouped marker; the group people can have is "Others"
     setMerchantAliases((prev) => [
       ...prev,
-      { id: uid("mg"), canonical: finalName, type: type || "category", variants: cluster.variants.map((v) => v.key) },
+      { id: uid("mg"), canonical: groupName, type: type || "category", variants: cluster.variants.map((v) => v.key) },
     ]);
   }
 
@@ -10527,8 +12145,8 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
     // Defensive check - MerchantGroupRow already validates on blur before calling this,
     // but this is the actual data-mutation point, so it shouldn't rely solely on the
     // caller having done so.
-    if (name.trim().toLowerCase() === "other") return;
-    setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, canonical: name } : g)));
+    const clean = name.trim().toLowerCase() === "other" ? "Others" : name;
+    setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, canonical: clean } : g)));
   }
 
   // Whether this group's variants get combined for recurring-pattern learning
@@ -10541,8 +12159,15 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
     setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, type } : g)));
   }
 
+  // Take one merchant out of a group (the group goes when its last merchant does). A rule that named this group for the merchant forgets it too,
+  // or the group would quietly put the merchant back.
   function removeVariant(id, variant) {
-    setMerchantAliases((prev) => prev.map((g) => (g.id === id ? { ...g, variants: g.variants.filter((v) => v !== variant) } : g)).filter((g) => g.variants.length > 0));
+    const g = merchantAliases.find((x) => x.id === id);
+    setMerchantAliases((prev) => prev.map((x) => (x.id === id ? { ...x, variants: x.variants.filter((v) => v !== variant) } : x)).filter((x) => x.variants.length > 0));
+    if (g && setRules) {
+      const ruleIds = new Set(transactions.filter((t) => (t.merchant || t.description) === variant && t.matchedRuleId).map((t) => t.matchedRuleId));
+      setRules((prev) => prev.map((r) => (r.group && r.group.toLowerCase() === g.canonical.toLowerCase() && ruleIds.has(r.id) ? { ...r, group: undefined } : r)));
+    }
   }
 
   function addVariants(id, variantsToAdd) {
@@ -10556,6 +12181,8 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
 
   const groupedVariants = new Set(merchantAliases.flatMap((g) => g.variants));
   const ungroupedRaw = allRawMerchants.filter((k) => !groupedVariants.has(k));
+  // How many transactions carry each merchant exactly as written, so a merchant with none can be spotted and removed.
+  const txnCountByMerchant = useMemo(() => { const m = new Map(); transactions.forEach((t) => { const k = t.merchant || t.description; if (k) m.set(k, (m.get(k) || 0) + 1); }); return m; }, [transactions]);
 
   return (
     <div>
@@ -10587,7 +12214,7 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
         <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 22 }}>
           {merchantAliases.map((g) => (
             <MerchantGroupRow
-              key={g.id} group={g}
+              key={g.id} group={g} counts={txnCountByMerchant}
               availableToAdd={ungroupedRaw} fullDescriptionByKey={fullDescriptionByKey}
               onRename={renameGroup} onRemoveVariant={removeVariant} onAddVariants={addVariants} onDelete={deleteGroup}
               onChangeType={changeGroupType}
@@ -10599,11 +12226,7 @@ function MerchantGroupsPanel({ transactions, merchantAliases, setMerchantAliases
       <ManualMerchantGroupCreator availableRaw={ungroupedRaw} fullDescriptionByKey={fullDescriptionByKey} onCreate={(name, variants, type) => {
         const trimmed = name.trim();
         if (!trimmed || variants.length === 0) return;
-        if (trimmed.toLowerCase() === "other") {
-          showToast?.("\"Other\" is reserved for ungrouped merchants — please choose a different name.");
-          return;
-        }
-        setMerchantAliases((prev) => [...prev, { id: uid("mg"), canonical: trimmed, type: type || "category", variants }]);
+        setMerchantAliases((prev) => [...prev, { id: uid("mg"), canonical: trimmed.toLowerCase() === "other" ? "Others" : trimmed, type: type || "category", variants }]);
       }} />
     </div>
   );
@@ -10635,6 +12258,26 @@ function MerchantGroupTypeSelector({ value, onChange }) {
           <strong>Same recurring bill</strong> — this is really one thing with inconsistent bank text (e.g. Electricity
           billed under different descriptions each month). Combined so its pattern can actually be learned.
         </span>
+      </label>
+    </div>
+  );
+}
+
+/** Same Group Type choice as MerchantGroupTypeSelector above, terser for
+ *  space-constrained contexts (the Review bulk-bar) where a full paragraph per
+ *  option doesn't fit - definitions move into InfoTooltip instead of inline text. */
+function MerchantGroupTypeSelectorCompact({ value, onChange }) {
+  return (
+    <div className="bw-type-row">
+      <label>
+        <input type="radio" checked={value !== "sameCommitment"} onChange={() => onChange("category")} />
+        Spending category
+        <InfoTooltip text={'These are different things (e.g. Netflix and Audible under "Subscriptions"). Shown and totaled together, but each keeps learning its own pattern.'} />
+      </label>
+      <label>
+        <input type="radio" checked={value === "sameCommitment"} onChange={() => onChange("sameCommitment")} />
+        Same recurring bill
+        <InfoTooltip text={"This is really one thing with inconsistent bank text (e.g. Electricity billed under different descriptions each month). Combined so its pattern can actually be learned."} />
       </label>
     </div>
   );
@@ -10731,7 +12374,7 @@ function SearchableMerchantPicker({ options, fullDescriptionByKey, selected, onT
  *  (deleting the group entirely once its last variant is gone), add one or more
  *  ungrouped raw merchant strings to it in a single action, or delete the whole
  *  group. */
-function MerchantGroupRow({ group, availableToAdd, fullDescriptionByKey, onRename, onRemoveVariant, onAddVariants, onDelete, onChangeType }) {
+function MerchantGroupRow({ group, availableToAdd, fullDescriptionByKey, counts, onRename, onRemoveVariant, onAddVariants, onDelete, onChangeType }) {
   const [adding, setAdding] = useState(false);
   const [toAdd, setToAdd] = useState([]);
   // Local draft, separate from group.canonical - lets the person type freely (e.g.
@@ -10741,8 +12384,8 @@ function MerchantGroupRow({ group, availableToAdd, fullDescriptionByKey, onRenam
 
   function commitRename() {
     const trimmed = nameDraft.trim();
-    if (!trimmed || trimmed.toLowerCase() === "other") {
-      setNameDraft(group.canonical); // revert - rejected or emptied, nothing to commit
+    if (!trimmed) {
+      setNameDraft(group.canonical); // emptied - nothing to commit
       return;
     }
     if (trimmed !== group.canonical) onRename(group.id, trimmed);
@@ -10768,20 +12411,23 @@ function MerchantGroupRow({ group, availableToAdd, fullDescriptionByKey, onRenam
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8 }}>
         <input type="text" className="bw-select-inline" style={{ fontSize: 13, fontWeight: 600, width: 220 }}
           value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} onBlur={commitRename} />
-        <button className="bw-btn ghost small" onClick={() => onDelete(group.id)}><Trash2 size={12} /> Delete group</button>
+        <button className="bw-btn ghost small" data-testid="delete-group" onClick={() => onDelete(group.id)}><Trash2 size={12} /> Delete group</button>
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
-        {group.variants.map((v) => (
-          <span key={v} style={{
-            fontSize: 11, border: "1px solid var(--line)", borderRadius: 20, padding: "2px 8px 2px 10px",
-            display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)",
-          }}>
-            {v}
-            <button onClick={() => onRemoveVariant(group.id, v)} style={{ border: "none", background: "none", cursor: "pointer", padding: 0, display: "flex" }}>
-              <X size={10} />
-            </button>
-          </span>
-        ))}
+        {group.variants.map((v) => {
+          const n = counts.get(v) || 0;
+          return (
+            <span key={v} data-testid="group-chip" title={n === 0 ? "No transaction carries this merchant now" : n + " transaction" + (n === 1 ? "" : "s")} style={{
+              fontSize: 11, border: "1px solid " + (n === 0 ? "var(--ochre)" : "var(--line)"), borderRadius: 20, padding: "2px 6px 2px 10px",
+              display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)",
+            }}>
+              {v}<span style={{ color: n === 0 ? "var(--rust)" : "var(--ink-soft)" }}>{" \u00B7 "}{n}</span>
+              <button aria-label={"Remove " + v} data-testid="remove-variant" onClick={() => onRemoveVariant(group.id, v)} style={{ border: "none", background: "none", cursor: "pointer", padding: "0 3px", display: "flex", fontSize: 16, lineHeight: 1, color: "var(--ink-soft)" }}>
+                {"\u00D7"}
+              </button>
+            </span>
+          );
+        })}
       </div>
       <MerchantGroupTypeSelector value={group.type} onChange={(t) => onChangeType(group.id, t)} />
       {!adding ? (
@@ -10987,8 +12633,8 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
       <ZoneHeader icon={LineChartIcon} title="Overview" subtitle="Every pillar, at a glance — click any card for the full picture" />
       <div className="bw-insight-row">
         <InsightCard
-          icon={Landmark} title="Net worth" value={inr(nwCurrent.netWorth)}
-          delta={`${nwDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(nwDelta))} \u00B7 vs last snapshot`}
+          icon={Landmark} title="Net worth" description="Everything you own, minus everything you owe" value={inr(nwCurrent.netWorth)}
+          delta={`${nwDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(nwDelta))} \u00B7 since your last update`}
           deltaColor={nwDelta >= 0 ? "var(--teal)" : "var(--rust)"}
           onClick={() => onGoToView("networth")}
         >
@@ -10996,8 +12642,8 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
         </InsightCard>
 
         <InsightCard
-          icon={Wallet} title="Savings" value={inr(savingsAmount)}
-          delta={prevSavingsRate !== null ? `${savingsRate.toFixed(0)}% rate \u00B7 ${savingsRate >= prevSavingsRate ? "\u25B2" : "\u25BC"} vs last month` : `${savingsRate.toFixed(0)}% rate`}
+          icon={Wallet} title="Savings" description="What's left of your income after spending" value={inr(savingsAmount)}
+          delta={prevSavingsRate !== null ? `${savingsRate.toFixed(0)}% of income saved \u00B7 ${savingsRate >= prevSavingsRate ? "\u25B2" : "\u25BC"} vs last month` : `${savingsRate.toFixed(0)}% of income saved`}
           deltaColor={prevSavingsRate !== null ? (savingsRate >= prevSavingsRate ? "var(--teal)" : "var(--rust)") : "var(--ink-soft)"}
           onClick={() => onGoToView("cashflow")}
         >
@@ -11005,8 +12651,8 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
         </InsightCard>
 
         <InsightCard
-          icon={TrendingUp} title="Investments" value={inr(totalInvestmentsCurrent)}
-          delta={`${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))} \u00B7 vs last snapshot`}
+          icon={TrendingUp} title="Investments" description="What your investments are worth today" value={inr(totalInvestmentsCurrent)}
+          delta={`${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))} \u00B7 since your last update`}
           deltaColor={investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)"}
           onClick={() => onGoToView("investments")}
           footer={[
@@ -11019,7 +12665,7 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
 
         {hasDebt && (
           <InsightCard
-            icon={TrendingDown} title="Debt" value={inr(nwCurrent.totalDebt)}
+            icon={TrendingDown} title="Debt" description="What you still owe" value={inr(nwCurrent.totalDebt)}
             delta={`${debtPaidDown >= 0 ? "\u25BC" : "\u25B2"} ${inr(Math.abs(debtPaidDown))} \u00B7 ${debtPaidDown >= 0 ? "paid down" : "increased"} in 30 days`}
             deltaColor={debtPaidDown >= 0 ? "var(--teal)" : "var(--rust)"}
             onClick={() => onGoToView("debt")}
@@ -11029,7 +12675,7 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
         )}
 
         <InsightCard
-          icon={FileText} title="Expenses" value={inr(curM?.expense || 0)}
+          icon={FileText} title="Expenses" description="What you spent this month" value={inr(curM?.expense || 0)}
           delta={expenseDelta ? `${expenseDelta.text} vs last month` : null} deltaColor={expenseDelta?.color}
           onClick={() => onGoToView("cashflow")}
         >
@@ -11046,13 +12692,13 @@ function DashboardOverview({ transactions, accounts, budgets, merchantAliases, h
         </InsightCard>
 
         <InsightCard
-          icon={Flag} title="Goals" value={String(goals.length)}
+          icon={Flag} title="Goals" description="What you're saving toward" value={String(goals.length)}
           delta={goals.length === 0 ? "No goals set yet" : `${inr(totalGoalTarget)} target \u00B7 ${totalGoalPct.toFixed(0)}% funded`}
           deltaColor={totalGoalPct >= 75 ? "var(--teal)" : totalGoalPct >= 40 ? "var(--ochre)" : "var(--rust)"}
           onClick={() => onGoToView("goals")}
           footer={goals.length > 0 ? [
             { label: "Amount funded", value: inr(totalGoalFunded) },
-            { label: "Portfolio chg.", value: `${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))}`, color: investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)" },
+            { label: "Change in investments", value: `${investmentsVsSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} ${inr(Math.abs(investmentsVsSnapshotDelta))}`, color: investmentsVsSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)" },
           ] : undefined}
         />
       </div>
@@ -11160,10 +12806,10 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
           recurringByMethod[method][m].lastDate = t.date;
           recurringByMethod[method][m].frequency = t.frequency || "Monthly";
         }
-      } else if (t.frequencyClass === "Irregular" && t.subCategory === "Household") {
+      } else if (t.subCategory === "Household") { // Irregular or One-Time: everything that is not a commitment is Variable
         b.varHousehold += signed;
         merchantsByMethod[method].varHousehold[m] = (merchantsByMethod[method].varHousehold[m] || 0) + signed;
-      } else if (t.frequencyClass === "Irregular" && t.subCategory === "Personal") {
+      } else if (t.subCategory === "Personal") {
         b.varPersonal += signed;
         merchantsByMethod[method].varPersonal[m] = (merchantsByMethod[method].varPersonal[m] || 0) + signed;
       }
@@ -11561,7 +13207,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
           const pctOver = ((projected - budget) / budget) * 100;
           found.push({
             type: "budget", magnitude: pctOver,
-            text: `On pace to exceed your ${b.label} budget by ${pctOver.toFixed(0)}% (~${inr(projected)} projected vs ${inr(budget)} budgeted).`,
+            text: `On pace to exceed your ${b.label} budget by ${pctOver.toFixed(0)}% (~${inr(projected)} forecast vs ${inr(budget)} budgeted).`,
           });
         }
       });
@@ -11862,6 +13508,11 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
         return (
           <div key={method} style={{ marginBottom: 22 }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>{methodLabel} — {inr(data.total)}</div>
+            {Math.round(data.total - data.fixed - data.varHousehold - data.varPersonal) > 0 && (
+              <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 10 }}>
+                {inr(data.total - data.fixed - data.varHousehold - data.varPersonal)} of this isn't split into Fixed / Variable yet — those merchants still need a Household or Personal answer (Review).
+              </div>
+            )}
 
             <div style={{ marginBottom: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 6 }}>
@@ -11896,7 +13547,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                     <tbody>
                       {data.topVarHousehold.map(([m, v]) => (
                         <tr key={m} style={{ cursor: "pointer" }}
-                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Household" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
+                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass !== "Recurring" && t.subCategory === "Household" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
                           <td>{m || "—"}</td><td className="bw-amt debit">{inr(v)}</td>
                         </tr>
                       ))}
@@ -11913,7 +13564,7 @@ function CashFlowOverview({ transactions, setTransactions, accounts, budgets, se
                     <tbody>
                       {data.topVarPersonal.map(([m, v]) => (
                         <tr key={m} style={{ cursor: "pointer" }}
-                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Personal" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
+                          onClick={() => openDrill(m || "—", (t) => t.category === "Expense" && t.frequencyClass !== "Recurring" && t.subCategory === "Personal" && matchesMethod(t) && resolveMerchant(t.merchant || t.description, merchantAliases) === m)}>
                           <td>{m || "—"}</td><td className="bw-amt debit">{inr(v)}</td>
                         </tr>
                       ))}
@@ -12424,7 +14075,7 @@ function ListView({ transactions, accounts, rules, merchantAliases }) {
         <Stat label="Net cash flow" value={inr(totals.net)} color={totals.net >= 0 ? "var(--teal)" : "var(--rust)"} />
         <Stat label="Opening balance" value={openingBalance !== null ? inr(openingBalance) : "—"} color="var(--ink)" hint={dayBeforeMonthStart} />
         <Stat
-          label={isCurrentMonth ? "Closing balance (projected)" : "Closing balance"}
+          label={isCurrentMonth ? "Closing balance (forecast)" : "Closing balance"}
           value={closingBalance !== null ? inr(closingBalance) : "—"}
           color="var(--ink)"
           hint={closingBalance === null && !isCurrentMonth && monthEndStr > todayStr ? "See Forecast for future months" : monthEndStr}
@@ -12456,11 +14107,12 @@ function ListView({ transactions, accounts, rules, merchantAliases }) {
 
 const CASH_FLOW_EVENT_BUCKET_ORDER = ["SCHEDULED", "EXPECTED", "PLANNED", "PROJECTED"];
 const CASH_FLOW_EVENT_BUCKET_HINT = {
-  SCHEDULED: "Recurring, well-established pattern",
-  EXPECTED: "Recurring, pattern still being learned",
-  PLANNED: "From your goals",
-  PROJECTED: "Behavioural allowance for irregular spending",
+  SCHEDULED: "Happens regularly, on a set date",
+  EXPECTED: "Happens regularly; still learning the exact date",
+  PLANNED: "Part of your plan for a goal",
+  PROJECTED: "A typical month's estimate for spending with no fixed schedule",
 };
+const CASH_FLOW_EVENT_BUCKET_LABEL = { SCHEDULED: "Scheduled", EXPECTED: "Expected", PLANNED: "Planned", PROJECTED: "Projected" };
 
 /** Cash Flow Summary - the new output view telling one financial story: current
  *  verified cash, what's happening (confidence-bucketed event totals), where cash is
@@ -12480,7 +14132,7 @@ function CashFlowPerformanceSection({ performance, monthKeys, onSelectMonth }) {
   return (
     <div style={{ marginBottom: 26 }}>
       <h2 className="bw-h2" style={{ marginBottom: 2 }}>Cash Flow Performance</h2>
-      <p className="bw-lead" style={{ marginBottom: 14 }}>How actual cash flow compared with what was projected and planned.</p>
+      <p className="bw-lead" style={{ marginBottom: 14 }}>How actual cash flow compared with what was forecast and planned.</p>
       <div style={{ overflowX: "auto" }}>
         <table className="bw-table">
           <thead>
@@ -12499,7 +14151,7 @@ function CashFlowPerformanceSection({ performance, monthKeys, onSelectMonth }) {
               ))}
             </tr>
             <tr>
-              <td>Projected</td>
+              <td>Forecast</td>
               {monthKeys.map((mk) => (
                 <td key={mk} className="bw-amt" style={{ cursor: "pointer", color: "var(--ink-soft)" }} onClick={() => onSelectMonth(mk)}>
                   {inr(performance[mk].projected.total)}
@@ -12507,7 +14159,7 @@ function CashFlowPerformanceSection({ performance, monthKeys, onSelectMonth }) {
               ))}
             </tr>
             <tr>
-              <td>Variance</td>
+              <td>Difference</td>
               {monthKeys.map((mk) => {
                 const variance = performance[mk].actual.total - performance[mk].projected.total;
                 return (
@@ -12604,7 +14256,7 @@ function PerformanceAuditDrawer({ monthData, accountName, onClose }) {
           </div>
         ) : (
           <table className="bw-table">
-            <thead><tr><th></th><th style={{ textAlign: "right" }}>Actual</th><th style={{ textAlign: "right" }}>Projected</th><th style={{ textAlign: "right" }}>Variance</th></tr></thead>
+            <thead><tr><th></th><th style={{ textAlign: "right" }}>Actual</th><th style={{ textAlign: "right" }}>Forecast</th><th style={{ textAlign: "right" }}>Difference</th></tr></thead>
             <tbody>
               {rows.map((r) => {
                 const variance = r.actualTotal - r.projectedTotal;
@@ -12713,17 +14365,17 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
     const horizonLabel = `${horizonMonths} month${horizonMonths === 1 ? "" : "s"}`;
     if (cashBuffer > 0) {
       if (bufferSurplusOrShortfall >= 0) {
-        parts.push(`Your projected cash stays above your required buffer through the next ${horizonLabel}, with a surplus of ${inr(bufferSurplusOrShortfall)} at its lowest point on ${shortDateLabel(projectedMinimumCashDate)}.`);
+        parts.push(`Your cash is forecast to stay above your required buffer through the next ${horizonLabel}, with a surplus of ${inr(bufferSurplusOrShortfall)} at its lowest point on ${shortDateLabel(projectedMinimumCashDate)}.`);
       } else {
-        parts.push(`Your projected cash dips ${inr(Math.abs(bufferSurplusOrShortfall))} below your required buffer around ${shortDateLabel(projectedMinimumCashDate)}.`);
+        parts.push(`Your cash is forecast to dip ${inr(Math.abs(bufferSurplusOrShortfall))} below your required buffer around ${shortDateLabel(projectedMinimumCashDate)}.`);
       }
     } else {
-      parts.push(`Your projected minimum cash over the next ${horizonLabel} is ${inr(projectedMinimumCash)}, around ${shortDateLabel(projectedMinimumCashDate)}.`);
+      parts.push(`Your forecast minimum cash over the next ${horizonLabel} is ${inr(projectedMinimumCash)}, around ${shortDateLabel(projectedMinimumCashDate)}.`);
     }
     if (projectedSavingsRate.rate != null && actualSavingsRate.rate != null) {
       const diff = projectedSavingsRate.rate - actualSavingsRate.rate;
       const trend = Math.abs(diff) < 1 ? "in line with" : diff > 0 ? "up from" : "down from";
-      parts.push(`Your projected savings rate is ${Math.round(projectedSavingsRate.rate)}%, ${trend} your recent actual rate of ${Math.round(actualSavingsRate.rate)}%.`);
+      parts.push(`Your forecast savings rate is ${Math.round(projectedSavingsRate.rate)}%, ${trend} your recent actual rate of ${Math.round(actualSavingsRate.rate)}%.`);
     }
     return parts.join(" ");
   }, [projection, projectedSavingsRate, actualSavingsRate, cashBuffer, horizonMonths]);
@@ -12755,14 +14407,14 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
 
       {/* 1. WHERE AM I? - Actual Cash State */}
       <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--ink-soft)" }}>Cash Position</div>
+        <div style={{ fontSize: "var(--label-size)", textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--ink-soft)" }}>Cash Position</div>
         <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 34, fontWeight: 600, marginTop: 4, color: "var(--ink)" }}>{inr(actualCashState)}</div>
         <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginTop: 2 }}>Actual Cash State · Verified: {shortDateLabel(todayStr)}</div>
       </div>
 
       {/* 2. WHAT'S HAPPENING? - confidence-bucketed event totals */}
       <div className="bw-section-label" style={{ marginTop: 0 }}>Cash Flow Events</div>
-      <p className="bw-lead" style={{ marginBottom: 12 }}>Over the next {horizonMonths} month{horizonMonths === 1 ? "" : "s"}, summarized by confidence.</p>
+      <p className="bw-lead" style={{ marginBottom: 12 }}>Over the next {horizonMonths} month{horizonMonths === 1 ? "" : "s"}, grouped by how sure we are.</p>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 24 }}>
         {CASH_FLOW_EVENT_BUCKET_ORDER.map((bucket) => {
           const b = eventSummary ? eventSummary[bucket] : { inflow: 0, outflow: 0 };
@@ -12774,10 +14426,10 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
               onClick={onDrillToEvents ? () => onDrillToEvents(`next${horizonMonths}`, bucket) : undefined}
               style={onDrillToEvents ? { cursor: "pointer" } : undefined}
             >
-              <div className="label">{bucket}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--ink)" }}>{CASH_FLOW_EVENT_BUCKET_LABEL[bucket]}</div>
+              <div style={{ fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.4, marginTop: 2 }}>{CASH_FLOW_EVENT_BUCKET_HINT[bucket]}</div>
               {b.inflow > 0 && <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: "var(--teal)", fontSize: 15, marginTop: 4 }}>+{inr(b.inflow)}</div>}
               {b.outflow > 0 && <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: "var(--ink)", fontSize: 15, marginTop: b.inflow > 0 ? 2 : 4 }}>−{inr(b.outflow)}</div>}
-              <div style={{ fontSize: 10, color: "var(--ink-soft)", marginTop: 4 }}>{CASH_FLOW_EVENT_BUCKET_HINT[bucket]}</div>
               {onDrillToEvents && (
                 <div style={{ fontSize: 10.5, color: "var(--teal)", marginTop: 6, display: "flex", alignItems: "center", gap: 3 }}>
                   {bucketEventCount} event{bucketEventCount === 1 ? "" : "s"} <ArrowRight size={10} />
@@ -12792,7 +14444,7 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
       </div>
 
       {/* 3. WHERE AM I GOING? - the central visual */}
-      <div className="bw-section-label" style={{ marginTop: 0 }}>Projected Cash Position</div>
+      <div className="bw-section-label" style={{ marginTop: 0 }}>Forecast Cash Position</div>
       <ResponsiveContainer width="100%" height={280}>
         <AreaChart data={chartData}>
           <defs>
@@ -12814,7 +14466,7 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
               label={{ value: "Required buffer", position: "insideTopRight", fontSize: 10, fill: "var(--rust)" }} />
           )}
           <Area type="monotone" dataKey="actualBalance" name="Actual" stroke="var(--teal)" fill="url(#cfsActualFill)" strokeWidth={2} dot={false} connectNulls={false} />
-          <Area type="monotone" dataKey="projectedBalance" name="Projected" stroke="var(--ochre)" strokeDasharray="4 3" fill="url(#cfsProjectedFill)" strokeWidth={2} dot={false} connectNulls={false} />
+          <Area type="monotone" dataKey="projectedBalance" name="Forecast" stroke="var(--ochre)" strokeDasharray="4 3" fill="url(#cfsProjectedFill)" strokeWidth={2} dot={false} connectNulls={false} />
           {projection && (
             <ReferenceDot x={projection.projectedMinimumCashDate} y={projection.projectedMinimumCash} r={5} fill="var(--rust)" stroke="var(--card)" strokeWidth={2} />
           )}
@@ -12823,9 +14475,9 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
 
       {/* 4. HOW SAFE AM I? - minimum cash / drawdown / buffer */}
       <div className="bw-summary-row" style={{ marginTop: 20, marginBottom: 24 }}>
-        <Stat label="Projected Minimum Cash" value={projection ? inr(projection.projectedMinimumCash) : "—"} hint={projection ? shortDateLabel(projection.projectedMinimumCashDate) : null} />
-        <Stat label="Cash Drawdown" value={projection ? inr(projection.cashDrawdown) : "—"} hint={projection ? `From ${inr(actualCashState)} to ${inr(projection.projectedMinimumCash)}` : null} />
-        <Stat label="Required Cash Buffer" value={inr(cashBuffer)} hint="Set below" color={cashBuffer > 0 ? undefined : "var(--ink-soft)"} />
+        <Stat label="Forecast Minimum Cash" labelInfo="Lowest your cash is expected to go." value={projection ? inr(projection.projectedMinimumCash) : "—"} hint={projection ? shortDateLabel(projection.projectedMinimumCashDate) : null} />
+        <Stat label="Cash Drawdown" labelInfo="How much lower it could dip." value={projection ? inr(projection.cashDrawdown) : "—"} hint={projection ? `From ${inr(actualCashState)} to ${inr(projection.projectedMinimumCash)}` : null} />
+        <Stat label="Required Cash Buffer" labelInfo="Your safety cushion - the minimum you want to keep on hand." value={inr(cashBuffer)} hint="Set below" color={cashBuffer > 0 ? undefined : "var(--ink-soft)"} />
         <Stat
           label={projection && projection.bufferSurplusOrShortfall >= 0 ? "Buffer Surplus" : "Buffer Shortfall"}
           value={projection ? `${projection.bufferSurplusOrShortfall >= 0 ? "+" : "−"}${inr(Math.abs(projection.bufferSurplusOrShortfall))}` : "—"}
@@ -12841,10 +14493,11 @@ function CashFlowSummaryView({ transactions, accounts, rules, merchantAliases, g
       {/* 5. AM I ACHIEVING MY PLAN? - savings rate comparison, built as an extensible
          row so a future Budgeted column is a one-line addition, not a redesign */}
       <div className="bw-section-label" style={{ marginTop: 0 }}>Savings Rate</div>
+      <p style={{ fontSize: 11.5, color: "var(--ink-soft)", margin: "-6px 0 12px" }}>% of income you're keeping.</p>
       <div className="bw-summary-row" style={{ marginBottom: 24 }}>
         {[
           { label: "Actual", rate: actualSavingsRate.rate, amount: actualSavingsRate.savings },
-          { label: "Projected", rate: projectedSavingsRate ? projectedSavingsRate.rate : null, amount: projectedSavingsRate ? projectedSavingsRate.savings : null },
+          { label: "Forecast", rate: projectedSavingsRate ? projectedSavingsRate.rate : null, amount: projectedSavingsRate ? projectedSavingsRate.savings : null },
         ].map((col) => (
           <Stat
             key={col.label}
@@ -12914,6 +14567,13 @@ const EVENT_STATUS_COLOR = {
   ACTUAL: "var(--ink)", SCHEDULED: "var(--teal)", EXPECTED: "#3E7C8C",
   PLANNED: "var(--ochre)", PROJECTED: "var(--slate)",
 };
+// The event's own name already states which goal PLANNED belongs to (shown right
+// above this status line), so that phrase stays generic rather than repeating it.
+const EVENT_STATUS_PLAIN = {
+  ACTUAL: "Already happened", SCHEDULED: "On a set day, reliably",
+  EXPECTED: "Expected around this time - still learning exactly when",
+  PLANNED: "Part of your plan", PROJECTED: "A typical month's estimate",
+};
 const EVENT_TYPE_OPTIONS = ["Income", "Expense", "Investment", "Transfer"];
 
 const EVENT_QUICK_FILTERS = [
@@ -12971,6 +14631,8 @@ function EventRow({ event, accountName, onSelect }) {
   const isActual = event.status === "ACTUAL";
   const isProjected = event.status === "PROJECTED";
   const Icon = isActual ? Check : Circle;
+  const isDebtPayment = event.category === "Transfer" && event.subCategory === "Debt Payment";
+  const debtLabel = isDebtPayment ? describeDebtPayment(event, accountName) : null;
   return (
     <div
       onClick={() => onSelect(event)}
@@ -12981,10 +14643,13 @@ function EventRow({ event, accountName, onSelect }) {
     >
       <Icon size={13} style={{ color: isActual ? "var(--teal)" : "var(--ink-soft)", flexShrink: 0 }} />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{event.name || "—"}</div>
+        <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {debtLabel ? debtLabel.label : (event.name || "—")}
+          {debtLabel && !debtLabel.confirmed && debtLabel.label !== "Debt Payment" && <span className="bw-suggested-badge">guess</span>}
+        </div>
         <div style={{ fontSize: 10.5, color: "var(--ink-soft)", display: "flex", gap: 6, alignItems: "center", marginTop: 1 }}>
           <span style={{ color: EVENT_STATUS_COLOR[event.status], fontWeight: 600 }}>
-            {isProjected ? "PROJECTED · AVERAGE" : event.status}
+            {EVENT_STATUS_PLAIN[event.status] || event.status}
           </span>
           {event.underlyingEvents && <span>· {event.underlyingEvents.length} transaction{event.underlyingEvents.length === 1 ? "" : "s"}</span>}
           {isProjected && event.occurrencesPerMonth != null && <span>· ~{event.occurrencesPerMonth.toFixed(1)}x/month typically</span>}
@@ -13235,6 +14900,8 @@ function EventDetailDrawer({ event, allEvents, accounts, accountName, projection
     const state = projection.dailyStates.find((d) => d.date === event.date);
     return state ? state.balance : null;
   }, [projection, event]);
+  const isDebtPayment = event.category === "Transfer" && event.subCategory === "Debt Payment";
+  const debtLabel = isDebtPayment ? describeDebtPayment(event, accountName) : null;
 
   return (
     <div
@@ -13246,7 +14913,10 @@ function EventDetailDrawer({ event, allEvents, accounts, accountName, projection
         style={{ width: "min(420px, 100%)", background: "var(--card)", height: "100%", overflowY: "auto", padding: 22, boxShadow: "-4px 0 16px rgba(0,0,0,0.12)" }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
-          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, maxWidth: 320 }}>{event.name || "—"}</div>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, maxWidth: 320 }}>
+            {debtLabel ? debtLabel.label : (event.name || "—")}
+            {debtLabel && !debtLabel.confirmed && debtLabel.label !== "Debt Payment" && <span className="bw-suggested-badge">guess</span>}
+          </div>
           <button className="bw-btn ghost small" onClick={onClose}><X size={14} /></button>
         </div>
         <div className={`bw-amt ${event.direction === "inflow" ? "credit" : "debit"}`} style={{ fontSize: 22, marginBottom: 2 }}>
@@ -13254,7 +14924,7 @@ function EventDetailDrawer({ event, allEvents, accounts, accountName, projection
         </div>
         <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 16 }}>
           {event.date ? shortDateLabel(event.date) : `Sometime in ${monthLabel(`${event.year}-${String(event.month).padStart(2, "0")}`)}`}
-          {" · "}<span style={{ color: EVENT_STATUS_COLOR[event.status], fontWeight: 600 }}>{event.status}</span>
+          {" · "}<span style={{ color: EVENT_STATUS_COLOR[event.status], fontWeight: 600 }}>{EVENT_STATUS_PLAIN[event.status] || event.status}</span>
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16, fontSize: 12.5 }}>
@@ -13278,7 +14948,7 @@ function EventDetailDrawer({ event, allEvents, accounts, accountName, projection
             <div className="bw-section-label" style={{ marginTop: 0 }}>Cash impact</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16, fontSize: 12.5 }}>
               <DetailField label={event.direction === "inflow" ? "Cash increases by" : "Cash decreases by"} value={inr(event.amount)} />
-              <DetailField label="Projected cash after this event" value={inr(cashAfter)} />
+              <DetailField label="Forecast cash after this event" value={inr(cashAfter)} />
             </div>
           </>
         )}
@@ -13620,7 +15290,7 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
     const list = [];
     if (cashBuffer > 0 && projectedMinimumBalance !== null && projectedMinimumBalance < cashBuffer) {
       const minDay = projectedDaily.reduce((min, p) => (p.balance < min.balance ? p : min), projectedDaily[0]);
-      list.push(`Your projected balance dips to ${inr(projectedMinimumBalance)} on ${minDay.date.slice(8, 10)} ${monthLabelStr.split(" ")[0].slice(0, 3)} — below your buffer of ${inr(cashBuffer)}.`);
+      list.push(`Your forecast balance dips to ${inr(projectedMinimumBalance)} on ${minDay.date.slice(8, 10)} ${monthLabelStr.split(" ")[0].slice(0, 3)} — below your buffer of ${inr(cashBuffer)}.`);
     }
     const upcomingDebits = monthEvents.filter((e) => e.date >= todayStr && e.kind !== "actual" && e.direction === "debit");
     if (upcomingDebits.length > 0) {
@@ -13661,8 +15331,8 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
       else if (t.category === "Transfer" && t.subCategory === "Debt Payment" && linkedAccount?.type === "creditCard") buckets.ccPayments += amt;
       else if (t.category === "Transfer" && t.subCategory === "Debt Payment") buckets.loans += amt;
       else if (t.category === "Expense" && t.frequencyClass === "Recurring") buckets.fixedExpenses += amt;
-      else if (t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Household") buckets.discretionaryHousehold += amt;
-      else if (t.category === "Expense" && t.frequencyClass === "Irregular" && t.subCategory === "Personal") buckets.discretionaryPersonal += amt;
+      else if (t.category === "Expense" && t.frequencyClass !== "Recurring" && t.subCategory === "Household") buckets.discretionaryHousehold += amt;
+      else if (t.category === "Expense" && t.frequencyClass !== "Recurring" && t.subCategory === "Personal") buckets.discretionaryPersonal += amt;
     });
     const totalInflow = buckets.income + buckets.redemption;
     const totalOutflow = buckets.investments + buckets.loans + buckets.fixedExpenses + buckets.ccPayments + buckets.discretionaryHousehold + buckets.discretionaryPersonal;
@@ -13723,7 +15393,7 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
         <Stat label="Total outflows" value={inr(totalOutflows)} color="var(--rust)" />
         <Stat label="Net cash flow" value={inr(netCashFlow)} color={netCashFlow >= 0 ? "var(--teal)" : "var(--rust)"} />
         <Stat
-          label="Projected month-end balance"
+          label="Forecast month-end balance"
           value={projectedMonthEndBalance !== null ? inr(projectedMonthEndBalance) : "—"}
           color={projectedMonthEndBalance !== null && projectedMonthEndBalance >= 0 ? "var(--teal)" : "var(--rust)"}
           hint={todaysBalance !== null ? `Current balance ${inr(todaysBalance)}` : (isCurrentMonthView ? "Balance not yet confirmed" : "Only shown for the current month")}
@@ -13992,7 +15662,7 @@ function CashFlowCalendarView({ transactions, accounts, rules, cashBuffer, setCa
           <div className="bw-empty">Today's bank balance isn't confirmed yet — import a recent statement to see the projection.</div>
         ) : (
           <>
-            <div style={{ fontWeight: 600, fontSize: 13, margin: "14px 0 2px" }}>Projected cash balance</div>
+            <div style={{ fontWeight: 600, fontSize: 13, margin: "14px 0 2px" }}>Forecast cash balance</div>
             <p style={{ fontSize: 10.5, color: "var(--ink-soft)", margin: "0 0 8px" }}>
               Includes an estimated {inr(dailyDiscretionary)}/day for typical discretionary spending (median of
               recent months, spread evenly) — hover any day to see committed vs. discretionary separately.
@@ -14175,14 +15845,14 @@ function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSc
       <div className="bw-waterfall-card">
         <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
           <HeroStat label="Net Worth" value={summary.netWorth} color={summary.netWorth >= 0 ? "var(--teal)" : "var(--rust)"} />
-          <HeroStat label="Total Assets" value={summary.totalAssets} color="var(--ink)" />
-          <HeroStat label="Total Liabilities" value={summary.totalLiabilities} color="var(--rust)" />
+          <HeroStat label="Total Assets (what you own)" value={summary.totalAssets} color="var(--ink)" />
+          <HeroStat label="Total Liabilities (what you owe)" value={summary.totalLiabilities} color="var(--rust)" />
         </div>
       </div>
 
       <div className="bw-grid2">
         <div>
-          <div className="bw-section-label" style={{ marginTop: 0 }}>Assets</div>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Assets (what you own)</div>
           {assetRows.length === 0 ? (
             <div className="bw-empty" style={{ padding: "16px 10px" }}>No assets tracked yet.</div>
           ) : (
@@ -14204,7 +15874,7 @@ function NetWorthOverview({ accounts, holdingSnapshots, otherInvestments, debtSc
         </div>
 
         <div>
-          <div className="bw-section-label" style={{ marginTop: 0 }}>Liabilities</div>
+          <div className="bw-section-label" style={{ marginTop: 0 }}>Liabilities (what you owe)</div>
           {liabilityRows.length === 0 ? (
             <div className="bw-empty" style={{ padding: "16px 10px" }}>No liabilities tracked — nice.</div>
           ) : (
@@ -14319,10 +15989,10 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
 
       <div className="bw-waterfall-card" style={{ marginBottom: 22 }}>
         <div className="bw-waterfall" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
-          <HeroStat label="Total outstanding" value={totalOutstanding} color="var(--rust)"
+          <HeroStat label="Total still owed" value={totalOutstanding} color="var(--rust)"
             hint={ccOutstanding > 0 ? `${inr(loanOutstanding)} loans + ${inr(ccOutstanding)} credit cards` : null} />
-          <HeroStat label="Principal paid to date" value={totalPrincipalPaid} color="var(--teal)" hint="Loans only" />
-          <HeroStat label="Interest paid to date" value={totalInterestPaid} color="var(--ink)" hint="Loans only" />
+          <HeroStat label="Loan amount repaid to date" value={totalPrincipalPaid} color="var(--teal)" hint="Loans only" />
+          <HeroStat label="Interest paid to date" value={totalInterestPaid} color="var(--ink)" hint="Cost of borrowing - loans only" />
         </div>
       </div>
 
@@ -14353,9 +16023,9 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
               </div>
 
               <div className="bw-summary-row">
-                <Stat label="Current outstanding" value={inr(summary.currentOutstanding)} color="var(--rust)" hint={`as of ${summary.asOfPeriod}`} />
-                <Stat label="Principal paid" value={inr(summary.cumulativePrincipalPaid)} color="var(--teal)" />
-                <Stat label="Interest paid" value={inr(summary.cumulativeInterestPaid)} color="var(--ink)" />
+                <Stat label="Still owed" value={inr(summary.currentOutstanding)} color="var(--rust)" hint={`as of ${summary.asOfPeriod}`} />
+                <Stat label="Loan amount repaid" value={inr(summary.cumulativePrincipalPaid)} color="var(--teal)" />
+                <Stat label="Interest paid" labelInfo="The cost of borrowing." value={inr(summary.cumulativeInterestPaid)} color="var(--ink)" />
                 <Stat
                   label={summary.loanComplete ? "Loan complete" : "Next EMI"}
                   value={summary.loanComplete ? "—" : inr(summary.nextEmiAmount)}
@@ -14382,7 +16052,7 @@ function DebtOverview({ accounts, debtSchedules, onGoToUpload }) {
               </div>
               <span className="bw-pill" style={{ background: "var(--slate)" }}>Credit card</span>
             </div>
-            <Stat label="Current outstanding" value={inr(outstanding)} color="var(--rust)" />
+            <Stat label="Still owed" value={inr(outstanding)} color="var(--rust)" />
           </div>
         ))}
       </div>
@@ -15063,7 +16733,7 @@ function InvestmentsOverview({ accounts, setAccounts, holdingSnapshots, otherInv
         <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--ink-soft)", margin: "-8px 0 14px" }}>
           <span>Last updated: {lastUpdatedDate}</span>
           <span style={{ color: vsLastSnapshotDelta >= 0 ? "var(--teal)" : "var(--rust)" }}>
-            {vsLastSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} {inr(Math.abs(vsLastSnapshotDelta))} vs last snapshot
+            {vsLastSnapshotDelta >= 0 ? "\u25B2" : "\u25BC"} {inr(Math.abs(vsLastSnapshotDelta))} since your last update
           </span>
         </div>
       )}
@@ -15714,7 +17384,7 @@ function GoalsOverview({ goals, setGoals, accounts, holdingSnapshots, transactio
           <HeroStat label="Total invested (portfolio)" value={portfolioTotals.invested} color="var(--ink)" />
           <HeroStat label="In near-term goals" value={nearTermAssignedInvested} color="var(--ink)" />
           <HeroStat label="Allocated to other goals" value={tracking.totalManualRequested} color={tracking.manualOverAllocated ? "var(--rust)" : "var(--ink)"} />
-          <HeroStat label="Unallocated" value={Math.max(0, poolForLongTermGoals - tracking.totalManualRequested)} color="var(--teal)" />
+          <HeroStat label="Not assigned to a goal" value={Math.max(0, poolForLongTermGoals - tracking.totalManualRequested)} color="var(--teal)" />
         </div>
       </div>
 
@@ -15810,13 +17480,13 @@ function NearTermGoalCard({ goal, result, averageMonthlyExpense, holdingsIndex, 
         <div style={{ width: `${pctFunded}%`, height: "100%", background: pctFunded >= 100 ? "var(--teal)" : "var(--ochre)", transition: "width 0.3s" }} />
       </div>
       <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 12 }}>
-        {inr(result.trackedCurrentValue)} tracked of {inr(target)} target ({pctFunded.toFixed(0)}%)
+        {inr(result.trackedCurrentValue)} reached of {inr(target)} target ({pctFunded.toFixed(0)}%)
         {isEmergency && <> — {goal.emergencyMonths || 6} months × {inr(averageMonthlyExpense)}/month average expense</>}
       </div>
 
       <div className="bw-summary-row" style={{ marginBottom: 12 }}>
         <Stat label="Target" value={inr(target)} color="var(--ink)" />
-        <Stat label="Tracked (assigned holdings)" value={inr(result.trackedInvested)} color="var(--ink)" hint={`grown to ${inr(result.trackedCurrentValue)}`} />
+        <Stat label="Invested so far" labelInfo="Money you have put into the holdings assigned to this goal." value={inr(result.trackedInvested)} color="var(--ink)" hint={`now worth ${inr(result.trackedCurrentValue)}`} />
         <Stat label="Growth so far" value={inr(result.growth)} color={result.growth >= 0 ? "var(--teal)" : "var(--rust)"} />
       </div>
 
@@ -15931,12 +17601,12 @@ function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, conf
         <div style={{ width: `${pctFunded}%`, height: "100%", background: pctFunded >= 100 ? "var(--teal)" : "var(--ochre)", transition: "width 0.3s" }} />
       </div>
       <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 12 }}>
-        {inr(result.trackedCurrentValue)} tracked of {inr(math.targetCorpus)} target ({pctFunded.toFixed(0)}%)
+        {inr(result.trackedCurrentValue)} reached of {inr(math.targetCorpus)} target ({pctFunded.toFixed(0)}%)
       </div>
 
       <div className="bw-summary-row" style={{ marginBottom: 12 }}>
-        <Stat label="Target corpus" value={inr(math.targetCorpus)} color="var(--ink)" />
-        <Stat label="Tracked (real)" value={inr(result.trackedInvested)} color="var(--ink)" hint={`grown to ${inr(result.trackedCurrentValue)}`} />
+        <Stat label="Amount you need to reach" value={inr(math.targetCorpus)} color="var(--ink)" />
+        <Stat label="Invested so far" labelInfo="Money you have put into the holdings assigned to this goal." value={inr(result.trackedInvested)} color="var(--ink)" hint={`now worth ${inr(result.trackedCurrentValue)}`} />
         <Stat label="Growth so far" value={inr(result.growth)} color={result.growth >= 0 ? "var(--teal)" : "var(--rust)"} />
         {(() => {
           // Lumpsum/SIP required was always computed from the FULL target, never
@@ -15952,9 +17622,9 @@ function GoalCard({ goal, result, portfolioInvested, accentColor, onUpdate, conf
           const remainingLumpsum = Math.round(math.lumpsumRequired * remainingRatio * 100) / 100;
           const remainingSip = Math.round(math.sipRequired * remainingRatio * 100) / 100;
           return remainingGap <= 0 ? (
-            <Stat label="Lumpsum / SIP needed" value="Goal met" color="var(--teal)" hint="No further funding needed" />
+            <Stat label="Still needed" value="Goal met" color="var(--teal)" hint="No further funding needed" />
           ) : (
-            <Stat label="Lumpsum / SIP needed" value={inr(remainingLumpsum)} color="var(--ink)" hint={`or ${inr(remainingSip)}/mo \u00B7 remaining gap`} />
+            <Stat label="Still needed" value={inr(remainingLumpsum)} color="var(--ink)" hint={`as a one-time amount, or ${inr(remainingSip)}/month`} />
           );
         })()}
       </div>
@@ -16269,8 +17939,8 @@ function GoalWizard({ apiKey, portfolioInvested, tracking, holdingsIndex, assign
                 In <strong>{years}</strong> years, this will cost about <strong>{inr(math.targetCorpus)}</strong> (today's {inr(cost)}, inflated at {inflation}%/year).
               </div>
               <div className="bw-summary-row">
-                <Stat label="Lumpsum needed today" value={inr(math.lumpsumRequired)} color="var(--ink)" />
-                <Stat label="Or, monthly SIP" value={inr(math.sipRequired)} color="var(--ink)" />
+                <Stat label="One-time amount needed today" value={inr(math.lumpsumRequired)} color="var(--ink)" />
+                <Stat label="Or, a monthly investment (SIP)" value={inr(math.sipRequired)} color="var(--ink)" />
               </div>
             </div>
           )}
@@ -16431,13 +18101,14 @@ function HeroStat({ label, value, color, hint, clickable, onClick }) {
  *  optional delta line, a flexible body (sparkline SVG or custom breakdown via children),
  *  and an optional footer. Cash Flow and every other screen are untouched — this is
  *  used only by DashboardOverview. */
-function InsightCard({ icon: Icon, title, badge, value, delta, deltaColor, footer, onClick, children }) {
+function InsightCard({ icon: Icon, title, description, badge, value, delta, deltaColor, footer, onClick, children }) {
   return (
     <div className={`bw-insight-card ${onClick ? "clickable" : ""}`} onClick={onClick}>
       <div className="bw-insight-head">
         <div className="bw-insight-title">{Icon && <Icon size={14} color="var(--teal)" />} {title}</div>
         {badge && <span className="bw-insight-badge" style={{ background: badge.bg, color: badge.color }}>{badge.text}</span>}
       </div>
+      {description && <div className="bw-insight-desc">{description}</div>}
       {value !== undefined && <div className="bw-insight-value">{value}</div>}
       {delta && <div className="bw-insight-delta" style={{ color: deltaColor || "var(--ink-soft)" }}>{delta}</div>}
       {children}
@@ -16546,10 +18217,10 @@ function TransactionsZone({ scoped, accounts, accountName }) {
 /** The most-reused small building block in the app - a labeled figure with an
  *  optional colored value and a small explanatory hint line underneath. Used across
  *  nearly every screen's summary rows. */
-function Stat({ label, value, color, hint }) {
+function Stat({ label, value, color, hint, labelInfo }) {
   return (
     <div className="bw-stat">
-      <div className="label">{label}</div>
+      <div className="label">{label}{labelInfo && <InfoTooltip text={labelInfo} />}</div>
       <div className="value" style={{ color }}>{value}</div>
       {hint && <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 3 }}>{hint}</div>}
     </div>
@@ -16594,7 +18265,7 @@ function PersonaChatScreen({ persona, transactions, accounts, holdingSnapshots, 
 
   useEffect(() => { (async () => { setApiKeyLocal(await loadState("geminiApiKey", "")); })(); }, []);
 
-  const personaLabel = persona === "cfo" ? "Personal CFO" : "AI Analyst";
+  const personaLabel = persona === "cfo" ? "Money Coach" : "AI Analyst";
   const personaThreads = chatThreads.filter((t) => t.persona === persona).sort((a, b) => b.createdAt - a.createdAt);
   const personaPrompts = PROMPT_LIBRARY.filter((p) => p.persona === persona);
   const personaSavedPrompts = savedPrompts.filter((p) => p.persona === persona);
@@ -17039,4 +18710,46 @@ function TokenResolutionModal({ promptDef, categoryOptions, accountOptions, goal
       </div>
     </div>
   );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Test-only exports (Phase 0 safety net, migration plan item #45)        */
+/* ---------------------------------------------------------------------- */
+/* Purely additive: exposes the module's existing pure engine functions on
+ * globalThis so golden-number regression tests (golden/*.cjs) can call the
+ * REAL functions rather than a hand-copied duplicate that could drift out of
+ * sync with them. Nothing above this line is touched or behaves differently;
+ * this never runs inside the shipped browser app's own logic path, it only
+ * gives an external Node test script something to grab after loading the
+ * compiled module. Guarded so it's a no-op in any context where it isn't
+ * expected (e.g. if a future bundler tree-shakes it away, tests simply fail
+ * loudly rather than silently passing on stale data). */
+if (typeof globalThis !== "undefined") {
+  globalThis.__BW_TEST_EXPORTS__ = {
+    computeGoalMath,
+    computeNetWorthSummary,
+    computeDebtSummary,
+    computeGoalsTracking,
+    computeCashProjection,
+    computeAmountBehaviors,
+    computeAmountBehavior,
+    learnRecurringDay,
+    matchRule,
+    findLibraryEntry,
+    normalizeMerchant,
+    seedRules,
+    demoJourneySource: DEMO_JOURNEY_SOURCE,
+    describeDebtPayment,
+    detectHeaderRow,
+    guessColumn,
+    normalizeHeader,
+    computeAggregateCashBalance,
+    computeRecurringCommitments,
+    computeForecastStreams,
+    // Mirrors the exact expression used in App.jsx's cardPatternEvidence check
+    // (backlog #51's next-step fix), so that logic can be tested directly against
+    // real descriptions rather than assumed correct from reading it.
+    matchesAnyCardIssuerPattern: (description) =>
+      CARD_ISSUER_PATTERNS.some((p) => normalizedPatternMatches(normalizeForMatch(description), normalizeForMatch(p.pattern))),
+  };
 }
