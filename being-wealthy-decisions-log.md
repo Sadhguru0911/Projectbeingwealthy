@@ -187,3 +187,37 @@ this update: **Cash Flow Calendar** (extensively designed above, entirely unbuil
 day-by-day layout, recurring overlay, and danger-zone projection), and the still-unresolved
 export-to-file / import-from-file backup feature noted in earlier versions of this log, which
 remains a real, present data-loss risk that hasn't yet been addressed.
+
+---
+
+## Migration to the new experience (29 Sep 2026 onward)
+
+A new, larger body of work started after this log's last entry: redesigning onboarding, adding a
+post-onboarding "Home" screen, unifying Analyst/Money Coach into one "Ask" surface, restyling the
+app with shared design tokens, and building a real inference engine to sort statements
+automatically. This is tracked in three places, not duplicated into this log:
+
+- **`BACKLOG.md`** items #37–47 — the authoritative, current status of every piece of this work.
+- **`INFERENCE_ENGINE_DESIGN.md`** and **`INFERENCE_ENGINE_BUILD_PLAN.md`** — the inference
+  engine's architecture and phase-wise build plan in full (item #46/#47 in the backlog point here
+  rather than repeating this content).
+- **Backlog #45** — the overall migration plan: ground rules (new files only, an "experience" flag
+  so nothing big-bangs, storage versioning, no visual change until Phase 1), and Phases 0–5.
+
+**Phase 0 (safety net) is complete** as of this entry: baseline tagged
+(`pre-migration-baseline`); a golden-number regression harness added at `golden/` that loads the
+real, compiled `App.jsx` (via a guarded, additive-only test-export footer) and checks its pure
+engine functions against committed reference values — proven to catch a real injected regression
+during this same session; the `experience` flag (default `"classic"`, inert until Home exists);
+`schemaVersion` storage versioning (resolves the previously-parked "consolidate migration guards"
+idea); `src/ui/tokens.js` scaffolding (color/font/density/shell tokens, defined but unused by any
+screen yet).
+
+**Known environment constraint, recorded for whoever picks this up next**: this container has no
+network access and an empty `node_modules` — the real Vite dev server and a real browser-rendered
+screenshot harness against the actual React app cannot run here (unlike the standalone HTML
+prototypes used for design work, which need no npm packages). Phase 0's regression safety net was
+built around this constraint using Node + esbuild directly against the compiled source, which does
+not need a dev server. A true visual-regression screenshot harness across every real screen still
+needs to run somewhere with `npm install` available (a local machine or CI) before Phase 1 restyling
+begins in earnest — flagged in `BACKLOG.md` #45 rather than silently assumed done.

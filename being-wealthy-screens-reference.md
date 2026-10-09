@@ -245,3 +245,12 @@ Control, and an account filter that resets appropriately when switching tabs (Cl
 Credit Card filter against entirely different account sets).
 
 
+
+---
+
+## New screens in progress (not yet built into the app)
+
+Onboarding, Home, and Ask are being redesigned; see `BACKLOG.md` #38, #39, #41, #42 for full
+specs and interactive prototypes referenced there. This file describes the app as it exists
+today — it will be extended screen-by-screen as each piece actually lands in `src/App.jsx`,
+rather than describing planned screens ahead of the code.
