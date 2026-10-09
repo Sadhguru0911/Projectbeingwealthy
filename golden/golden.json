@@ -1,0 +1,163 @@
+[
+  {
+    "fn": "computeGoalMath",
+    "label": "5-year goal, moderate inflation/return",
+    "args": [
+      1000000,
+      6,
+      10,
+      5
+    ],
+    "value": {
+      "targetCorpus": 1338225.58,
+      "lumpsumRequired": 830932.8,
+      "sipRequired": 17138.64
+    },
+    "error": null
+  },
+  {
+    "fn": "computeGoalMath",
+    "label": "18-month goal, zero assumed return (matches Ask's cautious-estimate convention)",
+    "args": [
+      1200000,
+      6,
+      0,
+      1.5
+    ],
+    "value": {
+      "targetCorpus": 1309604.15,
+      "lumpsumRequired": 1309604.15,
+      "sipRequired": 72755.79
+    },
+    "error": null
+  },
+  {
+    "fn": "learnRecurringDay",
+    "label": "four clean monthly-on-the-5th dates",
+    "args": [
+      [
+        "2026-01-05",
+        "2026-02-05",
+        "2026-03-06",
+        "2026-04-05"
+      ]
+    ],
+    "value": {
+      "recurs": true,
+      "hasPattern": true,
+      "patternType": "dayOfMonth",
+      "expectedDay": 5,
+      "confidence": 1,
+      "confidenceTier": "confirmed",
+      "occurrenceCount": 4
+    },
+    "error": null
+  },
+  {
+    "fn": "learnRecurringDay",
+    "label": "two widely-spaced dates (should NOT read as a confirmed monthly pattern)",
+    "args": [
+      [
+        "2026-01-09",
+        "2026-05-14"
+      ]
+    ],
+    "value": {
+      "recurs": true,
+      "hasPattern": false,
+      "occurrenceCount": 2,
+      "domConfidence": 0.5,
+      "dowConfidence": 0.5
+    },
+    "error": null
+  },
+  {
+    "fn": "computeDebtSummary",
+    "label": "a home loan, 3 periods imported, today mid-schedule",
+    "args": [
+      [
+        {
+          "importedAt": 1,
+          "entries": [
+            {
+              "period": "2026-07",
+              "principal": 8000,
+              "interest": 17000,
+              "emi": 25000,
+              "closingBalance": 1892000
+            },
+            {
+              "period": "2026-08",
+              "principal": 8060,
+              "interest": 16940,
+              "emi": 25000,
+              "closingBalance": 1883940
+            },
+            {
+              "period": "2026-09",
+              "principal": 8121,
+              "interest": 16879,
+              "emi": 25000,
+              "closingBalance": 1875819
+            }
+          ]
+        }
+      ],
+      "2026-09-28"
+    ],
+    "value": {
+      "hasData": true,
+      "currentOutstanding": 1875819,
+      "asOfPeriod": "2026-09",
+      "cumulativePrincipalPaid": 24181,
+      "cumulativeInterestPaid": 50819,
+      "nextEmiPeriod": null,
+      "nextEmiAmount": null,
+      "totalPeriods": 3,
+      "loanComplete": true
+    },
+    "error": null
+  },
+  {
+    "fn": "computeNetWorthSummary",
+    "label": "one bank account, one credit card, one demat account with a snapshot",
+    "args": [
+      [
+        {
+          "id": "a1",
+          "type": "bank",
+          "lastKnownBalance": 186000
+        },
+        {
+          "id": "a2",
+          "type": "creditCard",
+          "lastKnownBalance": 18400
+        },
+        {
+          "id": "a3",
+          "type": "demat"
+        }
+      ],
+      [
+        {
+          "accountId": "a3",
+          "asOfDate": "2026-09-20",
+          "totalCurrentValue": 560000
+        }
+      ],
+      [],
+      []
+    ],
+    "value": {
+      "bankTotal": 186000,
+      "creditCardOwed": 18400,
+      "marketTrackedValue": 560000,
+      "otherInvestmentsValue": 0,
+      "totalDebt": 0,
+      "totalAssets": 746000,
+      "totalLiabilities": 18400,
+      "netWorth": 727600
+    },
+    "error": null
+  }
+]
